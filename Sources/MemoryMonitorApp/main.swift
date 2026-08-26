@@ -26,15 +26,19 @@ struct MemoryMonitorApp: App {
 final class MonitorViewModel: ObservableObject {
     @Published private(set) var system: SystemMemorySnapshot?
     @Published private(set) var groups: [WorkloadGroupSnapshot] = []
+    @Published private(set) var observedProcessCount = 0
     @Published private(set) var growth: [WorkloadGrowth] = []
-    @Published private(set) var history: [MemoryHistoryEntry] = []
+    @Published private(set) var history: [MemoryHistoryRecord] = []
     @Published private(set) var lastError: String?
+    @Published private(set) var historyError: String?
     @Published private(set) var updatedAt: Date?
 
     private var refreshTask: Task<Void, Never>?
     private let sampler = MonitorSampler()
     private let trendAnalyzer = WorkloadTrendAnalyzer()
+    private let historyStore = HistoryStore()
     private var historyBuffer = MemoryHistoryBuffer(capacity: 60)
+    private var historyStoreAvailable = true
     private var previousGroups: [WorkloadGroupSnapshot] = []
     private var previousSampleAt: Date?
 
@@ -49,7 +53,7 @@ final class MonitorViewModel: ObservableObject {
     }
 
     var pressure: PressureState {
-        guard let system else { return .unknown }
+        guard lastError == nil, let system else { return .unknown }
         if system.availableFraction < 0.10
             || (system.swapTotalBytes > 0 && system.swapFreeBytes < 1 * 1024 * 1024 * 1024)
             || system.throttledPages > 0 {
@@ -64,6 +68,14 @@ final class MonitorViewModel: ObservableObject {
     }
 
     private func refreshLoop() async {
+        do {
+            history = try await historyStore.load()
+            historyError = nil
+        } catch {
+            historyStoreAvailable = false
+            historyError = error.localizedDescription
+        }
+
         while !Task.isCancelled {
             let result = await Task.detached(priority: .utility) { [sampler] in
                 sampler.sample()
@@ -72,7 +84,22 @@ final class MonitorViewModel: ObservableObject {
             switch result {
             case let .success(snapshot):
                 historyBuffer.append(snapshot: snapshot.system)
-                history = historyBuffer.entries
+                if historyStoreAvailable {
+                    do {
+                        history = try await historyStore.append(
+                            snapshot: snapshot.system,
+                            groups: snapshot.groups,
+                            now: snapshot.timestamp
+                        )
+                        historyError = nil
+                    } catch {
+                        historyStoreAvailable = false
+                        historyError = error.localizedDescription
+                        history = historyBuffer.entries.map { MemoryHistoryRecord(entry: $0) }
+                    }
+                } else {
+                    history = historyBuffer.entries.map { MemoryHistoryRecord(entry: $0) }
+                }
                 if let previousSampleAt {
                     growth = trendAnalyzer.growingGroups(
                         previous: previousGroups,
@@ -84,6 +111,7 @@ final class MonitorViewModel: ObservableObject {
                 previousSampleAt = snapshot.timestamp
                 system = snapshot.system
                 groups = snapshot.groups
+                observedProcessCount = snapshot.processCount
                 updatedAt = snapshot.timestamp
                 lastError = nil
             case let .failure(error):
@@ -93,8 +121,12 @@ final class MonitorViewModel: ObservableObject {
             do {
                 try await Task.sleep(for: .seconds(5))
             } catch {
-                return
+                break
             }
+        }
+
+        if historyStoreAvailable {
+            try? await historyStore.flush()
         }
     }
 }
@@ -111,7 +143,8 @@ private struct MonitorSampler: Sendable {
             return .success(MonitorSnapshot(
                 timestamp: Date(),
                 system: system,
-                groups: WorkloadGrouper().group(processes)
+                groups: WorkloadGrouper().group(processes),
+                processCount: processes.count
             ))
         } catch {
             return .failure(error)
@@ -123,6 +156,7 @@ private struct MonitorSnapshot: Sendable {
     let timestamp: Date
     let system: SystemMemorySnapshot
     let groups: [WorkloadGroupSnapshot]
+    let processCount: Int
 }
 
 enum PressureState: String {
@@ -158,7 +192,11 @@ private struct MenuBarStatus: View {
             Circle()
                 .fill(model.pressure.color)
                 .frame(width: 7, height: 7)
-            Text(model.system.map { "RAM \(Int((1 - $0.availableFraction) * 100))%" } ?? "RAM --")
+            Text(
+                model.lastError == nil
+                    ? (model.system.map { "RAM \(Int((1 - $0.availableFraction) * 100))%" } ?? "RAM --")
+                    : "RAM --"
+            )
                 .font(.system(size: 12, weight: .medium, design: .rounded))
         }
     }
@@ -185,11 +223,14 @@ private struct MonitorPopover: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Memory Monitor")
                     .font(.system(size: 18, weight: .semibold))
+                Text("全量进程观察 · 已采集 \(model.observedProcessCount) 个进程")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 HStack(spacing: 6) {
                     Circle()
                         .fill(model.pressure.color)
                         .frame(width: 8, height: 8)
-                    Text(model.pressure.title)
+                    Text(model.lastError == nil ? model.pressure.title : "采集受限")
                         .font(.subheadline.weight(.medium))
                         .foregroundStyle(model.pressure.color)
                 }
@@ -262,7 +303,7 @@ private struct MonitorPopover: View {
     }
 
     private var historyTrend: some View {
-        GroupBox("最近趋势") {
+        GroupBox("24 小时磁盘历史") {
             if let first = model.history.first, let last = model.history.last, model.history.count >= 2 {
                 VStack(alignment: .leading, spacing: 7) {
                     HStack(spacing: 8) {
@@ -279,14 +320,20 @@ private struct MonitorPopover: View {
                             value: signedBytes(last.swapUsedBytes, comparedTo: first.swapUsedBytes)
                         )
                     }
-                    Text("最近 \(model.history.count) 次采样 · 从 \(first.timestamp, style: .time) 到 \(last.timestamp, style: .time)")
+                    Text("已保存 \(model.history.count) 条分钟记录 · 从 \(first.timestamp, style: .time) 到 \(last.timestamp, style: .time)")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
             } else {
-                Text("等待更多采样以生成趋势")
+                Text(model.history.isEmpty ? "等待首条分钟记录" : "等待更多采样以生成趋势")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+
+            if let historyError = model.historyError {
+                Text(historyError)
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
             }
         }
     }
@@ -294,29 +341,39 @@ private struct MonitorPopover: View {
     private var processList: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack {
-                Text("工作组")
+                Text("工作组归因")
                     .font(.headline)
                 Spacer()
-                Text("footprint")
+                Text("归因总量 · footprint")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            Text("已采集本机所有可枚举进程；组内数值为 footprint/RSS 相加的归因总量，包含共享映射，不能相加当作整机实际占用。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
 
             if model.groups.isEmpty {
                 Text("暂无工作组数据")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
-                ForEach(Array(model.groups.prefix(8))) { group in
-                    WorkloadGroupRow(group: group)
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        ForEach(model.groups) { group in
+                            WorkloadGroupRow(group: group)
+                        }
+                    }
                 }
+                .frame(maxHeight: 280)
             }
         }
     }
 
     private var footer: some View {
         HStack {
-            Text("只读监视 · 每 5 秒刷新")
+            Text("只读监视 · 全量进程 · 每 5 秒刷新")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             Spacer()
@@ -385,9 +442,12 @@ private struct WorkloadGroupRow: View {
             }
             Spacer(minLength: 4)
             VStack(alignment: .trailing, spacing: 2) {
-                Text(MemoryFormatter.bytes(group.physicalFootprintBytes))
+                Text(group.containsEstimatedFootprint ? "footprint 归因总量 · 估算" : "footprint 归因总量")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text(MemoryFormatter.bytes(group.attributedFootprintBytes))
                     .font(.system(size: 12, weight: .medium, design: .monospaced))
-                Text("RSS \(MemoryFormatter.bytes(group.residentBytes))")
+                Text("RSS 归因总量 \(MemoryFormatter.bytes(group.attributedResidentBytes))")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }

@@ -52,7 +52,7 @@
 - 将进程折叠为可理解的工作组；
 - 找出高占用、快速增长和高交换活动的对象；
 - 给出带原因和预期收益的建议；
-- 支持本地短期历史，帮助判断“正在恢复”还是“又在恶化”；
+- 支持本地 24 小时磁盘历史，帮助判断“正在恢复”还是“又在恶化”；
 - 无网络依赖、无遥测、无自动结束进程。
 
 ### 3.2 首版明确不做
@@ -97,7 +97,7 @@ Ghostty 中的构建、日志或 Python 服务长时间运行。界面应显示�
 - 严重：红色；
 - 采集受限：灰色并标注原因。
 
-点击后打开 360–440 px 宽的 popover。应用关闭面板时仍继续低频采样。
+点击后打开 360–440 px 宽的 popover。当前实现持续采样并在内存中更新，历史按分钟写盘。
 
 ### 5.2 弹出面板布局
 
@@ -106,7 +106,7 @@ Ghostty 中的构建、日志或 Python 服务长时间运行。界面应显示�
    - 可用内存；
    - 压缩内存；
    - swap 已用/剩余；
-   - 最近 60 秒趋势。
+   - 最近趋势和 24 小时历史窗口。
 
 2. **现在最该关注**
    - 最多 3 条建议；
@@ -120,7 +120,7 @@ Ghostty 中的构建、日志或 Python 服务长时间运行。界面应显示�
 
 4. **事件时间线**
    - 记录压力等级变化、工作组启动/退出、swap 越过阈值和建议生成；
-   - 只保留本地短期历史。
+   - 只保留本地 24 小时磁盘历史。
 
 ### 5.3 工作组详情
 
@@ -141,7 +141,7 @@ Ghostty 中的构建、日志或 Python 服务长时间运行。界面应显示�
 
 - `total`: `hw.memsize`；
 - `free`: 当前空闲页；
-- `available_estimate`: `free + inactive + speculative + purgeable` 的估算值；
+- `available_estimate`: `free + inactive + purgeable` 的估算值（Darwin 的 `free_count` 已包含 speculative 页）；
 - `wired`: 不可换出的内核/系统页；
 - `compressed`: 压缩器占用页数；
 - `throttled`: 被系统节流的页数；
@@ -181,7 +181,7 @@ Ghostty 中的构建、日志或 Python 服务长时间运行。界面应显示�
 - `proc_pid_rusage`：进程 footprint/resident 等资源统计；
 - `NSRunningApplication`：应用名、图标和 bundle 信息。
 
-不同 macOS 版本可能限制部分路径或命令行信息。采集层必须允许字段缺失，并显示“信息受系统权限限制”，不能用猜测值替代。
+不同 macOS 版本可能限制部分路径或命令行信息。采集层必须允许字段缺失，并显示“信息受系统权限限制”；`phys_footprint` 不可用时可暂用 RSS，但必须明确标记为估算值。
 
 ## 7. 工作组分组规则
 
@@ -250,7 +250,7 @@ PID 不是稳定身份。内部使用 `(pid, start_time)` 作为进程键，避�
 - `WorkloadGrouper`：工作组识别与聚合；
 - `PressureEvaluator`：等级、趋势和持续时间；
 - `RecommendationEngine`：建议生成与排序；
-- `HistoryStore`：本地环形历史；
+- `HistoryStore`：本地 24 小时 JSON 磁盘历史；
 - `MonitorStore`：面向 UI 的状态快照；
 - `MenuBarUI`：菜单栏和 popover；
 - `PrivacyFilter`：命令行/路径脱敏和日志过滤。
@@ -261,6 +261,15 @@ PID 不是稳定身份。内部使用 `(pid, start_time)` 作为进程键，避�
 
 并发模型建议使用 Swift Concurrency：采集器由后台 actor 管理，UI 只接收不可变快照，避免在主线程扫描进程。
 
+### 9.1 24 小时磁盘历史契约
+
+- 文件位置：`~/Library/Application Support/MemoryMonitor/history.json`；
+- 文件格式：带 `version` 的 JSON envelope，当前版本为 1；
+- 采样粒度：内存中每 5 秒更新，按分钟合并后写盘；首次记录、新分钟和显式 `flush()` 会触发原子写入；
+- 保留策略：以当前时间为基准保留最近 24 小时，启动和追加时清理过期记录；
+- 持久化字段：时间戳、可用内存比例、压缩内存、Swap 已用量，以及 footprint 最大的 40 个工作组名称、进程数、footprint/RSS 归因总量和系统标记；其余用户组、系统组分别合并为“其他”归因总量；
+- 隐私边界：不写入 PID、启动时间、命令行、URL、环境变量、凭据或完整路径；目录权限为 0700，文件权限为 0600。
+
 ## 10. 轻量化和稳定性目标
 
 - 后台常驻内存目标：< 40–60 MiB；
@@ -268,7 +277,7 @@ PID 不是稳定身份。内部使用 `(pid, start_time)` 作为进程键，避�
 - 面板打开时采样间隔：2–3 秒；
 - 面板关闭时采样间隔：15–30 秒；
 - 只有面板打开或压力异常时才进行更完整的进程细节解析；
-- 历史使用内存环形缓冲，默认保留 24 小时，避免首版引入重型数据库；
+- 历史使用版本化 JSON 文件，按分钟合并并默认保留 24 小时，避免引入重型数据库；
 - 采集失败、权限不足或进程消失时优雅降级；
 - 监视器必须排除自身的建议对象，避免自我结束或自我放大。
 
@@ -277,7 +286,7 @@ PID 不是稳定身份。内部使用 `(pid, start_time)` 作为进程键，避�
 - 首版完全本地运行，不联网、不上传遥测；
 - 不持久化完整命令行、环境变量、URL、token 或 cookie；
 - 日志中的路径只保留应用名、项目目录 basename 或脱敏标签；
-- 默认只关注当前用户进程；
+- 监视面板观察本机所有可枚举进程；未来的操作能力仍只允许当前用户进程；
 - 系统进程只读展示，不提供操作入口；
 - 任何未来的操作功能都必须重新验证 PID、启动时间、路径、用户和父子关系；
 - 未来的强制结束功能必须逐次确认，不能后台自动执行；
@@ -332,7 +341,7 @@ PID 不是稳定身份。内部使用 `(pid, start_time)` 作为进程键，避�
 
 - 菜单栏常驻状态指示器；
 - popover 状态、可用估算、压缩和 swap 指标；
-- 按 physical footprint 排序的前 8 个进程；
+- 按归因总 footprint 排序的全量工作组列表；
 - 正常/注意/严重/采集中状态和只读建议；
 - 无历史、无操作能力。
 
@@ -343,7 +352,7 @@ PID 不是稳定身份。内部使用 `(pid, start_time)` 作为进程键，避�
 - Codex 自动化、MaiBot、Ghostty、虚拟机识别器；
 - 压力等级和趋势；
 - 建议引擎；
-- 最近 24 小时事件环形历史；
+- 最近 24 小时磁盘历史（分钟粒度）；
 - 忽略/稍后提醒规则。
 
 验收：能重现当前已观察的 Chrome/Node/虚拟机场景，并给出正确优先级。
@@ -363,7 +372,7 @@ PID 不是稳定身份。内部使用 `(pid, start_time)` 作为进程键，避�
 首版按以下默认值实现：
 
 - 设备：当前 Apple Silicon Mac；
-- 监控范围：本机、当前用户进程；
+- 监控范围：本机所有可枚举进程；
 - UI：菜单栏常驻 + popover；
 - 网络：关闭；
 - 历史：本地 24 小时；
@@ -406,13 +415,13 @@ Run the probe with:
 swift run memory-monitor-probe
 ~~~
 
-The probe deliberately prints executable basenames instead of full command lines. The menu bar UI, pressure evaluation, and baseline recommendations are now available in Phase 1; workload grouping and trend history remain in the next phases.
+The probe deliberately prints executable basenames instead of full command lines. The menu bar UI, pressure evaluation, workload grouping, trend analysis, and disk-backed history are available in the current build.
 
 ### Phase 1 completed
 
 - Added `memory-monitor-app`, a SwiftUI `MenuBarExtra` accessory app.
 - Added a five-second read-only refresh loop backed by `MemoryMonitorCore`.
-- Added pressure classification, system metric tiles, recommendations, and top-footprint process rows.
+- Added pressure classification, system metric tiles, recommendations, and full workload-group rows.
 - Kept process display limited to names, PIDs, parents, and memory values; no command lines or control actions.
 - Verified with `swift build --product memory-monitor-app`, `swift test`, and a real arm64 CLI probe run.
 
@@ -422,15 +431,27 @@ Launch during development with:
 swift run memory-monitor-app
 ~~~
 
-Persistent trend history and process controls remain planned for later phases.
+Process controls remain planned for later phases.
 
-### Phase 2 in progress
+### Phase 2 completed
 
 - Added `WorkloadGrouper` to aggregate each sample into explainable workload groups.
-- Current rules cover Codex automation descendants, Chrome, Safari/WebKit, Ghostty/development services, MaiBot, virtual machines, common runtimes, and system processes.
-- The popover now shows group footprint, RSS, process count, and the largest member instead of a flat process-only list.
+- Current rules cover Codex automation descendants, Chrome, Safari/WebKit, unassigned WebKit, Ghostty/development services, MaiBot, virtual machines, common runtimes, and system processes.
+- The popover now shows all sampled process groups, group footprint/RSS attribution totals, process count, and the largest member instead of a flat process-only list.
 - Added `WorkloadTrendAnalyzer` to compare consecutive samples and surface the fastest-growing existing group.
 - The UI reports a growth recommendation only after a group grows by at least 16 MiB in one sampling interval.
 - Added an in-memory `MemoryHistoryBuffer` retaining the latest 60 samples (about five minutes at the default interval).
-- The popover now shows available-memory, compression, and Swap changes across the retained window.
-- Group identity is label-based for this phase; persistent disk-backed history and richer parent/work-directory evidence are still pending.
+- Added `HistoryStore`, a versioned JSON file at `~/Library/Application Support/MemoryMonitor/history.json`.
+- History records are coalesced to one record per minute, retain 24 hours, write atomically, and contain only system metrics plus privacy-preserving workload attribution totals. To keep the file lightweight, each record keeps the top 40 workloads and separate user/system aggregates for the remainder.
+- The popover now shows available-memory, compression, and Swap changes across the persisted window, and reports history write errors separately from sampling errors.
+- Process enumeration retries when the PID list grows during a sample; unavailable physical footprint values are marked as estimates.
+- Group identity remains label-based; richer parent/work-directory evidence and process controls are still pending.
+
+### 当前限制与下一步
+
+- 面板关闭时目前仍按 5 秒刷新；低频后台采样和面板打开时的加速刷新尚未接入；
+- 压力等级尚未加入设计中的 30 秒持续时间防抖，瞬时尖峰仍可能立即改变状态；
+- 工作组识别仍是可解释的名称/父链启发式，Node/Python 的不同项目可能需要更细的工作目录身份；
+- 当前 Swift Package 生成命令行可执行文件，正式 `.app` bundle、签名、登录启动和沙盒策略仍待确定；
+- `libproc` 属于 macOS 私有接口，已在本机 arm64 macOS 验证，其他系统版本需要单独回归；
+- 退出和强制结束能力仍保持只读边界，后续实现必须只允许当前用户且逐次确认。
