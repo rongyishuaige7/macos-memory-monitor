@@ -423,3 +423,10 @@ swift run memory-monitor-app
 ~~~
 
 Workload grouping, trend history, and process controls remain planned for later phases.
+
+### Phase 2 in progress
+
+- Added `WorkloadGrouper` to aggregate each sample into explainable workload groups.
+- Current rules cover Codex automation descendants, Chrome, Safari/WebKit, Ghostty/development services, MaiBot, virtual machines, common runtimes, and system processes.
+- The popover now shows group footprint, RSS, process count, and the largest member instead of a flat process-only list.
+- Group identity is label-based for this phase; persistent trends and richer parent/work-directory evidence are still pending.

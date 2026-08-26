@@ -266,6 +266,120 @@ public struct ProcessSampler: Sendable {
     }
 }
 
+public struct WorkloadGroupSnapshot: Codable, Sendable, Identifiable {
+    public let id: String
+    public let title: String
+    public let processCount: Int
+    public let physicalFootprintBytes: UInt64
+    public let residentBytes: UInt64
+    public let isSystem: Bool
+    public let representativeProcess: String
+
+    public init(
+        id: String,
+        title: String,
+        processCount: Int,
+        physicalFootprintBytes: UInt64,
+        residentBytes: UInt64,
+        isSystem: Bool,
+        representativeProcess: String
+    ) {
+        self.id = id
+        self.title = title
+        self.processCount = processCount
+        self.physicalFootprintBytes = physicalFootprintBytes
+        self.residentBytes = residentBytes
+        self.isSystem = isSystem
+        self.representativeProcess = representativeProcess
+    }
+}
+
+/// Groups one sampling pass into stable, user-facing workload labels.
+public struct WorkloadGrouper: Sendable {
+    public init() {}
+
+    public func group(_ processes: [ProcessSnapshot]) -> [WorkloadGroupSnapshot] {
+        let byPID = Dictionary(uniqueKeysWithValues: processes.map { ($0.identity.pid, $0) })
+        var buckets: [String: (title: String, processes: [ProcessSnapshot], isSystem: Bool)] = [:]
+
+        for process in processes {
+            let classification = classify(process, byPID: byPID)
+            var bucket = buckets[classification.id] ?? (
+                title: classification.title,
+                processes: [],
+                isSystem: classification.isSystem
+            )
+            bucket.processes.append(process)
+            buckets[classification.id] = bucket
+        }
+
+        return buckets.map { id, bucket in
+            let largest = bucket.processes.max { $0.physicalFootprintBytes < $1.physicalFootprintBytes }
+            return WorkloadGroupSnapshot(
+                id: id,
+                title: bucket.title,
+                processCount: bucket.processes.count,
+                physicalFootprintBytes: bucket.processes.reduce(0) { $0 + $1.physicalFootprintBytes },
+                residentBytes: bucket.processes.reduce(0) { $0 + $1.residentBytes },
+                isSystem: bucket.isSystem,
+                representativeProcess: largest?.name ?? "(unknown)"
+            )
+        }
+        .sorted {
+            if $0.isSystem != $1.isSystem { return !$0.isSystem }
+            return $0.physicalFootprintBytes > $1.physicalFootprintBytes
+        }
+    }
+
+    private func classify(
+        _ process: ProcessSnapshot,
+        byPID: [Int32: ProcessSnapshot]
+    ) -> (id: String, title: String, isSystem: Bool) {
+        let names = ancestorNames(for: process, byPID: byPID)
+        let combined = names.joined(separator: " ").lowercased()
+        let own = process.name.lowercased()
+        let path = process.executablePath?.lowercased() ?? ""
+        let identityText = "\(own) \(path)"
+
+        if process.isSystem || ["kernel_task", "windowserver", "controlcenter", "launchd"].contains(own) {
+            return ("system", "系统", true)
+        }
+        if combined.contains("codex") && (identityText.contains("chrome") || identityText.contains("chromium") || identityText.contains("node")) {
+            return ("codex-automation", "Codex 自动化", false)
+        }
+        if own.contains("webkit") || own.contains("safari") || path.contains("webkit") || path.contains("safari") {
+            return ("safari-webkit", "Safari/WebKit", false)
+        }
+        if identityText.contains("chrome") || identityText.contains("chromium") {
+            return ("chrome", "Chrome", false)
+        }
+        if combined.contains("ghostty") {
+            return ("ghostty-services", "Ghostty/开发服务", false)
+        }
+        if identityText.contains("maibot") || path.contains("maibot") {
+            return ("maibot", "MaiBot", false)
+        }
+        if identityText.contains("virtualization") || identityText.contains("virtual machine") || identityText.contains("vmm") {
+            return ("virtual-machines", "虚拟机", false)
+        }
+        if own.contains("python") || own.contains("node") {
+            return ("runtime-\(own)", own, false)
+        }
+        return ("process-\(own)", process.name, false)
+    }
+
+    private func ancestorNames(for process: ProcessSnapshot, byPID: [Int32: ProcessSnapshot]) -> [String] {
+        var names = [process.name]
+        var parentPID = process.parentPID
+        var visited = Set<Int32>()
+        while parentPID > 0, visited.insert(parentPID).inserted, let parent = byPID[parentPID] {
+            names.append(parent.name)
+            parentPID = parent.parentPID
+        }
+        return names
+    }
+}
+
 public enum MemoryFormatter {
     public static func bytes(_ value: UInt64) -> String {
         let units = ["B", "KiB", "MiB", "GiB", "TiB"]

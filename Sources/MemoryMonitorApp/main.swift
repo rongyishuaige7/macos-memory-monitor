@@ -25,7 +25,7 @@ struct MemoryMonitorApp: App {
 @MainActor
 final class MonitorViewModel: ObservableObject {
     @Published private(set) var system: SystemMemorySnapshot?
-    @Published private(set) var processes: [ProcessSnapshot] = []
+    @Published private(set) var groups: [WorkloadGroupSnapshot] = []
     @Published private(set) var lastError: String?
     @Published private(set) var updatedAt: Date?
 
@@ -66,7 +66,7 @@ final class MonitorViewModel: ObservableObject {
             switch result {
             case let .success(snapshot):
                 system = snapshot.system
-                processes = snapshot.processes
+                groups = snapshot.groups
                 updatedAt = snapshot.timestamp
                 lastError = nil
             case let .failure(error):
@@ -91,7 +91,11 @@ private struct MonitorSampler: Sendable {
             let system = try systemSampler.sample()
             let processes = try processSampler.sample()
                 .sorted { $0.physicalFootprintBytes > $1.physicalFootprintBytes }
-            return .success(MonitorSnapshot(timestamp: Date(), system: system, processes: processes))
+            return .success(MonitorSnapshot(
+                timestamp: Date(),
+                system: system,
+                groups: WorkloadGrouper().group(processes)
+            ))
         } catch {
             return .failure(error)
         }
@@ -101,7 +105,7 @@ private struct MonitorSampler: Sendable {
 private struct MonitorSnapshot: Sendable {
     let timestamp: Date
     let system: SystemMemorySnapshot
-    let processes: [ProcessSnapshot]
+    let groups: [WorkloadGroupSnapshot]
 }
 
 enum PressureState: String {
@@ -233,7 +237,7 @@ private struct MonitorPopover: View {
     private var processList: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack {
-                Text("高占用进程")
+            Text("工作组")
                     .font(.headline)
                 Spacer()
                 Text("footprint")
@@ -241,13 +245,13 @@ private struct MonitorPopover: View {
                     .foregroundStyle(.secondary)
             }
 
-            if model.processes.isEmpty {
-                Text("暂无进程数据")
+            if model.groups.isEmpty {
+                Text("暂无工作组数据")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
-                ForEach(Array(model.processes.prefix(8))) { process in
-                    ProcessRow(process: process)
+                ForEach(Array(model.groups.prefix(8))) { group in
+                    WorkloadGroupRow(group: group)
                 }
             }
         }
@@ -291,23 +295,27 @@ private struct MetricTile: View {
     }
 }
 
-private struct ProcessRow: View {
-    let process: ProcessSnapshot
+private struct WorkloadGroupRow: View {
+    let group: WorkloadGroupSnapshot
 
     var body: some View {
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(process.executablePath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? process.name)
+                Text(group.title)
                     .font(.system(size: 12, weight: .medium))
                     .lineLimit(1)
-                Text("PID \(process.identity.pid) · parent \(process.parentPID)")
+                Text("\(group.processCount) 个进程 · \(group.representativeProcess)")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
             Spacer(minLength: 4)
-            Text(MemoryFormatter.bytes(process.physicalFootprintBytes))
-                .font(.system(size: 12, weight: .medium, design: .monospaced))
-                .foregroundStyle(.primary)
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(MemoryFormatter.bytes(group.physicalFootprintBytes))
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                Text("RSS \(MemoryFormatter.bytes(group.residentBytes))")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 }
