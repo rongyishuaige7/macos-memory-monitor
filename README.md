@@ -205,6 +205,8 @@ Ghostty 中的构建、日志或 Python 服务长时间运行。界面应显示�
 - `通信应用`：微信、QQ 等；
 - `系统`：`kernel_task`、`WindowServer`、`ControlCenter` 和系统守护进程。
 
+工作目录标签目前只作为 Node/Python 等通用运行时的细分键；Chrome、Safari/WebKit、Codex 自动化、Ghostty、虚拟机和系统组仍先按各自的高优先级规则归类。
+
 PID 不是稳定身份。内部使用 `(pid, start_time)` 作为进程键，避免旧 PID 被复用后误关联。
 
 ## 8. 压力等级与建议引擎
@@ -246,7 +248,7 @@ PID 不是稳定身份。内部使用 `(pid, start_time)` 作为进程键，避�
 
 - `SystemSampler`：系统内存和 swap；
 - `ProcessSampler`：进程枚举和资源指标；
-- `IdentityResolver`：应用名、图标、父子链和脱敏标签；
+- `IdentityResolver`：应用名、图标、父子链和脱敏标签；工作目录只提取安全的项目目录名；
 - `WorkloadGrouper`：工作组识别与聚合；
 - `PressureEvaluator`：等级、趋势和持续时间；
 - `RecommendationEngine`：建议生成与排序；
@@ -280,6 +282,7 @@ PID 不是稳定身份。内部使用 `(pid, start_time)` 作为进程键，避�
 - 压力等级变化需连续 30 秒确认，避免瞬时尖峰触发状态切换；
 - 只有面板打开或压力异常时才进行更完整的进程细节解析；
 - 历史使用版本化 JSON 文件，按分钟合并并默认保留 24 小时，避免引入重型数据库；
+- 工作目录身份只保留经过过滤的 basename，用于细分 Node/Python 等通用运行时；无法读取或无法区分项目时回退到通用 runtime 组；
 - 采集失败、权限不足或进程消失时优雅降级；
 - 监视器必须排除自身的建议对象，避免自我结束或自我放大。
 
@@ -287,7 +290,7 @@ PID 不是稳定身份。内部使用 `(pid, start_time)` 作为进程键，避�
 
 - 首版完全本地运行，不联网、不上传遥测；
 - 不持久化完整命令行、环境变量、URL、token 或 cookie；
-- 日志中的路径只保留应用名、项目目录 basename 或脱敏标签；
+- 日志和历史中的路径只保留应用名、项目目录 basename 或脱敏标签；完整工作目录永不离开采集层；
 - 监视面板观察本机所有可枚举进程；未来的操作能力仍只允许当前用户进程；
 - 系统进程只读展示，不提供操作入口；
 - 任何未来的操作功能都必须重新验证 PID、启动时间、路径、用户和父子关系；
@@ -449,11 +452,12 @@ Process controls remain planned for later phases.
 - Process enumeration retries when the PID list grows during a sample; unavailable physical footprint values are marked as estimates.
 - Added adaptive sampling: the panel uses a three-second cadence, normal background monitoring uses twenty seconds, and elevated pressure uses five seconds even when the panel is closed. A visibility change wakes the scheduler immediately.
 - Added debounced pressure evaluation: the first successful sample establishes a baseline, and later upgrades or recovery transitions must persist for 30 seconds. Raw elevated observations still request the faster cadence while they are being confirmed.
-- Group identity remains label-based; richer parent/work-directory evidence and process controls are still pending.
+- Added privacy-preserving working-directory labels for generic Node/Python runtimes. Only a filtered directory basename is retained; common roots such as the home directory, `/tmp`, and `/var/folders` are ignored. A process inherits the first usable label found in its parent chain, and unreadable paths fall back to the previous runtime group.
+- Group identity remains heuristic; formal app bundles, login launch behavior, and process controls are still pending.
 
 ### 当前限制与下一步
 
-- 工作组识别仍是可解释的名称/父链启发式，Node/Python 的不同项目可能需要更细的工作目录身份；
+- 工作组识别仍是可解释的名称/父链/目录 basename 启发式；目录不可读、项目目录同名或运行时不属于 Node/Python 时仍可能需要人工区分；
 - 当前 Swift Package 生成命令行可执行文件，正式 `.app` bundle、签名、登录启动和沙盒策略仍待确定；
 - `libproc` 属于 macOS 私有接口，已在本机 arm64 macOS 验证，其他系统版本需要单独回归；
 - 退出和强制结束能力仍保持只读边界，后续实现必须只允许当前用户且逐次确认。

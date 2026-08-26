@@ -149,6 +149,92 @@ public struct ProcessIdentity: Hashable, Codable, Sendable {
     }
 }
 
+/// Extracts a short, privacy-preserving project label from a process working
+/// directory. The full path never leaves the sampling layer.
+public enum WorkingDirectoryLabelSanitizer {
+    public static let maxLength = 48
+
+    /// Returns a safe basename for an absolute working-directory path.
+    /// Common roots and transient macOS directories are intentionally omitted.
+    public static func label(
+        from path: String,
+        homeDirectory: String = NSHomeDirectory()
+    ) -> String? {
+        guard path.hasPrefix("/"),
+              !path.unicodeScalars.contains(where: { $0.value == 0 }) else {
+            return nil
+        }
+        let normalizedPath = URL(fileURLWithPath: path).standardizedFileURL.path
+        guard !normalizedPath.isEmpty, normalizedPath != "/" else { return nil }
+
+        let normalizedHome = URL(fileURLWithPath: homeDirectory).standardizedFileURL.path
+        if normalizedPath == normalizedHome {
+            return nil
+        }
+        if transientPrefixes.contains(where: { prefix in
+            normalizedPath == prefix || normalizedPath.hasPrefix(prefix + "/")
+        }) {
+            return nil
+        }
+
+        return label(fromComponent: URL(fileURLWithPath: normalizedPath).lastPathComponent)
+    }
+
+    /// Cleans a basename for display. This also handles synthetic/test input
+    /// so callers cannot smuggle path separators or terminal control codes.
+    public static func label(fromComponent component: String) -> String? {
+        var filtered = ""
+        for scalar in component.unicodeScalars {
+            if isControl(scalar) {
+                continue
+            }
+            if scalar.value == 0x2F || scalar.value == 0x5C {
+                filtered.append("-")
+            } else {
+                filtered.unicodeScalars.append(scalar)
+            }
+        }
+
+        let collapsed = filtered
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !collapsed.isEmpty, collapsed != ".", collapsed != ".." else { return nil }
+
+        let limited = String(collapsed.prefix(maxLength))
+        return limited.isEmpty ? nil : limited
+    }
+
+    /// Encodes a label for use in a stable workload ID without losing
+    /// distinction between non-ASCII project names.
+    public static func identifierComponent(for label: String) -> String {
+        let cleaned = self.label(fromComponent: label) ?? "project"
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+        return cleaned.addingPercentEncoding(withAllowedCharacters: allowed) ?? "project"
+    }
+
+    private static let transientPrefixes = [
+        "/tmp",
+        "/private/tmp",
+        "/var/tmp",
+        "/private/var/tmp",
+        "/var/folders",
+        "/private/var/folders"
+    ]
+
+    private static func isControl(_ scalar: Unicode.Scalar) -> Bool {
+        let value = scalar.value
+        // C0/C1 controls and bidirectional/invisible formatting controls are
+        // not useful in a process label and can make UI/log output deceptive.
+        return value < 0x20
+            || (0x7F...0x9F).contains(value)
+            || (0x200B...0x200F).contains(value)
+            || (0x202A...0x202E).contains(value)
+            || (0x2060...0x2064).contains(value)
+            || (0x2066...0x2069).contains(value)
+    }
+}
+
 public struct ProcessSnapshot: Codable, Sendable, Identifiable {
     public let identity: ProcessIdentity
     public let parentPID: Int32
@@ -160,6 +246,8 @@ public struct ProcessSnapshot: Codable, Sendable, Identifiable {
     public let physicalFootprintBytes: UInt64
     /// True when libproc could not provide phys_footprint and RSS was used as a fallback.
     public let physicalFootprintIsEstimated: Bool
+    /// A sanitized basename of the current working directory, when available.
+    public let workingDirectoryLabel: String?
     public let virtualBytes: UInt64
     public let userTimeNanos: UInt64
     public let systemTimeNanos: UInt64
@@ -177,6 +265,7 @@ public struct ProcessSnapshot: Codable, Sendable, Identifiable {
         residentBytes: UInt64,
         physicalFootprintBytes: UInt64,
         physicalFootprintIsEstimated: Bool = false,
+        workingDirectoryLabel: String? = nil,
         virtualBytes: UInt64,
         userTimeNanos: UInt64,
         systemTimeNanos: UInt64,
@@ -191,6 +280,12 @@ public struct ProcessSnapshot: Codable, Sendable, Identifiable {
         self.residentBytes = residentBytes
         self.physicalFootprintBytes = physicalFootprintBytes
         self.physicalFootprintIsEstimated = physicalFootprintIsEstimated
+        self.workingDirectoryLabel = workingDirectoryLabel.flatMap { label in
+            // A basename cannot contain path separators. Rejecting them here
+            // keeps public model construction from reintroducing full paths.
+            guard !label.contains("/"), !label.contains("\\") else { return nil }
+            return WorkingDirectoryLabelSanitizer.label(fromComponent: label)
+        }
         self.virtualBytes = virtualBytes
         self.userTimeNanos = userTimeNanos
         self.systemTimeNanos = systemTimeNanos
@@ -258,6 +353,10 @@ public struct ProcessSampler: Sendable {
             let end = bytes.firstIndex(of: 0) ?? bytes.count
             return String(decoding: bytes[..<end], as: UTF8.self)
         }
+        let processName = name.isEmpty ? "(unknown)" : name
+        let directoryLabel = capturesWorkingDirectory(for: processName)
+            ? workingDirectoryLabel(for: pid)
+            : nil
 
         return ProcessSnapshot(
             identity: ProcessIdentity(
@@ -268,11 +367,12 @@ public struct ProcessSampler: Sendable {
             parentPID: Int32(bsd.pbi_ppid),
             userID: UInt32(bsd.pbi_uid),
             isSystem: (bsd.pbi_flags & UInt32(PROC_FLAG_SYSTEM)) != 0,
-            name: name.isEmpty ? "(unknown)" : name,
+            name: processName,
             executablePath: executablePath(for: pid),
             residentBytes: task.pti_resident_size,
             physicalFootprintBytes: footprint,
             physicalFootprintIsEstimated: !footprintAvailable,
+            workingDirectoryLabel: directoryLabel,
             virtualBytes: task.pti_virtual_size,
             userTimeNanos: task.pti_total_user,
             systemTimeNanos: task.pti_total_system,
@@ -287,6 +387,28 @@ public struct ProcessSampler: Sendable {
         }
         guard length > 0 else { return nil }
         return String(decoding: buffer.prefix(Int(length)), as: UTF8.self)
+    }
+
+    private func capturesWorkingDirectory(for name: String) -> Bool {
+        let lowercased = name.lowercased()
+        return lowercased.contains("node") || lowercased.contains("python")
+    }
+
+    private func workingDirectoryLabel(for pid: pid_t) -> String? {
+        var info = proc_vnodepathinfo()
+        let infoSize = Int32(MemoryLayout<proc_vnodepathinfo>.stride)
+        let infoBytes = withUnsafeMutablePointer(to: &info) { pointer in
+            proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, pointer, infoSize)
+        }
+        guard infoBytes >= infoSize else { return nil }
+
+        return withUnsafeBytes(of: info.pvi_cdir.vip_path) { rawBuffer -> String? in
+            let bytes = rawBuffer.bindMemory(to: UInt8.self)
+            let end = bytes.firstIndex(of: 0) ?? bytes.count
+            guard end > 0 else { return nil }
+            let path = String(decoding: bytes[..<end], as: UTF8.self)
+            return WorkingDirectoryLabelSanitizer.label(from: path)
+        }
     }
 }
 
@@ -404,10 +526,50 @@ public struct WorkloadGrouper: Sendable {
         if identityText.contains("virtualization") || identityText.contains("virtual machine") || identityText.contains("vmm") {
             return ("virtual-machines", "虚拟机", false)
         }
-        if own.contains("python") || own.contains("node") {
-            return ("runtime-\(own)", own, false)
+        if let runtime = runtimeDescriptor(for: own) {
+            if let label = workingDirectoryLabel(for: process, byPID: byPID) {
+                let component = WorkingDirectoryLabelSanitizer.identifierComponent(for: label)
+                return (
+                    "runtime-\(runtime.id)-\(component)",
+                    "\(runtime.title) · \(label)",
+                    false
+                )
+            }
+            return ("runtime-\(runtime.id)", runtime.title, false)
         }
         return ("process-\(own)", process.name, false)
+    }
+
+    private func runtimeDescriptor(for name: String) -> (id: String, title: String)? {
+        if name.contains("python") {
+            return ("python", "Python")
+        }
+        if name.contains("node") {
+            return ("node", "Node")
+        }
+        return nil
+    }
+
+    private func workingDirectoryLabel(
+        for process: ProcessSnapshot,
+        byPID: [Int32: ProcessSnapshot]
+    ) -> String? {
+        var current = process
+        var visited = Set<Int32>()
+        while true {
+            if let label = current.workingDirectoryLabel,
+               let sanitized = WorkingDirectoryLabelSanitizer.label(fromComponent: label) {
+                return sanitized
+            }
+
+            let parentPID = current.parentPID
+            guard parentPID > 0,
+                  visited.insert(parentPID).inserted,
+                  let parent = byPID[parentPID] else {
+                return nil
+            }
+            current = parent
+        }
     }
 
     private func ancestorNames(for process: ProcessSnapshot, byPID: [Int32: ProcessSnapshot]) -> [String] {

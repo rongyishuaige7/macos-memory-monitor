@@ -63,6 +63,93 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertTrue(processes.contains { $0.identity.pid == getpid() })
     }
 
+    func testWorkingDirectoryLabelSanitizerFiltersCommonRoots() {
+        XCTAssertEqual(
+            WorkingDirectoryLabelSanitizer.label(
+                from: "/Users/foo/projects/api",
+                homeDirectory: "/Users/foo"
+            ),
+            "api"
+        )
+        XCTAssertNil(
+            WorkingDirectoryLabelSanitizer.label(
+                from: "/Users/foo",
+                homeDirectory: "/Users/foo"
+            )
+        )
+        XCTAssertNil(
+            WorkingDirectoryLabelSanitizer.label(
+                from: "/tmp/build",
+                homeDirectory: "/Users/foo"
+            )
+        )
+        XCTAssertNil(
+            WorkingDirectoryLabelSanitizer.label(
+                from: "/private/var/folders/xx/random",
+                homeDirectory: "/Users/foo"
+            )
+        )
+        XCTAssertEqual(
+            WorkingDirectoryLabelSanitizer.label(
+                from: "/tmp2/project",
+                homeDirectory: "/Users/foo"
+            ),
+            "project"
+        )
+        XCTAssertNil(
+            WorkingDirectoryLabelSanitizer.label(
+                from: "relative/project",
+                homeDirectory: "/Users/foo"
+            )
+        )
+        XCTAssertNil(
+            WorkingDirectoryLabelSanitizer.label(
+                from: "/Users/foo/project\u{0000}suffix",
+                homeDirectory: "/Users/foo"
+            )
+        )
+        XCTAssertNil(
+            WorkingDirectoryLabelSanitizer.label(
+                from: "/",
+                homeDirectory: "/Users/foo"
+            )
+        )
+    }
+
+    func testWorkingDirectoryLabelSanitizerCleansComponentsAndIDs() {
+        XCTAssertEqual(
+            WorkingDirectoryLabelSanitizer.label(fromComponent: " api/\nworker "),
+            "api-worker"
+        )
+
+        let longComponent = String(repeating: "x", count: 100)
+        let limited = try! XCTUnwrap(
+            WorkingDirectoryLabelSanitizer.label(fromComponent: longComponent)
+        )
+        XCTAssertEqual(limited.count, WorkingDirectoryLabelSanitizer.maxLength)
+        XCTAssertFalse(limited.contains("\n"))
+
+        let unicodeID = WorkingDirectoryLabelSanitizer.identifierComponent(for: "中文项目")
+        let otherUnicodeID = WorkingDirectoryLabelSanitizer.identifierComponent(for: "另一个项目")
+        XCTAssertNotEqual(unicodeID, otherUnicodeID)
+        XCTAssertFalse(unicodeID.contains("/"))
+    }
+
+    func testProcessSnapshotCodableRetainsWorkingDirectoryLabel() throws {
+        let process = makeProcess(pid: 9, name: "node", footprint: 100, workingDirectoryLabel: "api")
+        let data = try JSONEncoder().encode(process)
+        let decoded = try JSONDecoder().decode(ProcessSnapshot.self, from: data)
+        XCTAssertEqual(decoded.workingDirectoryLabel, "api")
+
+        let unsafe = makeProcess(
+            pid: 10,
+            name: "node",
+            footprint: 100,
+            workingDirectoryLabel: "/Users/foo/projects/api"
+        )
+        XCTAssertNil(unsafe.workingDirectoryLabel)
+    }
+
     func testWorkloadGrouperAggregatesChromeHelpers() {
         let processes = [
             makeProcess(pid: 10, name: "Google Chrome", footprint: 500),
@@ -81,7 +168,7 @@ final class MemoryMonitorCoreTests: XCTestCase {
     func testWorkloadGrouperUsesCodexAncestorForAutomation() {
         let processes = [
             makeProcess(pid: 20, name: "codex", footprint: 100),
-            makeProcess(pid: 21, name: "node", parentPID: 20, footprint: 200),
+            makeProcess(pid: 21, name: "node", parentPID: 20, footprint: 200, workingDirectoryLabel: "api"),
             makeProcess(pid: 22, name: "Google Chrome Helper", parentPID: 21, footprint: 300)
         ]
 
@@ -89,6 +176,46 @@ final class MemoryMonitorCoreTests: XCTestCase {
         let automation = try! XCTUnwrap(groups.first { $0.id == "codex-automation" })
         XCTAssertEqual(automation.processCount, 2)
         XCTAssertEqual(automation.physicalFootprintBytes, 500)
+        XCTAssertNil(groups.first { $0.id == "runtime-node-api" })
+    }
+
+    func testWorkloadGrouperSeparatesGenericRuntimesByWorkingDirectory() {
+        let processes = [
+            makeProcess(pid: 40, name: "node", footprint: 100, workingDirectoryLabel: "api"),
+            makeProcess(pid: 41, name: "node", footprint: 200, workingDirectoryLabel: "bot"),
+            makeProcess(pid: 42, name: "python3", footprint: 300, workingDirectoryLabel: "bot")
+        ]
+
+        let groups = WorkloadGrouper().group(processes)
+        XCTAssertEqual(
+            Set(groups.map(\.id)),
+            Set(["runtime-node-api", "runtime-node-bot", "runtime-python-bot"])
+        )
+        XCTAssertEqual(groups.first { $0.id == "runtime-node-api" }?.title, "Node · api")
+        XCTAssertEqual(groups.first { $0.id == "runtime-python-bot" }?.title, "Python · bot")
+    }
+
+    func testWorkloadGrouperInheritsLabelFromRuntimeAncestor() {
+        let processes = [
+            makeProcess(pid: 50, name: "node", footprint: 100, workingDirectoryLabel: "api"),
+            makeProcess(pid: 51, name: "node", parentPID: 50, footprint: 200),
+            makeProcess(pid: 52, name: "python3", parentPID: 51, footprint: 300)
+        ]
+
+        let groups = WorkloadGrouper().group(processes)
+        XCTAssertEqual(groups.first { $0.id == "runtime-node-api" }?.processCount, 2)
+        XCTAssertEqual(groups.first { $0.id == "runtime-python-api" }?.processCount, 1)
+    }
+
+    func testWorkloadGrouperFallsBackWhenWorkingDirectoryIsUnavailable() {
+        let processes = [
+            makeProcess(pid: 60, name: "node", footprint: 100),
+            makeProcess(pid: 61, name: "python3", footprint: 200)
+        ]
+
+        let groups = WorkloadGrouper().group(processes)
+        XCTAssertEqual(groups.first { $0.id == "runtime-node" }?.title, "Node")
+        XCTAssertEqual(groups.first { $0.id == "runtime-python" }?.title, "Python")
     }
 
     func testWorkloadGrouperDoesNotAssumeEveryWebKitProcessBelongsToSafari() {
@@ -355,6 +482,32 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertEqual(aggregate.attributedFootprintBytes, 600)
     }
 
+    func testHistoryStorePersistsOnlySanitizedRuntimeIdentity() async throws {
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let processes = [
+            makeProcess(
+                pid: 70,
+                name: "node",
+                footprint: 100,
+                workingDirectoryLabel: "api"
+            )
+        ]
+        let groups = WorkloadGrouper().group(processes)
+        let store = HistoryStore(fileURL: url)
+        _ = try await store.append(
+            snapshot: makeSystemSnapshot(timestamp: Date(timeIntervalSince1970: 1_700_000_000), compressed: 1, swap: 1),
+            groups: groups,
+            now: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+
+        let persisted = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertTrue(persisted.contains("runtime-node-api"))
+        XCTAssertFalse(persisted.contains("/Users/"))
+        XCTAssertFalse(persisted.contains("commandLine"))
+    }
+
     func testHistoryStoreRejectsCorruptFile() async throws {
         let (url, directory) = makeTemporaryHistoryURL()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -455,7 +608,8 @@ final class MemoryMonitorCoreTests: XCTestCase {
         name: String,
         parentPID: Int32 = 1,
         footprint: UInt64,
-        isSystem: Bool = false
+        isSystem: Bool = false,
+        workingDirectoryLabel: String? = nil
     ) -> ProcessSnapshot {
         ProcessSnapshot(
             identity: ProcessIdentity(pid: pid, startTimeSeconds: 1, startTimeMicroseconds: UInt64(pid)),
@@ -466,6 +620,7 @@ final class MemoryMonitorCoreTests: XCTestCase {
             executablePath: "/usr/bin/\(name)",
             residentBytes: footprint,
             physicalFootprintBytes: footprint,
+            workingDirectoryLabel: workingDirectoryLabel,
             virtualBytes: footprint,
             userTimeNanos: 0,
             systemTimeNanos: 0,
