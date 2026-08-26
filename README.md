@@ -406,7 +406,7 @@ Run the probe with:
 swift run memory-monitor-probe
 ~~~
 
-The probe deliberately prints executable basenames instead of full command lines. The menu bar UI, workload grouping, pressure evaluation, and recommendation engine remain in the next phases.
+The probe deliberately prints executable basenames instead of full command lines. The menu bar UI, pressure evaluation, and baseline recommendations are now available in Phase 1; workload grouping and trend history remain in the next phases.
 
 ### Phase 1 completed
 
