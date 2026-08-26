@@ -438,6 +438,19 @@ swift run memory-monitor-app
 
 Process controls remain planned for later phases.
 
+### 本地 App bundle 构建
+
+当前仓库同时提供一个不依赖 Xcode 工程的本地 `.app` 打包脚本。它会构建 `memory-monitor-app`、写入菜单栏应用所需的 `Info.plist`，检查 Apple Silicon 架构，并默认使用 ad-hoc 签名。为避免 iCloud Desktop/File Provider 自动附加 Finder 元数据，默认产物位于本机目录 `~/Library/Application Support/MemoryMonitor/dist/MemoryMonitor.app`：
+
+~~~bash
+./scripts/build-app.sh
+open "$HOME/Library/Application Support/MemoryMonitor/dist/MemoryMonitor.app"
+~~~
+
+也可以通过 `OUTPUT_DIR` 指定其他本机目录；脚本会拒绝 iCloud Drive 或其他 File Provider 路径，因为这些位置可能在签名后重新写入 `com.apple.FinderInfo`。脚本只生成本地产物，不会自动安装、注册登录启动项或修改系统 LaunchAgents。Developer ID 签名、沙盒策略和登录启动开关留到单独阶段决定。
+
+构建脚本支持以下环境变量：`CONFIGURATION=debug|release`、`APP_VERSION`、`BUILD_NUMBER`、`CODE_SIGN_IDENTITY` 和 `SKIP_SIGNING=1`。默认签名身份为本地 ad-hoc（`-`）。
+
 ### Phase 2 completed
 
 - Added `WorkloadGrouper` to aggregate each sample into explainable workload groups.
@@ -455,9 +468,19 @@ Process controls remain planned for later phases.
 - Added privacy-preserving working-directory labels for generic Node/Python runtimes. Only a filtered directory basename is retained; common roots such as the home directory, `/tmp`, and `/var/folders` are ignored. A process inherits the first usable label found in its parent chain, and unreadable paths fall back to the previous runtime group.
 - Group identity remains heuristic; formal app bundles, login launch behavior, and process controls are still pending.
 
+### Phase 3A completed：本地 App bundle
+
+本阶段只解决可重复构建和本地启动，不扩大监视器的运行权限：
+
+- 目标：从 SwiftPM 产物生成可由 Finder/Launch Services 打开的 `MemoryMonitor.app`；
+- 非目标：自动登录启动、系统级安装、Developer ID 发布签名、App Sandbox 和进程操作；
+- 架构：`scripts/build-app.sh` 负责构建、在本机临时目录组装并签名，再复制到本机输出目录；同时复制 `Resources/Info.plist`、校验 plist/架构并执行 ad-hoc 签名；
+- 风险：ad-hoc 签名只适合本机开发，不能替代 Developer ID 和 notarization；GUI 启动仍依赖当前用户会话；
+- 验收：脚本在当前 arm64 Mac 上成功产出 bundle，`plutil` 和 `codesign` 校验通过，`open` 后菜单栏进程可启动，核心测试不回归；File Provider 输出路径会在构建前明确失败并给出本机路径示例。
+
 ### 当前限制与下一步
 
 - 工作组识别仍是可解释的名称/父链/目录 basename 启发式；目录不可读、项目目录同名或运行时不属于 Node/Python 时仍可能需要人工区分；
-- 当前 Swift Package 生成命令行可执行文件，正式 `.app` bundle、签名、登录启动和沙盒策略仍待确定；
+- 已提供本地 `.app` bundle 构建脚本；Developer ID 发布签名、登录启动和沙盒策略仍待单独确定；
 - `libproc` 属于 macOS 私有接口，已在本机 arm64 macOS 验证，其他系统版本需要单独回归；
 - 退出和强制结束能力仍保持只读边界，后续实现必须只允许当前用户且逐次确认。
