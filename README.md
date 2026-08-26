@@ -422,7 +422,7 @@ Launch during development with:
 swift run memory-monitor-app
 ~~~
 
-Workload grouping, trend history, and process controls remain planned for later phases.
+Persistent trend history and process controls remain planned for later phases.
 
 ### Phase 2 in progress
 
@@ -431,4 +431,6 @@ Workload grouping, trend history, and process controls remain planned for later 
 - The popover now shows group footprint, RSS, process count, and the largest member instead of a flat process-only list.
 - Added `WorkloadTrendAnalyzer` to compare consecutive samples and surface the fastest-growing existing group.
 - The UI reports a growth recommendation only after a group grows by at least 16 MiB in one sampling interval.
-- Group identity is label-based for this phase; persistent trends and richer parent/work-directory evidence are still pending.
+- Added an in-memory `MemoryHistoryBuffer` retaining the latest 60 samples (about five minutes at the default interval).
+- The popover now shows available-memory, compression, and Swap changes across the retained window.
+- Group identity is label-based for this phase; persistent disk-backed history and richer parent/work-directory evidence are still pending.

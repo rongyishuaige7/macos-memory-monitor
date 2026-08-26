@@ -72,6 +72,20 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertEqual(growth.first?.rateBytesPerSecond, 120)
     }
 
+    func testMemoryHistoryBufferKeepsNewestEntries() {
+        let first = makeSystemSnapshot(timestamp: Date(timeIntervalSince1970: 1), compressed: 10, swap: 20)
+        let second = makeSystemSnapshot(timestamp: Date(timeIntervalSince1970: 2), compressed: 11, swap: 21)
+        let third = makeSystemSnapshot(timestamp: Date(timeIntervalSince1970: 3), compressed: 12, swap: 22)
+        var history = MemoryHistoryBuffer(capacity: 2)
+
+        history.append(snapshot: first)
+        history.append(snapshot: second)
+        history.append(snapshot: third)
+
+        XCTAssertEqual(history.entries.map(\.timestamp), [second.timestamp, third.timestamp])
+        XCTAssertEqual(history.entries.map(\.compressedBytes), [11, 12])
+    }
+
     private func makeGroup(id: String, title: String, footprint: UInt64) -> WorkloadGroupSnapshot {
         WorkloadGroupSnapshot(
             id: id,
@@ -81,6 +95,25 @@ final class MemoryMonitorCoreTests: XCTestCase {
             residentBytes: footprint,
             isSystem: false,
             representativeProcess: title
+        )
+    }
+
+    private func makeSystemSnapshot(timestamp: Date, compressed: UInt64, swap: UInt64) -> SystemMemorySnapshot {
+        SystemMemorySnapshot(
+            timestamp: timestamp,
+            totalBytes: 1_000,
+            pageSize: 1,
+            freeBytes: 100,
+            activeBytes: 500,
+            inactiveBytes: 0,
+            speculativeBytes: 0,
+            wiredBytes: 400,
+            purgeableBytes: 0,
+            compressedBytes: compressed,
+            throttledPages: 0,
+            swapTotalBytes: 100,
+            swapUsedBytes: swap,
+            swapFreeBytes: 100 - swap
         )
     }
 

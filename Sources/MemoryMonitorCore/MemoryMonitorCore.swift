@@ -433,6 +433,40 @@ public struct WorkloadTrendAnalyzer: Sendable {
     }
 }
 
+public struct MemoryHistoryEntry: Sendable, Codable, Identifiable, Equatable {
+    public let timestamp: Date
+    public let availableFraction: Double
+    public let compressedBytes: UInt64
+    public let swapUsedBytes: UInt64
+
+    public var id: Date { timestamp }
+
+    public init(snapshot: SystemMemorySnapshot) {
+        timestamp = snapshot.timestamp
+        availableFraction = snapshot.availableFraction
+        compressedBytes = snapshot.compressedBytes
+        swapUsedBytes = snapshot.swapUsedBytes
+    }
+}
+
+public struct MemoryHistoryBuffer: Sendable {
+    public let capacity: Int
+    private var storage: [MemoryHistoryEntry] = []
+
+    public init(capacity: Int = 60) {
+        self.capacity = max(capacity, 1)
+    }
+
+    public var entries: [MemoryHistoryEntry] { storage }
+
+    public mutating func append(snapshot: SystemMemorySnapshot) {
+        storage.append(MemoryHistoryEntry(snapshot: snapshot))
+        if storage.count > capacity {
+            storage.removeFirst(storage.count - capacity)
+        }
+    }
+}
+
 public enum MemoryFormatter {
     public static func bytes(_ value: UInt64) -> String {
         let units = ["B", "KiB", "MiB", "GiB", "TiB"]

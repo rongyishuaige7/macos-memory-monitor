@@ -27,12 +27,14 @@ final class MonitorViewModel: ObservableObject {
     @Published private(set) var system: SystemMemorySnapshot?
     @Published private(set) var groups: [WorkloadGroupSnapshot] = []
     @Published private(set) var growth: [WorkloadGrowth] = []
+    @Published private(set) var history: [MemoryHistoryEntry] = []
     @Published private(set) var lastError: String?
     @Published private(set) var updatedAt: Date?
 
     private var refreshTask: Task<Void, Never>?
     private let sampler = MonitorSampler()
     private let trendAnalyzer = WorkloadTrendAnalyzer()
+    private var historyBuffer = MemoryHistoryBuffer(capacity: 60)
     private var previousGroups: [WorkloadGroupSnapshot] = []
     private var previousSampleAt: Date?
 
@@ -69,6 +71,8 @@ final class MonitorViewModel: ObservableObject {
 
             switch result {
             case let .success(snapshot):
+                historyBuffer.append(snapshot: snapshot.system)
+                history = historyBuffer.entries
                 if let previousSampleAt {
                     growth = trendAnalyzer.growingGroups(
                         previous: previousGroups,
@@ -167,6 +171,7 @@ private struct MonitorPopover: View {
         VStack(alignment: .leading, spacing: 14) {
             header
             metrics
+            historyTrend
             recommendations
             processList
             footer
@@ -256,10 +261,40 @@ private struct MonitorPopover: View {
         }
     }
 
+    private var historyTrend: some View {
+        GroupBox("最近趋势") {
+            if let first = model.history.first, let last = model.history.last, model.history.count >= 2 {
+                VStack(alignment: .leading, spacing: 7) {
+                    HStack(spacing: 8) {
+                        TrendValue(
+                            title: "可用",
+                            value: String(format: "%+.1f%%", (last.availableFraction - first.availableFraction) * 100)
+                        )
+                        TrendValue(
+                            title: "压缩",
+                            value: signedBytes(last.compressedBytes, comparedTo: first.compressedBytes)
+                        )
+                        TrendValue(
+                            title: "Swap",
+                            value: signedBytes(last.swapUsedBytes, comparedTo: first.swapUsedBytes)
+                        )
+                    }
+                    Text("最近 \(model.history.count) 次采样 · 从 \(first.timestamp, style: .time) 到 \(last.timestamp, style: .time)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Text("等待更多采样以生成趋势")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
     private var processList: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack {
-            Text("工作组")
+                Text("工作组")
                     .font(.headline)
                 Spacer()
                 Text("footprint")
@@ -317,6 +352,24 @@ private struct MetricTile: View {
     }
 }
 
+private struct TrendValue: View {
+    let title: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.system(size: 12, weight: .medium, design: .monospaced))
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 private struct WorkloadGroupRow: View {
     let group: WorkloadGroupSnapshot
 
@@ -340,4 +393,11 @@ private struct WorkloadGroupRow: View {
             }
         }
     }
+}
+
+private func signedBytes(_ current: UInt64, comparedTo initial: UInt64) -> String {
+    if current >= initial {
+        return "+\(MemoryFormatter.bytes(current - initial))"
+    }
+    return "-\(MemoryFormatter.bytes(initial - current))"
 }
