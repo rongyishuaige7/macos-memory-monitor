@@ -380,6 +380,59 @@ public struct WorkloadGrouper: Sendable {
     }
 }
 
+public struct WorkloadGrowth: Codable, Sendable, Equatable, Identifiable {
+    public let id: String
+    public let title: String
+    public let deltaBytes: UInt64
+    public let currentFootprintBytes: UInt64
+    public let rateBytesPerSecond: Double
+
+    public init(
+        id: String,
+        title: String,
+        deltaBytes: UInt64,
+        currentFootprintBytes: UInt64,
+        rateBytesPerSecond: Double
+    ) {
+        self.id = id
+        self.title = title
+        self.deltaBytes = deltaBytes
+        self.currentFootprintBytes = currentFootprintBytes
+        self.rateBytesPerSecond = rateBytesPerSecond
+    }
+}
+
+public struct WorkloadTrendAnalyzer: Sendable {
+    public init() {}
+
+    /// Compares only groups present in both samples; new groups need a baseline first.
+    public func growingGroups(
+        previous: [WorkloadGroupSnapshot],
+        current: [WorkloadGroupSnapshot],
+        intervalSeconds: TimeInterval
+    ) -> [WorkloadGrowth] {
+        let previousByID = Dictionary(uniqueKeysWithValues: previous.map { ($0.id, $0) })
+        let interval = max(intervalSeconds, 0.001)
+        return current.compactMap { group in
+            guard let old = previousByID[group.id], group.physicalFootprintBytes > old.physicalFootprintBytes else {
+                return nil
+            }
+            let delta = group.physicalFootprintBytes - old.physicalFootprintBytes
+            return WorkloadGrowth(
+                id: group.id,
+                title: group.title,
+                deltaBytes: delta,
+                currentFootprintBytes: group.physicalFootprintBytes,
+                rateBytesPerSecond: Double(delta) / interval
+            )
+        }
+        .sorted {
+            if $0.deltaBytes != $1.deltaBytes { return $0.deltaBytes > $1.deltaBytes }
+            return $0.rateBytesPerSecond > $1.rateBytesPerSecond
+        }
+    }
+}
+
 public enum MemoryFormatter {
     public static func bytes(_ value: UInt64) -> String {
         let units = ["B", "KiB", "MiB", "GiB", "TiB"]

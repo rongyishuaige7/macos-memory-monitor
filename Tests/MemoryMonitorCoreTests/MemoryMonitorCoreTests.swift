@@ -49,6 +49,41 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertEqual(automation.physicalFootprintBytes, 500)
     }
 
+    func testWorkloadTrendAnalyzerReportsExistingGrowingGroups() {
+        let previous = [
+            makeGroup(id: "chrome", title: "Chrome", footprint: 1_000),
+            makeGroup(id: "stable", title: "Stable", footprint: 2_000)
+        ]
+        let current = [
+            makeGroup(id: "chrome", title: "Chrome", footprint: 1_600),
+            makeGroup(id: "stable", title: "Stable", footprint: 1_900),
+            makeGroup(id: "new", title: "New", footprint: 4_000)
+        ]
+
+        let growth = WorkloadTrendAnalyzer().growingGroups(
+            previous: previous,
+            current: current,
+            intervalSeconds: 5
+        )
+
+        XCTAssertEqual(growth.count, 1)
+        XCTAssertEqual(growth.first?.id, "chrome")
+        XCTAssertEqual(growth.first?.deltaBytes, 600)
+        XCTAssertEqual(growth.first?.rateBytesPerSecond, 120)
+    }
+
+    private func makeGroup(id: String, title: String, footprint: UInt64) -> WorkloadGroupSnapshot {
+        WorkloadGroupSnapshot(
+            id: id,
+            title: title,
+            processCount: 1,
+            physicalFootprintBytes: footprint,
+            residentBytes: footprint,
+            isSystem: false,
+            representativeProcess: title
+        )
+    }
+
     private func makeProcess(
         pid: Int32,
         name: String,

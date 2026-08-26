@@ -26,11 +26,15 @@ struct MemoryMonitorApp: App {
 final class MonitorViewModel: ObservableObject {
     @Published private(set) var system: SystemMemorySnapshot?
     @Published private(set) var groups: [WorkloadGroupSnapshot] = []
+    @Published private(set) var growth: [WorkloadGrowth] = []
     @Published private(set) var lastError: String?
     @Published private(set) var updatedAt: Date?
 
     private var refreshTask: Task<Void, Never>?
     private let sampler = MonitorSampler()
+    private let trendAnalyzer = WorkloadTrendAnalyzer()
+    private var previousGroups: [WorkloadGroupSnapshot] = []
+    private var previousSampleAt: Date?
 
     init() {
         refreshTask = Task { [weak self] in
@@ -65,6 +69,15 @@ final class MonitorViewModel: ObservableObject {
 
             switch result {
             case let .success(snapshot):
+                if let previousSampleAt {
+                    growth = trendAnalyzer.growingGroups(
+                        previous: previousGroups,
+                        current: snapshot.groups,
+                        intervalSeconds: snapshot.timestamp.timeIntervalSince(previousSampleAt)
+                    )
+                }
+                previousGroups = snapshot.groups
+                previousSampleAt = snapshot.timestamp
                 system = snapshot.system
                 groups = snapshot.groups
                 updatedAt = snapshot.timestamp
@@ -221,6 +234,15 @@ private struct MonitorPopover: View {
                 case .unknown:
                     Label("正在读取系统指标...", systemImage: "arrow.triangle.2.circlepath")
                         .foregroundStyle(.secondary)
+                }
+
+                if let fastest = model.growth.first,
+                   fastest.deltaBytes >= 16 * 1024 * 1024 {
+                    Label(
+                        "增长最快：\(fastest.title) +\(MemoryFormatter.bytes(fastest.deltaBytes))",
+                        systemImage: "arrow.up.right"
+                    )
+                    .foregroundStyle(.orange)
                 }
 
                 if let error = model.lastError {

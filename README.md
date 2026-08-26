@@ -429,4 +429,6 @@ Workload grouping, trend history, and process controls remain planned for later 
 - Added `WorkloadGrouper` to aggregate each sample into explainable workload groups.
 - Current rules cover Codex automation descendants, Chrome, Safari/WebKit, Ghostty/development services, MaiBot, virtual machines, common runtimes, and system processes.
 - The popover now shows group footprint, RSS, process count, and the largest member instead of a flat process-only list.
+- Added `WorkloadTrendAnalyzer` to compare consecutive samples and surface the fastest-growing existing group.
+- The UI reports a growth recommendation only after a group grows by at least 16 MiB in one sampling interval.
 - Group identity is label-based for this phase; persistent trends and richer parent/work-directory evidence are still pending.
