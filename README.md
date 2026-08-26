@@ -330,13 +330,13 @@ PID 不是稳定身份。内部使用 `(pid, start_time)` 作为进程键，避�
 
 ### Phase 1：只读菜单栏 MVP
 
-- 菜单栏状态；
-- popover 状态条；
-- 前 20 个进程和基础分组；
-- 系统保护对象标识；
+- 菜单栏常驻状态指示器；
+- popover 状态、可用估算、压缩和 swap 指标；
+- 按 physical footprint 排序的前 8 个进程；
+- 正常/注意/严重/采集中状态和只读建议；
 - 无历史、无操作能力。
 
-验收：常驻开销达标，面板在 1 秒内显示最新快照。
+验收：应用可构建，面板显示真实系统快照，采样失败时明确显示错误。
 
 ### Phase 2：个人工作组与建议
 
@@ -407,3 +407,19 @@ swift run memory-monitor-probe
 ~~~
 
 The probe deliberately prints executable basenames instead of full command lines. The menu bar UI, workload grouping, pressure evaluation, and recommendation engine remain in the next phases.
+
+### Phase 1 completed
+
+- Added `memory-monitor-app`, a SwiftUI `MenuBarExtra` accessory app.
+- Added a five-second read-only refresh loop backed by `MemoryMonitorCore`.
+- Added pressure classification, system metric tiles, recommendations, and top-footprint process rows.
+- Kept process display limited to names, PIDs, parents, and memory values; no command lines or control actions.
+- Verified with `swift build --product memory-monitor-app`, `swift test`, and a real arm64 CLI probe run.
+
+Launch during development with:
+
+~~~bash
+swift run memory-monitor-app
+~~~
+
+Workload grouping, trend history, and process controls remain planned for later phases.

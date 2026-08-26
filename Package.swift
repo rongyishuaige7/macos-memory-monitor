@@ -15,12 +15,20 @@ let package = Package(
         .executable(
             name: "memory-monitor-probe",
             targets: ["MemoryMonitorProbe"]
+        ),
+        .executable(
+            name: "memory-monitor-app",
+            targets: ["MemoryMonitorApp"]
         )
     ],
     targets: [
         .target(name: "MemoryMonitorCore"),
         .executableTarget(
             name: "MemoryMonitorProbe",
+            dependencies: ["MemoryMonitorCore"]
+        ),
+        .executableTarget(
+            name: "MemoryMonitorApp",
             dependencies: ["MemoryMonitorCore"]
         ),
         .testTarget(
