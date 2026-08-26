@@ -218,7 +218,7 @@ PID 不是稳定身份。内部使用 `(pid, start_time)` 作为进程键，避�
 - **严重**：估算可用内存 < 10%，或 swap 剩余 < 1 GiB，或 swap-in 持续快速增加；
 - **采集异常**：无法获得关键指标时单独显示，不伪装为正常。
 
-等级需要满足持续时间，例如连续 30 秒才升级，避免短暂采样尖峰造成骚扰。
+当前实现采用稳定状态与原始观测分离的防抖策略：首次成功采样立即建立基线，后续升级或恢复必须持续 30 秒才提交；候选异常期间仍保持较快采样，以便及时确认。采集失败时显示“采集受限”，不会把失败样本当作正常或异常状态。
 
 ### 8.2 建议排序
 
@@ -277,6 +277,7 @@ PID 不是稳定身份。内部使用 `(pid, start_time)` 作为进程键，避�
 - 面板打开时采样间隔：2–3 秒；
 - 面板关闭时采样间隔：15–30 秒；
 - 压力异常时即使面板关闭也保持约 5 秒采样，恢复正常后自动降频；
+- 压力等级变化需连续 30 秒确认，避免瞬时尖峰触发状态切换；
 - 只有面板打开或压力异常时才进行更完整的进程细节解析；
 - 历史使用版本化 JSON 文件，按分钟合并并默认保留 24 小时，避免引入重型数据库；
 - 采集失败、权限不足或进程消失时优雅降级；
@@ -447,11 +448,11 @@ Process controls remain planned for later phases.
 - The popover now shows available-memory, compression, and Swap changes across the persisted window, and reports history write errors separately from sampling errors.
 - Process enumeration retries when the PID list grows during a sample; unavailable physical footprint values are marked as estimates.
 - Added adaptive sampling: the panel uses a three-second cadence, normal background monitoring uses twenty seconds, and elevated pressure uses five seconds even when the panel is closed. A visibility change wakes the scheduler immediately.
+- Added debounced pressure evaluation: the first successful sample establishes a baseline, and later upgrades or recovery transitions must persist for 30 seconds. Raw elevated observations still request the faster cadence while they are being confirmed.
 - Group identity remains label-based; richer parent/work-directory evidence and process controls are still pending.
 
 ### 当前限制与下一步
 
-- 压力等级尚未加入设计中的 30 秒持续时间防抖，瞬时尖峰仍可能立即改变状态；
 - 工作组识别仍是可解释的名称/父链启发式，Node/Python 的不同项目可能需要更细的工作目录身份；
 - 当前 Swift Package 生成命令行可执行文件，正式 `.app` bundle、签名、登录启动和沙盒策略仍待确定；
 - `libproc` 属于 macOS 私有接口，已在本机 arm64 macOS 验证，其他系统版本需要单独回归；

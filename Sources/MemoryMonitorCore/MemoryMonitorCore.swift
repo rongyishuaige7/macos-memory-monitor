@@ -513,6 +513,114 @@ public struct AdaptiveSamplingPolicy: Sendable, Equatable {
     }
 }
 
+public enum MemoryPressureLevel: String, Codable, Sendable, Equatable {
+    case normal
+    case attention
+    case critical
+}
+
+/// Converts raw system metrics into a stable pressure level. A candidate level
+/// must remain unchanged for the configured interval before it replaces the
+/// current level, which prevents one noisy sample from changing the UI state.
+public struct MemoryPressureEvaluator: Sendable, Equatable {
+    public static let defaultTransitionIntervalSeconds: TimeInterval = 30
+
+    public let transitionIntervalSeconds: TimeInterval
+    public private(set) var stableLevel: MemoryPressureLevel?
+    public private(set) var pendingLevel: MemoryPressureLevel?
+
+    private var pendingSince: Date?
+
+    public init(
+        transitionIntervalSeconds: TimeInterval = MemoryPressureEvaluator.defaultTransitionIntervalSeconds
+    ) {
+        self.transitionIntervalSeconds = Self.validatedInterval(transitionIntervalSeconds)
+    }
+
+    public var pressureActiveForSampling: Bool {
+        isElevated(stableLevel) || isElevated(pendingLevel)
+    }
+
+    public mutating func update(snapshot: SystemMemorySnapshot) -> MemoryPressureLevel {
+        update(observed: Self.observedLevel(for: snapshot), at: snapshot.timestamp)
+    }
+
+    @discardableResult
+    public mutating func update(
+        observed: MemoryPressureLevel,
+        at timestamp: Date
+    ) -> MemoryPressureLevel {
+        guard let stableLevel else {
+            self.stableLevel = observed
+            pendingLevel = nil
+            pendingSince = nil
+            return observed
+        }
+
+        guard observed != stableLevel else {
+            pendingLevel = nil
+            pendingSince = nil
+            return stableLevel
+        }
+
+        if pendingLevel != observed {
+            pendingLevel = observed
+            pendingSince = timestamp
+            if transitionIntervalSeconds == 0 {
+                return commitPendingLevel()
+            }
+            return stableLevel
+        }
+
+        guard let pendingSince else {
+            self.pendingSince = timestamp
+            return stableLevel
+        }
+
+        // A wall-clock adjustment should not make a candidate wait forever.
+        if timestamp < pendingSince {
+            self.pendingSince = timestamp
+            return stableLevel
+        }
+
+        if timestamp.timeIntervalSince(pendingSince) >= transitionIntervalSeconds {
+            return commitPendingLevel()
+        }
+        return stableLevel
+    }
+
+    public static func observedLevel(for snapshot: SystemMemorySnapshot) -> MemoryPressureLevel {
+        if snapshot.availableFraction < 0.10
+            || (snapshot.swapTotalBytes > 0 && snapshot.swapFreeBytes < 1 * 1024 * 1024 * 1024)
+            || snapshot.throttledPages > 0 {
+            return .critical
+        }
+        if snapshot.availableFraction < 0.20
+            || snapshot.compressedBytes > snapshot.totalBytes / 5
+            || (snapshot.swapTotalBytes > 0 && snapshot.swapUsedBytes > snapshot.swapTotalBytes / 2) {
+            return .attention
+        }
+        return .normal
+    }
+
+    private mutating func commitPendingLevel() -> MemoryPressureLevel {
+        let committed = pendingLevel ?? stableLevel ?? .normal
+        stableLevel = committed
+        pendingLevel = nil
+        pendingSince = nil
+        return committed
+    }
+
+    private static func validatedInterval(_ value: TimeInterval) -> TimeInterval {
+        guard value.isFinite else { return defaultTransitionIntervalSeconds }
+        return max(value, 0)
+    }
+
+    private func isElevated(_ level: MemoryPressureLevel?) -> Bool {
+        level == .attention || level == .critical
+    }
+}
+
 public struct MemoryHistoryEntry: Sendable, Codable, Identifiable, Equatable {
     public let timestamp: Date
     public let availableFraction: Double

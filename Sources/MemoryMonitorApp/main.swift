@@ -35,11 +35,13 @@ final class MonitorViewModel: ObservableObject {
     @Published private(set) var historyError: String?
     @Published private(set) var updatedAt: Date?
     @Published private(set) var isPanelPresented = false
+    @Published private(set) var pressureLevel: MemoryPressureLevel?
 
     private var refreshTask: Task<Void, Never>?
     private let sampler = MonitorSampler()
     private let trendAnalyzer = WorkloadTrendAnalyzer()
     private let samplingPolicy = AdaptiveSamplingPolicy()
+    private var pressureEvaluator = MemoryPressureEvaluator()
     private let refreshWakeup = RefreshWakeup()
     private let historyStore = HistoryStore()
     private var historyBuffer = MemoryHistoryBuffer(capacity: 60)
@@ -58,25 +60,14 @@ final class MonitorViewModel: ObservableObject {
     }
 
     var pressure: PressureState {
-        guard lastError == nil, let system else { return .unknown }
-        if system.availableFraction < 0.10
-            || (system.swapTotalBytes > 0 && system.swapFreeBytes < 1 * 1024 * 1024 * 1024)
-            || system.throttledPages > 0 {
-            return .critical
-        }
-        if system.availableFraction < 0.20
-            || system.compressedBytes > system.totalBytes / 5
-            || (system.swapTotalBytes > 0 && system.swapUsedBytes > system.swapTotalBytes / 2) {
-            return .attention
-        }
-        return .normal
+        guard lastError == nil, let pressureLevel else { return .unknown }
+        return PressureState(level: pressureLevel)
     }
 
     var samplingCadenceDescription: String {
-        let pressureActive = pressure == .attention || pressure == .critical
         let interval = samplingPolicy.intervalSeconds(
             panelPresented: isPanelPresented,
-            pressureActive: pressureActive
+            pressureActive: pressureEvaluator.pressureActiveForSampling
         )
         if interval.rounded() == interval {
             return "约 \(Int(interval)) 秒刷新"
@@ -106,6 +97,7 @@ final class MonitorViewModel: ObservableObject {
 
             switch result {
             case let .success(snapshot):
+                pressureLevel = pressureEvaluator.update(snapshot: snapshot.system)
                 historyBuffer.append(snapshot: snapshot.system)
                 if historyStoreAvailable {
                     do {
@@ -150,10 +142,9 @@ final class MonitorViewModel: ObservableObject {
     }
 
     private func waitForNextSample() async -> Bool {
-        let pressureActive = pressure == .attention || pressure == .critical
         let interval = samplingPolicy.intervalSeconds(
             panelPresented: isPanelPresented,
-            pressureActive: pressureActive
+            pressureActive: pressureEvaluator.pressureActiveForSampling
         )
         let wakeup = refreshWakeup
 
@@ -259,6 +250,17 @@ enum PressureState: String {
     case attention
     case critical
     case unknown
+
+    init(level: MemoryPressureLevel) {
+        switch level {
+        case .normal:
+            self = .normal
+        case .attention:
+            self = .attention
+        case .critical:
+            self = .critical
+        }
+    }
 
     var title: String {
         switch self {

@@ -173,6 +173,79 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertEqual(infinitePolicy.intervalSeconds(panelPresented: false, pressureActive: true), 0.1)
     }
 
+    func testMemoryPressureEvaluatorDebouncesTransientTransitions() {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        var evaluator = MemoryPressureEvaluator(transitionIntervalSeconds: 30)
+
+        XCTAssertEqual(evaluator.update(observed: .normal, at: start), .normal)
+        XCTAssertEqual(
+            evaluator.update(observed: .attention, at: start.addingTimeInterval(10)),
+            .normal
+        )
+        XCTAssertEqual(evaluator.pendingLevel, .attention)
+        XCTAssertTrue(evaluator.pressureActiveForSampling)
+
+        XCTAssertEqual(
+            evaluator.update(observed: .normal, at: start.addingTimeInterval(20)),
+            .normal
+        )
+        XCTAssertNil(evaluator.pendingLevel)
+        XCTAssertFalse(evaluator.pressureActiveForSampling)
+    }
+
+    func testMemoryPressureEvaluatorCommitsSustainedUpgradeAndRecovery() {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        var evaluator = MemoryPressureEvaluator(transitionIntervalSeconds: 30)
+
+        XCTAssertEqual(evaluator.update(observed: .normal, at: start), .normal)
+        XCTAssertEqual(
+            evaluator.update(observed: .critical, at: start.addingTimeInterval(1)),
+            .normal
+        )
+        XCTAssertEqual(
+            evaluator.update(observed: .critical, at: start.addingTimeInterval(30)),
+            .normal
+        )
+        XCTAssertEqual(
+            evaluator.update(observed: .critical, at: start.addingTimeInterval(31)),
+            .critical
+        )
+
+        XCTAssertEqual(
+            evaluator.update(observed: .normal, at: start.addingTimeInterval(60)),
+            .critical
+        )
+        XCTAssertEqual(
+            evaluator.update(observed: .normal, at: start.addingTimeInterval(61)),
+            .critical
+        )
+        XCTAssertEqual(
+            evaluator.update(observed: .normal, at: start.addingTimeInterval(91)),
+            .normal
+        )
+    }
+
+    func testMemoryPressureEvaluatorClassifiesCriticalBeforeAttention() {
+        let snapshot = makePressureSnapshot(
+            timestamp: Date(timeIntervalSince1970: 1_700_000_000),
+            availableFraction: 0.05,
+            compressedBytes: 8 * 1024 * 1024 * 1024
+        )
+
+        XCTAssertEqual(MemoryPressureEvaluator.observedLevel(for: snapshot), .critical)
+    }
+
+    func testMemoryPressureEvaluatorUsesSwapThreshold() {
+        let snapshot = makePressureSnapshot(
+            timestamp: Date(timeIntervalSince1970: 1_700_000_000),
+            availableFraction: 0.30,
+            swapTotalBytes: 8 * 1024 * 1024 * 1024,
+            swapFreeBytes: 512 * 1024 * 1024
+        )
+
+        XCTAssertEqual(MemoryPressureEvaluator.observedLevel(for: snapshot), .critical)
+    }
+
     func testMemoryHistoryBufferKeepsNewestEntries() {
         let first = makeSystemSnapshot(timestamp: Date(timeIntervalSince1970: 1), compressed: 10, swap: 20)
         let second = makeSystemSnapshot(timestamp: Date(timeIntervalSince1970: 2), compressed: 11, swap: 21)
@@ -344,6 +417,36 @@ final class MemoryMonitorCoreTests: XCTestCase {
             swapTotalBytes: 100,
             swapUsedBytes: swap,
             swapFreeBytes: 100 - swap
+        )
+    }
+
+    private func makePressureSnapshot(
+        timestamp: Date,
+        availableFraction: Double,
+        compressedBytes: UInt64 = 0,
+        throttledPages: UInt64 = 0,
+        swapTotalBytes: UInt64 = 0,
+        swapFreeBytes: UInt64 = 0
+    ) -> SystemMemorySnapshot {
+        let totalBytes: UInt64 = 16 * 1024 * 1024 * 1024
+        let freeBytes = UInt64(Double(totalBytes) * availableFraction)
+        return SystemMemorySnapshot(
+            timestamp: timestamp,
+            totalBytes: totalBytes,
+            pageSize: 4096,
+            freeBytes: freeBytes,
+            activeBytes: totalBytes - freeBytes,
+            inactiveBytes: 0,
+            speculativeBytes: 0,
+            wiredBytes: 0,
+            purgeableBytes: 0,
+            compressedBytes: compressedBytes,
+            throttledPages: throttledPages,
+            swapTotalBytes: swapTotalBytes,
+            swapUsedBytes: swapTotalBytes >= swapFreeBytes
+                ? swapTotalBytes - swapFreeBytes
+                : 0,
+            swapFreeBytes: swapFreeBytes
         )
     }
 
