@@ -145,6 +145,34 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertEqual(growth.map(\.id), ["large", "fast"])
     }
 
+    func testAdaptiveSamplingPolicyUsesPanelCadenceFirst() {
+        let policy = AdaptiveSamplingPolicy(
+            backgroundIntervalSeconds: 20,
+            panelIntervalSeconds: 3,
+            pressureIntervalSeconds: 5
+        )
+
+        XCTAssertEqual(policy.intervalSeconds(panelPresented: true, pressureActive: false), 3)
+        XCTAssertEqual(policy.intervalSeconds(panelPresented: true, pressureActive: true), 3)
+        XCTAssertEqual(policy.intervalSeconds(panelPresented: false, pressureActive: true), 5)
+        XCTAssertEqual(policy.intervalSeconds(panelPresented: false, pressureActive: false), 20)
+    }
+
+    func testAdaptiveSamplingPolicyPreventsNonPositiveIntervals() {
+        let policy = AdaptiveSamplingPolicy(
+            backgroundIntervalSeconds: 0,
+            panelIntervalSeconds: -2,
+            pressureIntervalSeconds: .nan
+        )
+
+        XCTAssertEqual(policy.intervalSeconds(panelPresented: false, pressureActive: false), 0.1)
+        XCTAssertEqual(policy.intervalSeconds(panelPresented: true, pressureActive: false), 0.1)
+        XCTAssertEqual(policy.intervalSeconds(panelPresented: false, pressureActive: true), 0.1)
+
+        let infinitePolicy = AdaptiveSamplingPolicy(pressureIntervalSeconds: .infinity)
+        XCTAssertEqual(infinitePolicy.intervalSeconds(panelPresented: false, pressureActive: true), 0.1)
+    }
+
     func testMemoryHistoryBufferKeepsNewestEntries() {
         let first = makeSystemSnapshot(timestamp: Date(timeIntervalSince1970: 1), compressed: 10, swap: 20)
         let second = makeSystemSnapshot(timestamp: Date(timeIntervalSince1970: 2), compressed: 11, swap: 21)

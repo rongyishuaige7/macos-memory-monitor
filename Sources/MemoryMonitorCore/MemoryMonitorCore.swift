@@ -477,6 +477,42 @@ public struct WorkloadTrendAnalyzer: Sendable {
     }
 }
 
+/// Chooses a sampling cadence from the amount of detail the user currently needs.
+/// The values are deliberately conservative for a menu-bar process monitor: the
+/// full process scan is the expensive part, so normal background observation is
+/// much less frequent than an open panel or an elevated-pressure state.
+public struct AdaptiveSamplingPolicy: Sendable, Equatable {
+    public let backgroundIntervalSeconds: TimeInterval
+    public let panelIntervalSeconds: TimeInterval
+    public let pressureIntervalSeconds: TimeInterval
+
+    public init(
+        backgroundIntervalSeconds: TimeInterval = 20,
+        panelIntervalSeconds: TimeInterval = 3,
+        pressureIntervalSeconds: TimeInterval = 5
+    ) {
+        self.backgroundIntervalSeconds = Self.validatedInterval(backgroundIntervalSeconds)
+        self.panelIntervalSeconds = Self.validatedInterval(panelIntervalSeconds)
+        self.pressureIntervalSeconds = Self.validatedInterval(pressureIntervalSeconds)
+    }
+
+    public func intervalSeconds(panelPresented: Bool, pressureActive: Bool) -> TimeInterval {
+        if panelPresented {
+            return panelIntervalSeconds
+        }
+        if pressureActive {
+            return pressureIntervalSeconds
+        }
+        return backgroundIntervalSeconds
+    }
+
+    private static func validatedInterval(_ value: TimeInterval) -> TimeInterval {
+        // A lower bound prevents a bad configuration from creating a busy loop.
+        guard value.isFinite else { return 0.1 }
+        return max(value, 0.1)
+    }
+}
+
 public struct MemoryHistoryEntry: Sendable, Codable, Identifiable, Equatable {
     public let timestamp: Date
     public let availableFraction: Double

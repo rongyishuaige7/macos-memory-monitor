@@ -97,7 +97,7 @@ Ghostty 中的构建、日志或 Python 服务长时间运行。界面应显示�
 - 严重：红色；
 - 采集受限：灰色并标注原因。
 
-点击后打开 360–440 px 宽的 popover。当前实现持续采样并在内存中更新，历史按分钟写盘。
+点击后打开 360–440 px 宽的 popover。采样频率会随面板可见性和压力状态调整：面板打开时加快，面板关闭且压力正常时降频，压力异常时保持较快观察；历史按分钟写盘。
 
 ### 5.2 弹出面板布局
 
@@ -265,7 +265,7 @@ PID 不是稳定身份。内部使用 `(pid, start_time)` 作为进程键，避�
 
 - 文件位置：`~/Library/Application Support/MemoryMonitor/history.json`；
 - 文件格式：带 `version` 的 JSON envelope，当前版本为 1；
-- 采样粒度：内存中每 5 秒更新，按分钟合并后写盘；首次记录、新分钟和显式 `flush()` 会触发原子写入；
+- 采样粒度：采集周期由自适应策略决定（面板打开约 3 秒、面板关闭且压力正常约 20 秒、压力异常约 5 秒），按分钟合并后写盘；首次记录、新分钟和显式 `flush()` 会触发原子写入；
 - 保留策略：以当前时间为基准保留最近 24 小时，启动和追加时清理过期记录；
 - 持久化字段：时间戳、可用内存比例、压缩内存、Swap 已用量，以及 footprint 最大的 40 个工作组名称、进程数、footprint/RSS 归因总量和系统标记；其余用户组、系统组分别合并为“其他”归因总量；
 - 隐私边界：不写入 PID、启动时间、命令行、URL、环境变量、凭据或完整路径；目录权限为 0700，文件权限为 0600。
@@ -276,6 +276,7 @@ PID 不是稳定身份。内部使用 `(pid, start_time)` 作为进程键，避�
 - 面板关闭时平均 CPU：< 1%；
 - 面板打开时采样间隔：2–3 秒；
 - 面板关闭时采样间隔：15–30 秒；
+- 压力异常时即使面板关闭也保持约 5 秒采样，恢复正常后自动降频；
 - 只有面板打开或压力异常时才进行更完整的进程细节解析；
 - 历史使用版本化 JSON 文件，按分钟合并并默认保留 24 小时，避免引入重型数据库；
 - 采集失败、权限不足或进程消失时优雅降级；
@@ -440,16 +441,16 @@ Process controls remain planned for later phases.
 - The popover now shows all sampled process groups, group footprint/RSS attribution totals, process count, and the largest member instead of a flat process-only list.
 - Added `WorkloadTrendAnalyzer` to compare consecutive samples and surface the fastest-growing existing group.
 - The UI reports a growth recommendation only after a group grows by at least 16 MiB in one sampling interval.
-- Added an in-memory `MemoryHistoryBuffer` retaining the latest 60 samples (about five minutes at the default interval).
+- Added an in-memory `MemoryHistoryBuffer` retaining the latest 60 samples; the covered wall-clock window varies with the adaptive cadence.
 - Added `HistoryStore`, a versioned JSON file at `~/Library/Application Support/MemoryMonitor/history.json`.
 - History records are coalesced to one record per minute, retain 24 hours, write atomically, and contain only system metrics plus privacy-preserving workload attribution totals. To keep the file lightweight, each record keeps the top 40 workloads and separate user/system aggregates for the remainder.
 - The popover now shows available-memory, compression, and Swap changes across the persisted window, and reports history write errors separately from sampling errors.
 - Process enumeration retries when the PID list grows during a sample; unavailable physical footprint values are marked as estimates.
+- Added adaptive sampling: the panel uses a three-second cadence, normal background monitoring uses twenty seconds, and elevated pressure uses five seconds even when the panel is closed. A visibility change wakes the scheduler immediately.
 - Group identity remains label-based; richer parent/work-directory evidence and process controls are still pending.
 
 ### 当前限制与下一步
 
-- 面板关闭时目前仍按 5 秒刷新；低频后台采样和面板打开时的加速刷新尚未接入；
 - 压力等级尚未加入设计中的 30 秒持续时间防抖，瞬时尖峰仍可能立即改变状态；
 - 工作组识别仍是可解释的名称/父链启发式，Node/Python 的不同项目可能需要更细的工作目录身份；
 - 当前 Swift Package 生成命令行可执行文件，正式 `.app` bundle、签名、登录启动和沙盒策略仍待确定；

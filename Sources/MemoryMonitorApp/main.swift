@@ -15,6 +15,8 @@ struct MemoryMonitorApp: App {
     var body: some Scene {
         MenuBarExtra {
             MonitorPopover(model: model)
+                .onAppear { model.setPanelPresented(true) }
+                .onDisappear { model.setPanelPresented(false) }
         } label: {
             MenuBarStatus(model: model)
         }
@@ -32,10 +34,13 @@ final class MonitorViewModel: ObservableObject {
     @Published private(set) var lastError: String?
     @Published private(set) var historyError: String?
     @Published private(set) var updatedAt: Date?
+    @Published private(set) var isPanelPresented = false
 
     private var refreshTask: Task<Void, Never>?
     private let sampler = MonitorSampler()
     private let trendAnalyzer = WorkloadTrendAnalyzer()
+    private let samplingPolicy = AdaptiveSamplingPolicy()
+    private let refreshWakeup = RefreshWakeup()
     private let historyStore = HistoryStore()
     private var historyBuffer = MemoryHistoryBuffer(capacity: 60)
     private var historyStoreAvailable = true
@@ -65,6 +70,24 @@ final class MonitorViewModel: ObservableObject {
             return .attention
         }
         return .normal
+    }
+
+    var samplingCadenceDescription: String {
+        let pressureActive = pressure == .attention || pressure == .critical
+        let interval = samplingPolicy.intervalSeconds(
+            panelPresented: isPanelPresented,
+            pressureActive: pressureActive
+        )
+        if interval.rounded() == interval {
+            return "约 \(Int(interval)) 秒刷新"
+        }
+        return String(format: "约 %.1f 秒刷新", interval)
+    }
+
+    func setPanelPresented(_ presented: Bool) {
+        guard isPanelPresented != presented else { return }
+        isPanelPresented = presented
+        Task { await refreshWakeup.signal() }
     }
 
     private func refreshLoop() async {
@@ -118,16 +141,88 @@ final class MonitorViewModel: ObservableObject {
                 lastError = error.localizedDescription
             }
 
-            do {
-                try await Task.sleep(for: .seconds(5))
-            } catch {
-                break
-            }
+            guard await waitForNextSample() else { break }
         }
 
         if historyStoreAvailable {
             try? await historyStore.flush()
         }
+    }
+
+    private func waitForNextSample() async -> Bool {
+        let pressureActive = pressure == .attention || pressure == .critical
+        let interval = samplingPolicy.intervalSeconds(
+            panelPresented: isPanelPresented,
+            pressureActive: pressureActive
+        )
+        let wakeup = refreshWakeup
+
+        return await withTaskGroup(of: RefreshWaitResult.self) { group in
+            group.addTask {
+                do {
+                    try await Task.sleep(for: .seconds(interval))
+                    return .intervalElapsed
+                } catch {
+                    return .cancelled
+                }
+            }
+            group.addTask {
+                guard await wakeup.wait() else { return .cancelled }
+                return .wakeup
+            }
+
+            guard let result = await group.next() else { return false }
+            group.cancelAll()
+            return result != .cancelled
+        }
+    }
+}
+
+private enum RefreshWaitResult: Sendable {
+    case intervalElapsed
+    case wakeup
+    case cancelled
+}
+
+/// A one-slot async signal used to interrupt the current cadence when the
+/// popover opens or closes. A continuation keeps the wakeup path fully
+/// actor-isolated and cancellation-safe.
+private actor RefreshWakeup {
+    private var waiter: CheckedContinuation<Bool, Never>?
+    private var pendingSignal = false
+
+    func signal() {
+        if let waiter {
+            self.waiter = nil
+            waiter.resume(returning: true)
+        } else {
+            pendingSignal = true
+        }
+    }
+
+    func wait() async -> Bool {
+        if pendingSignal {
+            pendingSignal = false
+            return true
+        }
+
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                if Task.isCancelled {
+                    continuation.resume(returning: false)
+                } else {
+                    waiter = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter() }
+        }
+    }
+
+    private func cancelWaiter() {
+        guard let waiter else { return }
+        self.waiter = nil
+        waiter.resume(returning: false)
     }
 }
 
@@ -373,7 +468,7 @@ private struct MonitorPopover: View {
 
     private var footer: some View {
         HStack {
-            Text("只读监视 · 全量进程 · 每 5 秒刷新")
+            Text("只读监视 · 全量进程 · \(model.samplingCadenceDescription)")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             Spacer()
