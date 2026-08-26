@@ -389,3 +389,21 @@ PID 不是稳定身份。内部使用 `(pid, start_time)` 作为进程键，避�
 
 这份 README 是本项目后续实现的约束基线。任何新增能力都应先更新范围、风险和验收标准，再修改代码。
 
+## 16. Implementation Status
+
+### Phase 0 completed
+
+- Added a native Swift Package with no third-party dependencies.
+- Added MemoryMonitorCore system sampling using Mach VM statistics and vm.swapusage.
+- Added ProcessSampler using libproc for process identity, parent PID, resident size, physical footprint, and executable path.
+- Added memory-monitor-probe for a single read-only snapshot.
+- Added unit tests for byte formatting, system sampling, and process enumeration.
+- Verified on arm64 macOS 26.5.1 with Swift 6.3.3 and Xcode 26.6.
+
+Run the probe with:
+
+~~~bash
+swift run memory-monitor-probe
+~~~
+
+The probe deliberately prints executable basenames instead of full command lines. The menu bar UI, workload grouping, pressure evaluation, and recommendation engine remain in the next phases.
