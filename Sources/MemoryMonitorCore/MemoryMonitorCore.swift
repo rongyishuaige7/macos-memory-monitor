@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import IOKit
 
 public enum MemoryMonitorError: Error, CustomStringConvertible, LocalizedError, Sendable {
     case systemCall(name: String, code: Int32)
@@ -44,6 +45,13 @@ public struct SystemMemorySnapshot: Codable, Sendable {
 
     public var usedEstimateBytes: UInt64 {
         totalBytes > availableEstimateBytes ? totalBytes - availableEstimateBytes : 0
+    }
+
+    /// Reclaim-aware physical memory usage, expressed as a fraction of total RAM.
+    /// This is the complement of `availableFraction` and intentionally follows
+    /// the same estimate used by the pressure indicator.
+    public var usedFraction: Double {
+        min(max(1 - availableFraction, 0), 1)
     }
 
     public var availableFraction: Double {
@@ -134,6 +142,137 @@ public struct SystemMemorySampler: Sendable {
             swapUsedBytes: swap.xsu_used,
             swapFreeBytes: swap.xsu_avail
         )
+    }
+}
+
+/// Cumulative CPU time counters returned by the Mach host interface.
+public struct CPUTimeSnapshot: Sendable, Equatable {
+    public let userTicks: UInt64
+    public let systemTicks: UInt64
+    public let idleTicks: UInt64
+    public let niceTicks: UInt64
+
+    public init(
+        userTicks: UInt64,
+        systemTicks: UInt64,
+        idleTicks: UInt64,
+        niceTicks: UInt64
+    ) {
+        self.userTicks = userTicks
+        self.systemTicks = systemTicks
+        self.idleTicks = idleTicks
+        self.niceTicks = niceTicks
+    }
+
+    public var activeTicks: UInt64 {
+        userTicks + systemTicks + niceTicks
+    }
+
+    public var totalTicks: UInt64 {
+        activeTicks + idleTicks
+    }
+}
+
+/// Samples system-wide CPU counters without invoking external commands.
+public struct CPUTimeSampler: Sendable {
+    public init() {}
+
+    public func sample() throws -> CPUTimeSnapshot {
+        var load = host_cpu_load_info()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<host_cpu_load_info_data_t>.size / MemoryLayout<integer_t>.size
+        )
+        let status = withUnsafeMutablePointer(to: &load) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { rebound in
+                host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, rebound, &count)
+            }
+        }
+        guard status == KERN_SUCCESS else {
+            throw MemoryMonitorError.systemCall(name: "host_statistics(HOST_CPU_LOAD_INFO)", code: status)
+        }
+
+        return CPUTimeSnapshot(
+            userTicks: UInt64(load.cpu_ticks.0),
+            systemTicks: UInt64(load.cpu_ticks.1),
+            idleTicks: UInt64(load.cpu_ticks.2),
+            niceTicks: UInt64(load.cpu_ticks.3)
+        )
+    }
+}
+
+/// Converts two cumulative CPU samples into a bounded 0...1 utilization value.
+public enum CPUUsageCalculator {
+    public static func usedFraction(
+        current: CPUTimeSnapshot,
+        previous: CPUTimeSnapshot
+    ) -> Double? {
+        guard let totalDelta = delta(current.totalTicks, previous.totalTicks), totalDelta > 0,
+              let activeDelta = delta(current.activeTicks, previous.activeTicks),
+              activeDelta <= totalDelta else {
+            return nil
+        }
+        return min(max(Double(activeDelta) / Double(totalDelta), 0), 1)
+    }
+
+    private static func delta(_ current: UInt64, _ previous: UInt64) -> UInt64? {
+        current >= previous ? current - previous : nil
+    }
+}
+
+/// Reads the aggregate GPU utilization exposed by Apple's IOAccelerator
+/// service. The property is intentionally optional: some macOS versions or
+/// restricted environments do not expose performance statistics to user apps.
+public struct GPUUsageSampler: Sendable {
+    private static let utilizationKeys = [
+        "Device Utilization %",
+        "GPU Utilization %",
+        "Renderer Utilization %",
+        "Tiler Utilization %"
+    ]
+
+    public init() {}
+
+    public func sample() -> Double? {
+        var iterator: io_iterator_t = 0
+        let matching = IOServiceMatching("IOAccelerator")
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == KERN_SUCCESS else {
+            return nil
+        }
+        defer { IOObjectRelease(iterator) }
+
+        var values: [Double] = []
+        while true {
+            let service = IOIteratorNext(iterator)
+            guard service != 0 else { break }
+
+            var properties: Unmanaged<CFMutableDictionary>?
+            let status = IORegistryEntryCreateCFProperties(
+                service,
+                &properties,
+                kCFAllocatorDefault,
+                0
+            )
+            if status == KERN_SUCCESS, let properties {
+                let dictionary = properties.takeRetainedValue() as NSDictionary
+                if let performance = dictionary["PerformanceStatistics"] as? NSDictionary,
+                   let utilization = utilization(in: performance) {
+                    values.append(utilization)
+                }
+            }
+            IOObjectRelease(service)
+        }
+
+        return values.max()
+    }
+
+    private func utilization(in performance: NSDictionary) -> Double? {
+        for key in Self.utilizationKeys {
+            guard let number = performance[key] as? NSNumber else { continue }
+            let percentage = number.doubleValue
+            guard percentage.isFinite else { continue }
+            return min(max(percentage / 100, 0), 1)
+        }
+        return nil
     }
 }
 
@@ -487,8 +626,11 @@ public struct WorkloadGrouper: Sendable {
             )
         }
         .sorted {
+            if $0.physicalFootprintBytes != $1.physicalFootprintBytes {
+                return $0.physicalFootprintBytes > $1.physicalFootprintBytes
+            }
             if $0.isSystem != $1.isSystem { return !$0.isSystem }
-            return $0.physicalFootprintBytes > $1.physicalFootprintBytes
+            return $0.id < $1.id
         }
     }
 

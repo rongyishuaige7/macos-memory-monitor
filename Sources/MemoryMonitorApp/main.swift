@@ -27,9 +27,11 @@ struct MemoryMonitorApp: App {
 @MainActor
 final class MonitorViewModel: ObservableObject {
     @Published private(set) var system: SystemMemorySnapshot?
+    @Published private(set) var cpuUsageFraction: Double?
+    @Published private(set) var gpuUsageFraction: Double?
+    @Published private(set) var processes: [ProcessSnapshot] = []
     @Published private(set) var groups: [WorkloadGroupSnapshot] = []
     @Published private(set) var observedProcessCount = 0
-    @Published private(set) var growth: [WorkloadGrowth] = []
     @Published private(set) var history: [MemoryHistoryRecord] = []
     @Published private(set) var lastError: String?
     @Published private(set) var historyError: String?
@@ -39,15 +41,13 @@ final class MonitorViewModel: ObservableObject {
 
     private var refreshTask: Task<Void, Never>?
     private let sampler = MonitorSampler()
-    private let trendAnalyzer = WorkloadTrendAnalyzer()
     private let samplingPolicy = AdaptiveSamplingPolicy()
     private var pressureEvaluator = MemoryPressureEvaluator()
     private let refreshWakeup = RefreshWakeup()
     private let historyStore = HistoryStore()
     private var historyBuffer = MemoryHistoryBuffer(capacity: 60)
     private var historyStoreAvailable = true
-    private var previousGroups: [WorkloadGroupSnapshot] = []
-    private var previousSampleAt: Date?
+    private var previousCPUTime: CPUTimeSnapshot?
 
     init() {
         refreshTask = Task { [weak self] in
@@ -115,16 +115,18 @@ final class MonitorViewModel: ObservableObject {
                 } else {
                     history = historyBuffer.entries.map { MemoryHistoryRecord(entry: $0) }
                 }
-                if let previousSampleAt {
-                    growth = trendAnalyzer.growingGroups(
-                        previous: previousGroups,
-                        current: snapshot.groups,
-                        intervalSeconds: snapshot.timestamp.timeIntervalSince(previousSampleAt)
-                    )
+                if let cpuTime = snapshot.cpuTime {
+                    cpuUsageFraction = previousCPUTime.flatMap {
+                        CPUUsageCalculator.usedFraction(current: cpuTime, previous: $0)
+                    }
+                    previousCPUTime = cpuTime
+                } else {
+                    cpuUsageFraction = nil
+                    previousCPUTime = nil
                 }
-                previousGroups = snapshot.groups
-                previousSampleAt = snapshot.timestamp
+                gpuUsageFraction = snapshot.gpuUsageFraction
                 system = snapshot.system
+                processes = snapshot.processes
                 groups = snapshot.groups
                 observedProcessCount = snapshot.processCount
                 updatedAt = snapshot.timestamp
@@ -219,16 +221,30 @@ private actor RefreshWakeup {
 
 private struct MonitorSampler: Sendable {
     private let systemSampler = SystemMemorySampler()
+    private let cpuSampler = CPUTimeSampler()
+    private let gpuSampler = GPUUsageSampler()
     private let processSampler = ProcessSampler()
 
     func sample() -> Result<MonitorSnapshot, Error> {
         do {
+            let cpuTime = try? cpuSampler.sample()
             let system = try systemSampler.sample()
             let processes = try processSampler.sample()
-                .sorted { $0.physicalFootprintBytes > $1.physicalFootprintBytes }
+                .sorted {
+                    if $0.physicalFootprintBytes != $1.physicalFootprintBytes {
+                        return $0.physicalFootprintBytes > $1.physicalFootprintBytes
+                    }
+                    if $0.residentBytes != $1.residentBytes {
+                        return $0.residentBytes > $1.residentBytes
+                    }
+                    return $0.identity.pid < $1.identity.pid
+                }
             return .success(MonitorSnapshot(
                 timestamp: Date(),
                 system: system,
+                cpuTime: cpuTime,
+                gpuUsageFraction: gpuSampler.sample(),
+                processes: processes,
                 groups: WorkloadGrouper().group(processes),
                 processCount: processes.count
             ))
@@ -241,6 +257,9 @@ private struct MonitorSampler: Sendable {
 private struct MonitorSnapshot: Sendable {
     let timestamp: Date
     let system: SystemMemorySnapshot
+    let cpuTime: CPUTimeSnapshot?
+    let gpuUsageFraction: Double?
+    let processes: [ProcessSnapshot]
     let groups: [WorkloadGroupSnapshot]
     let processCount: Int
 }
@@ -291,23 +310,36 @@ private struct MenuBarStatus: View {
                 .frame(width: 7, height: 7)
             Text(
                 model.lastError == nil
-                    ? (model.system.map { "RAM \(Int((1 - $0.availableFraction) * 100))%" } ?? "RAM --")
-                    : "RAM --"
+                    ? (model.system.map { "内存 \(Int($0.usedFraction * 100))%" } ?? "内存 --")
+                    : "内存 --"
             )
                 .font(.system(size: 12, weight: .medium, design: .rounded))
         }
     }
 }
 
+private enum MonitorListMode: String, CaseIterable, Identifiable {
+    case processes
+    case groups
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .processes: return "进程排行"
+        case .groups: return "工作组归因"
+        }
+    }
+}
+
 private struct MonitorPopover: View {
     @ObservedObject var model: MonitorViewModel
+    @State private var listMode: MonitorListMode = .processes
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             header
             metrics
-            historyTrend
-            recommendations
             processList
             footer
         }
@@ -344,126 +376,128 @@ private struct MonitorPopover: View {
     private var metrics: some View {
         HStack(spacing: 8) {
             MetricTile(
-                title: "可用估算",
-                value: model.system.map { MemoryFormatter.bytes($0.availableEstimateBytes) } ?? "--",
-                detail: model.system.map { String(format: "%.0f%%", $0.availableFraction * 100) } ?? ""
+                title: "CPU",
+                fraction: model.cpuUsageFraction
             )
             MetricTile(
-                title: "压缩",
-                value: model.system.map { MemoryFormatter.bytes($0.compressedBytes) } ?? "--",
-                detail: "系统"
+                title: "内存",
+                fraction: model.system?.usedFraction
             )
             MetricTile(
-                title: "Swap",
-                value: model.system.map { MemoryFormatter.bytes($0.swapUsedBytes) } ?? "--",
-                detail: model.system.map { "剩余 \(MemoryFormatter.bytes($0.swapFreeBytes))" } ?? ""
+                title: "GPU",
+                fraction: model.gpuUsageFraction
             )
-        }
-    }
-
-    private var recommendations: some View {
-        GroupBox("建议") {
-            VStack(alignment: .leading, spacing: 6) {
-                switch model.pressure {
-                case .critical:
-                    Label("内存压力严重，优先检查增长中的工作组。", systemImage: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.red)
-                case .attention:
-                    Label("内存压力正在升高，观察压缩内存和 swap 趋势。", systemImage: "eye.fill")
-                        .foregroundStyle(.orange)
-                case .normal:
-                    Label("当前没有需要立即处理的内存异常。", systemImage: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
-                case .unknown:
-                    Label("正在读取系统指标...", systemImage: "arrow.triangle.2.circlepath")
-                        .foregroundStyle(.secondary)
-                }
-
-                if let fastest = model.growth.first,
-                   fastest.deltaBytes >= 16 * 1024 * 1024 {
-                    Label(
-                        "增长最快：\(fastest.title) +\(MemoryFormatter.bytes(fastest.deltaBytes))",
-                        systemImage: "arrow.up.right"
-                    )
-                    .foregroundStyle(.orange)
-                }
-
-                if let error = model.lastError {
-                    Text(error)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .font(.caption)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-
-    private var historyTrend: some View {
-        GroupBox("24 小时磁盘历史") {
-            if let first = model.history.first, let last = model.history.last, model.history.count >= 2 {
-                VStack(alignment: .leading, spacing: 7) {
-                    HStack(spacing: 8) {
-                        TrendValue(
-                            title: "可用",
-                            value: String(format: "%+.1f%%", (last.availableFraction - first.availableFraction) * 100)
-                        )
-                        TrendValue(
-                            title: "压缩",
-                            value: signedBytes(last.compressedBytes, comparedTo: first.compressedBytes)
-                        )
-                        TrendValue(
-                            title: "Swap",
-                            value: signedBytes(last.swapUsedBytes, comparedTo: first.swapUsedBytes)
-                        )
-                    }
-                    Text("已保存 \(model.history.count) 条分钟记录 · 从 \(first.timestamp, style: .time) 到 \(last.timestamp, style: .time)")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-            } else {
-                Text(model.history.isEmpty ? "等待首条分钟记录" : "等待更多采样以生成趋势")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            if let historyError = model.historyError {
-                Text(historyError)
-                    .font(.caption2)
-                    .foregroundStyle(.orange)
-            }
         }
     }
 
     private var processList: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack {
-                Text("工作组归因")
+                Text("内存占用")
                     .font(.headline)
                 Spacer()
-                Text("归因总量 · footprint")
+                Text(listMode == .processes ? "footprint 降序" : "归因总量 · footprint")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
+            Picker("显示", selection: $listMode) {
+                ForEach(MonitorListMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+
+            switch listMode {
+            case .processes:
+                processRanking
+            case .groups:
+                groupRanking
+            }
+        }
+    }
+
+    private var sortedProcesses: [ProcessSnapshot] {
+        model.processes.sorted {
+            if $0.physicalFootprintBytes != $1.physicalFootprintBytes {
+                return $0.physicalFootprintBytes > $1.physicalFootprintBytes
+            }
+            if $0.residentBytes != $1.residentBytes {
+                return $0.residentBytes > $1.residentBytes
+            }
+            return $0.identity.pid < $1.identity.pid
+        }
+    }
+
+    private var processRanking: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text("按单个进程 footprint 从大到小排列")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("共 \(sortedProcesses.count) 个")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            if sortedProcesses.isEmpty {
+                Text("正在读取进程数据...")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(height: 150, alignment: .topLeading)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(Array(sortedProcesses.enumerated()), id: \.element.id) { index, process in
+                            ProcessRow(rank: index + 1, process: process)
+                            if index < sortedProcesses.count - 1 {
+                                Divider()
+                            }
+                        }
+                    }
+                }
+                .frame(height: 230)
+            }
+        }
+    }
+
+    private var sortedGroups: [WorkloadGroupSnapshot] {
+        model.groups.sorted {
+            if $0.attributedFootprintBytes != $1.attributedFootprintBytes {
+                return $0.attributedFootprintBytes > $1.attributedFootprintBytes
+            }
+            if $0.isSystem != $1.isSystem {
+                return !$0.isSystem
+            }
+            return $0.id < $1.id
+        }
+    }
+
+    private var groupRanking: some View {
+        VStack(alignment: .leading, spacing: 5) {
             Text("已采集本机所有可枚举进程；组内数值为 footprint/RSS 相加的归因总量，包含共享映射，不能相加当作整机实际占用。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            if model.groups.isEmpty {
+            if sortedGroups.isEmpty {
                 Text("暂无工作组数据")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(height: 150, alignment: .topLeading)
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 8) {
-                        ForEach(model.groups) { group in
+                        ForEach(sortedGroups) { group in
                             WorkloadGroupRow(group: group)
                         }
                     }
                 }
-                .frame(maxHeight: 280)
+                .frame(height: 230)
             }
         }
     }
@@ -483,8 +517,16 @@ private struct MonitorPopover: View {
 
 private struct MetricTile: View {
     let title: String
-    let value: String
-    let detail: String
+    let fraction: Double?
+
+    private var value: String {
+        guard let fraction, fraction.isFinite else { return "--" }
+        return String(format: "%.0f%%", min(max(fraction, 0), 1) * 100)
+    }
+
+    private var detail: String {
+        fraction == nil ? "暂不可用" : "已使用"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -493,6 +535,7 @@ private struct MetricTile: View {
                 .foregroundStyle(.secondary)
             Text(value)
                 .font(.system(size: 15, weight: .semibold, design: .rounded))
+                .foregroundStyle(utilizationColor(fraction))
                 .lineLimit(1)
                 .minimumScaleFactor(0.75)
             Text(detail)
@@ -506,22 +549,11 @@ private struct MetricTile: View {
     }
 }
 
-private struct TrendValue: View {
-    let title: String
-    let value: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            Text(value)
-                .font(.system(size: 12, weight: .medium, design: .monospaced))
-                .lineLimit(1)
-                .minimumScaleFactor(0.75)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
+private func utilizationColor(_ fraction: Double?) -> Color {
+    guard let fraction, fraction.isFinite else { return .secondary }
+    if fraction >= 0.9 { return .red }
+    if fraction >= 0.75 { return .orange }
+    return .primary
 }
 
 private struct WorkloadGroupRow: View {
@@ -552,9 +584,55 @@ private struct WorkloadGroupRow: View {
     }
 }
 
-private func signedBytes(_ current: UInt64, comparedTo initial: UInt64) -> String {
-    if current >= initial {
-        return "+\(MemoryFormatter.bytes(current - initial))"
+private struct ProcessRow: View {
+    let rank: Int
+    let process: ProcessSnapshot
+
+    private var displayName: String {
+        guard let executablePath = process.executablePath else { return process.name }
+        let basename = URL(fileURLWithPath: executablePath).lastPathComponent
+        return WorkingDirectoryLabelSanitizer.label(fromComponent: basename) ?? process.name
     }
-    return "-\(MemoryFormatter.bytes(initial - current))"
+
+    private var detailText: String {
+        var details = ["PID \(process.identity.pid)", process.isSystem ? "系统" : "用户"]
+        if let label = process.workingDirectoryLabel {
+            details.append(label)
+        }
+        return details.joined(separator: " · ")
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text("#\(rank)")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 30, alignment: .leading)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(displayName)
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(detailText)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 4)
+
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(process.physicalFootprintIsEstimated ? "footprint 估算" : "footprint")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text(MemoryFormatter.bytes(process.physicalFootprintBytes))
+                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                Text("RSS \(MemoryFormatter.bytes(process.residentBytes))")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 46, alignment: .leading)
+    }
 }

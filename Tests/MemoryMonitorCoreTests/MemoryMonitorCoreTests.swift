@@ -55,6 +55,38 @@ final class MemoryMonitorCoreTests: XCTestCase {
 
         XCTAssertEqual(snapshot.availableEstimateBytes, 10)
         XCTAssertEqual(snapshot.availableFraction, 1)
+        XCTAssertEqual(snapshot.usedFraction, 0)
+    }
+
+    func testCPUUsageCalculatorComputesDeltaFraction() {
+        let previous = CPUTimeSnapshot(userTicks: 100, systemTicks: 50, idleTicks: 850, niceTicks: 0)
+        let current = CPUTimeSnapshot(userTicks: 200, systemTicks: 100, idleTicks: 950, niceTicks: 0)
+
+        let fraction = try! XCTUnwrap(
+            CPUUsageCalculator.usedFraction(current: current, previous: previous)
+        )
+        XCTAssertEqual(fraction, 0.6, accuracy: 0.0001)
+    }
+
+    func testCPUUsageCalculatorRejectsCounterReset() {
+        let previous = CPUTimeSnapshot(userTicks: 100, systemTicks: 50, idleTicks: 850, niceTicks: 0)
+        let current = CPUTimeSnapshot(userTicks: 10, systemTicks: 5, idleTicks: 20, niceTicks: 0)
+
+        XCTAssertNil(CPUUsageCalculator.usedFraction(current: current, previous: previous))
+    }
+
+    func testCPUTimeSamplerReturnsNonZeroCounters() throws {
+        let snapshot = try CPUTimeSampler().sample()
+
+        XCTAssertGreaterThan(snapshot.totalTicks, 0)
+        XCTAssertGreaterThanOrEqual(snapshot.totalTicks, snapshot.activeTicks)
+    }
+
+    func testGPUUsageSamplerReturnsBoundedValueWhenAvailable() {
+        guard let value = GPUUsageSampler().sample() else { return }
+
+        XCTAssertGreaterThanOrEqual(value, 0)
+        XCTAssertLessThanOrEqual(value, 1)
     }
 
     func testProcessSamplerFindsCurrentProcess() throws {
@@ -163,6 +195,18 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertEqual(chrome.processCount, 3)
         XCTAssertEqual(chrome.physicalFootprintBytes, 1_500)
         XCTAssertEqual(chrome.residentBytes, 1_500)
+    }
+
+    func testWorkloadGrouperSortsGroupsByFootprintBeforeSystemPriority() {
+        let processes = [
+            makeProcess(pid: 13, name: "small-user", footprint: 100),
+            makeProcess(pid: 14, name: "large-system", footprint: 1_000, isSystem: true),
+            makeProcess(pid: 15, name: "medium-user", footprint: 500)
+        ]
+
+        let groups = WorkloadGrouper().group(processes)
+
+        XCTAssertEqual(groups.map(\.physicalFootprintBytes), [1_000, 500, 100])
     }
 
     func testWorkloadGrouperUsesCodexAncestorForAutomation() {

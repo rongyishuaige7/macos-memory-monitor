@@ -88,7 +88,7 @@ Ghostty 中的构建、日志或 Python 服务长时间运行。界面应显示�
 
 菜单栏只显示一个紧凑状态，不显示大量数字。建议格式：
 
-`RAM 78% · swap 5.8G · 注意`
+`内存 78%`
 
 状态颜色和图标只表达等级：
 
@@ -102,25 +102,18 @@ Ghostty 中的构建、日志或 Python 服务长时间运行。界面应显示�
 ### 5.2 弹出面板布局
 
 1. **当前状态条**
-   - 压力等级；
-   - 可用内存；
-   - 压缩内存；
-   - swap 已用/剩余；
-   - 最近趋势和 24 小时历史窗口。
+   - 压力等级用圆点和颜色表达；
+   - CPU、内存、GPU 已使用百分比；
+   - 指标暂不可用时显示 `--`，不使用猜测值。
 
-2. **现在最该关注**
-   - 最多 3 条建议；
-   - 每条包含原因、证据、影响范围和建议动作；
-   - 首版动作仅为“查看详情”“忽略此组”“稍后提醒”。
+2. **进程列表**
+   - 默认显示单进程排行，按 footprint 降序，RSS 和 PID 作为稳定次序；
+   - 每行显示进程名、PID、用户/系统标识、footprint 和 RSS；
+   - 可切换到工作组归因排行，组内数值为 footprint/RSS 归因总量。
 
-3. **工作组列表**
-   - 默认按“可操作性 × footprint × 增长速度”排序；
-   - 显示应用图标、工作组名、总 footprint、RSS、CPU、子进程数和 5 分钟趋势；
-   - 系统组默认折叠。
-
-4. **事件时间线**
+3. **事件时间线**
    - 记录压力等级变化、工作组启动/退出、swap 越过阈值和建议生成；
-   - 只保留本地 24 小时磁盘历史。
+   - 只保留本地 24 小时磁盘历史；历史数据在后台写盘，当前紧凑面板不展开趋势卡片。
 
 ### 5.3 工作组详情
 
@@ -147,7 +140,9 @@ Ghostty 中的构建、日志或 Python 服务长时间运行。界面应显示�
 - `throttled`: 被系统节流的页数；
 - `swap_used`、`swap_free`、`swap_total`；
 - `swap_in_rate`、`swap_out_rate`；
-- `compression_growth_rate`。
+- `compression_growth_rate`；
+- `cpu_used_fraction`：相邻 Mach CPU 累计计数的使用比例（按整机总量）；
+- `gpu_used_fraction`：IOAccelerator 提供的 `Device Utilization %`，没有驱动数据时为空。
 
 这里的 `available_estimate` 明确标记为估算值，不伪装成 Apple 内部的唯一压力公式。
 
@@ -174,11 +169,13 @@ Ghostty 中的构建、日志或 Python 服务长时间运行。界面应显示�
 生产实现不调用 `top`、`vm_stat` 等外部命令，而使用 macOS 原生接口：
 
 - `host_statistics64`：系统页、压缩器和节流信息；
+- `host_statistics(HOST_CPU_LOAD_INFO)`：整机 CPU 累计计数；
 - `sysctlbyname("hw.memsize")`：总内存；
 - `sysctlbyname("vm.swapusage")`：swap；
 - `proc_listpids`：进程枚举；
 - `proc_pidinfo`：进程基础信息和父子关系；
 - `proc_pid_rusage`：进程 footprint/resident 等资源统计；
+- `IORegistryEntryCreateCFProperties`（`IOAccelerator`）：Apple Silicon GPU 使用率；
 - `NSRunningApplication`：应用名、图标和 bundle 信息。
 
 不同 macOS 版本可能限制部分路径或命令行信息。采集层必须允许字段缺失，并显示“信息受系统权限限制”；`phys_footprint` 不可用时可暂用 RSS，但必须明确标记为估算值。
@@ -447,6 +444,8 @@ Process controls remain planned for later phases.
 open "$HOME/Library/Application Support/MemoryMonitor/dist/MemoryMonitor.app"
 ~~~
 
+应用是菜单栏代理（`LSUIElement=true`），启动后不会显示 Dock 图标；点击主屏菜单栏中的 `内存 xx%` 状态项即可打开详细面板。
+
 也可以通过 `OUTPUT_DIR` 指定其他本机目录；脚本会拒绝 iCloud Drive 或其他 File Provider 路径，因为这些位置可能在签名后重新写入 `com.apple.FinderInfo`。脚本只生成本地产物，不会自动安装、注册登录启动项或修改系统 LaunchAgents。Developer ID 签名、沙盒策略和登录启动开关留到单独阶段决定。
 
 构建脚本支持以下环境变量：`CONFIGURATION=debug|release`、`APP_VERSION`、`BUILD_NUMBER`、`CODE_SIGN_IDENTITY` 和 `SKIP_SIGNING=1`。默认签名身份为本地 ad-hoc（`-`）。
@@ -461,7 +460,7 @@ open "$HOME/Library/Application Support/MemoryMonitor/dist/MemoryMonitor.app"
 - Added an in-memory `MemoryHistoryBuffer` retaining the latest 60 samples; the covered wall-clock window varies with the adaptive cadence.
 - Added `HistoryStore`, a versioned JSON file at `~/Library/Application Support/MemoryMonitor/history.json`.
 - History records are coalesced to one record per minute, retain 24 hours, write atomically, and contain only system metrics plus privacy-preserving workload attribution totals. To keep the file lightweight, each record keeps the top 40 workloads and separate user/system aggregates for the remainder.
-- The popover now shows available-memory, compression, and Swap changes across the persisted window, and reports history write errors separately from sampling errors.
+- 历史记录仍在后台持续写盘；紧凑面板不再展开历史趋势卡片或建议文字。
 - Process enumeration retries when the PID list grows during a sample; unavailable physical footprint values are marked as estimates.
 - Added adaptive sampling: the panel uses a three-second cadence, normal background monitoring uses twenty seconds, and elevated pressure uses five seconds even when the panel is closed. A visibility change wakes the scheduler immediately.
 - Added debounced pressure evaluation: the first successful sample establishes a baseline, and later upgrades or recovery transitions must persist for 30 seconds. Raw elevated observations still request the faster cadence while they are being confirmed.
@@ -477,6 +476,19 @@ open "$HOME/Library/Application Support/MemoryMonitor/dist/MemoryMonitor.app"
 - 架构：`scripts/build-app.sh` 负责构建、在本机临时目录组装并签名，再复制到本机输出目录；同时复制 `Resources/Info.plist`、校验 plist/架构并执行 ad-hoc 签名；
 - 风险：ad-hoc 签名只适合本机开发，不能替代 Developer ID 和 notarization；GUI 启动仍依赖当前用户会话；
 - 验收：脚本在当前 arm64 Mac 上成功产出 bundle，`plutil` 和 `codesign` 校验通过，`open` 后菜单栏进程可启动，核心测试不回归；File Provider 输出路径会在构建前明确失败并给出本机路径示例。
+
+### Phase 3B completed：进程占用排行
+
+- 面板默认显示“进程排行”，保留本次采样的全量进程快照；每行显示排名、进程名、PID、footprint 和 RSS。
+- 进程按 footprint 从大到小排序，footprint 相同时按 RSS 和 PID 稳定排序，便于直接定位当前最大的进程。
+- “工作组归因”保留为可切换视图，同样按归因 footprint 从大到小排列；列表使用固定高度滚动区域，避免内容被 SwiftUI 菜单栏面板压缩成不可见。
+- 进程与工作组数值仍是归因口径，包含共享映射；不能把各行相加当作整机实际占用。
+
+### Phase 3C completed：核心利用率与紧凑面板
+
+- 面板指标收敛为 CPU、内存、GPU 已使用百分比；删除可用估算、压缩、Swap 卡片和建议区，压力等级继续通过状态圆点与黄/红色表达。
+- CPU 使用率由 Mach 累计计数的相邻采样差计算；GPU 优先读取 Apple Silicon `IOAccelerator` 的 `Device Utilization %`，驱动不提供时显示 `--`。
+- 24 小时历史仍按分钟持久化，作为后台数据能力保留，不在当前紧凑面板展开。
 
 ### 当前限制与下一步
 
