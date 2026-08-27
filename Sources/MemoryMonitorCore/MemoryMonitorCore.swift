@@ -551,6 +551,23 @@ public struct ProcessSnapshot: Codable, Sendable, Identifiable, Equatable {
 
     public var id: ProcessIdentity { identity }
 
+    /// The process start instant reconstructed from the stable identity.
+    /// A nil value means the kernel supplied an invalid timestamp.
+    public var startDate: Date? {
+        let seconds = Double(identity.startTimeSeconds)
+            + Double(identity.startTimeMicroseconds) / 1_000_000
+        guard seconds.isFinite else { return nil }
+        return Date(timeIntervalSince1970: seconds)
+    }
+
+    /// Cumulative CPU time. This is intentionally not presented as a
+    /// percentage because a percentage requires a second process sample and a
+    /// defined machine-core denominator.
+    public var cpuTimeNanos: UInt64 {
+        let (value, overflow) = userTimeNanos.addingReportingOverflow(systemTimeNanos)
+        return overflow ? UInt64.max : value
+    }
+
     public var footprintQuality: SampleQuality {
         physicalFootprintIsEstimated ? .estimated : .available
     }
@@ -879,6 +896,11 @@ public struct WorkloadGroupSnapshot: Codable, Sendable, Identifiable, Equatable 
     /// enter this field.
     public let parentChain: [String]
 
+    /// Stable identities of the members captured in this live sampling pass.
+    /// These are deliberately omitted from `PersistedWorkloadRecord` and never
+    /// written to the 24-hour history.
+    public let memberProcessIdentities: [ProcessIdentity]
+
     /// Sum of member footprints attributed to this group; shared mappings are
     /// intentionally counted in each member and must not be treated as a
     /// de-duplicated machine total.
@@ -897,7 +919,8 @@ public struct WorkloadGroupSnapshot: Codable, Sendable, Identifiable, Equatable 
         isSystem: Bool,
         representativeProcess: String,
         attributionReason: WorkloadAttributionReason = .processName,
-        parentChain: [String] = []
+        parentChain: [String] = [],
+        memberProcessIdentities: [ProcessIdentity] = []
     ) {
         self.id = id
         self.title = title
@@ -913,6 +936,10 @@ public struct WorkloadGroupSnapshot: Codable, Sendable, Identifiable, Equatable 
                 .compactMap { WorkingDirectoryLabelSanitizer.label(fromComponent: $0) }
                 .prefix(8)
         )
+        var uniqueIdentities = Set<ProcessIdentity>()
+        self.memberProcessIdentities = memberProcessIdentities.filter {
+            uniqueIdentities.insert($0).inserted
+        }
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -926,6 +953,7 @@ public struct WorkloadGroupSnapshot: Codable, Sendable, Identifiable, Equatable 
         case representativeProcess
         case attributionReason
         case parentChain
+        case memberProcessIdentities
     }
 
     public init(from decoder: Decoder) throws {
@@ -940,7 +968,8 @@ public struct WorkloadGroupSnapshot: Codable, Sendable, Identifiable, Equatable 
             isSystem: try container.decode(Bool.self, forKey: .isSystem),
             representativeProcess: try container.decode(String.self, forKey: .representativeProcess),
             attributionReason: try container.decodeIfPresent(WorkloadAttributionReason.self, forKey: .attributionReason) ?? .processName,
-            parentChain: try container.decodeIfPresent([String].self, forKey: .parentChain) ?? []
+            parentChain: try container.decodeIfPresent([String].self, forKey: .parentChain) ?? [],
+            memberProcessIdentities: try container.decodeIfPresent([ProcessIdentity].self, forKey: .memberProcessIdentities) ?? []
         )
     }
 }
@@ -996,7 +1025,8 @@ public struct WorkloadGrouper: Sendable {
                 isSystem: bucket.isSystem,
                 representativeProcess: largest?.name ?? "(unknown)",
                 attributionReason: bucket.reason,
-                parentChain: largest.map { parentChain(for: $0, byPID: byPID) } ?? []
+                parentChain: largest.map { parentChain(for: $0, byPID: byPID) } ?? [],
+                memberProcessIdentities: bucket.processes.map(\.identity)
             )
         }
         .sorted {
@@ -2512,6 +2542,39 @@ public struct MemoryHistoryFile: Codable, Sendable, Equatable {
     }
 }
 
+/// Runtime storage counters used to verify that history persistence stays
+/// lightweight. These values describe local files only; no process identity is
+/// included.
+public struct HistoryStoreDiagnostics: Sendable, Equatable {
+    public let snapshotBytes: Int
+    public let journalBytes: Int
+    public let pendingRecordCount: Int
+    public let journalRecordCount: Int
+    public let compactionCount: Int
+    public let lastCompactionAt: Date?
+
+    public init(
+        snapshotBytes: Int,
+        journalBytes: Int,
+        pendingRecordCount: Int,
+        journalRecordCount: Int,
+        compactionCount: Int,
+        lastCompactionAt: Date?
+    ) {
+        self.snapshotBytes = max(snapshotBytes, 0)
+        self.journalBytes = max(journalBytes, 0)
+        self.pendingRecordCount = max(pendingRecordCount, 0)
+        self.journalRecordCount = max(journalRecordCount, 0)
+        self.compactionCount = max(compactionCount, 0)
+        self.lastCompactionAt = lastCompactionAt
+    }
+
+    public var totalBytes: Int {
+        let (value, overflow) = snapshotBytes.addingReportingOverflow(journalBytes)
+        return overflow ? Int.max : value
+    }
+}
+
 public enum HistoryStoreError: Error, CustomStringConvertible, LocalizedError, Sendable, Equatable {
     case readFailed
     case writeFailed
@@ -2544,6 +2607,8 @@ public enum HistoryStoreError: Error, CustomStringConvertible, LocalizedError, S
 public actor HistoryStore {
     public static let defaultRetentionInterval: TimeInterval = 24 * 60 * 60
     public static let defaultMaxPersistedWorkloads = 40
+    public static let defaultCompactionRecordThreshold = 120
+    public static let defaultCompactionByteThreshold = 1 * 1024 * 1024
 
     public static var defaultFileURL: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -2555,23 +2620,50 @@ public actor HistoryStore {
             .appendingPathComponent("history.json", isDirectory: false)
     }
 
-    public let fileURL: URL
+    public nonisolated let fileURL: URL
+    /// A sidecar append-only file. It is intentionally derived from
+    /// `fileURL`, so custom/test stores remain self-contained.
+    public nonisolated let journalURL: URL
     public let retentionInterval: TimeInterval
     public let maxPersistedWorkloads: Int
+    public let compactionRecordThreshold: Int
+    public let compactionByteThreshold: Int
 
     private var records: [MemoryHistoryRecord] = []
     private var hasLoaded = false
     private var dirty = false
     private var lastPersistedMinute: Date?
+    private var pendingRecords: [Date: MemoryHistoryRecord] = [:]
+    private var journalRecordCount = 0
+    private var journalByteCount = 0
+    private var snapshotExists = false
+    private var compactionCount = 0
+    private var lastCompactionAt: Date?
 
     public init(
         fileURL: URL = HistoryStore.defaultFileURL,
         retentionInterval: TimeInterval = HistoryStore.defaultRetentionInterval,
-        maxPersistedWorkloads: Int = HistoryStore.defaultMaxPersistedWorkloads
+        maxPersistedWorkloads: Int = HistoryStore.defaultMaxPersistedWorkloads,
+        compactionRecordThreshold: Int = HistoryStore.defaultCompactionRecordThreshold,
+        compactionByteThreshold: Int = HistoryStore.defaultCompactionByteThreshold
     ) {
         self.fileURL = fileURL
+        self.journalURL = URL(fileURLWithPath: fileURL.path + ".journal")
         self.retentionInterval = max(retentionInterval, 0)
         self.maxPersistedWorkloads = max(maxPersistedWorkloads, 1)
+        self.compactionRecordThreshold = max(compactionRecordThreshold, 1)
+        self.compactionByteThreshold = max(compactionByteThreshold, 1)
+    }
+
+    public func diagnostics() -> HistoryStoreDiagnostics {
+        HistoryStoreDiagnostics(
+            snapshotBytes: byteCount(at: fileURL),
+            journalBytes: byteCount(at: journalURL),
+            pendingRecordCount: pendingRecords.count,
+            journalRecordCount: journalRecordCount,
+            compactionCount: compactionCount,
+            lastCompactionAt: lastCompactionAt
+        )
     }
 
     @discardableResult
@@ -2581,43 +2673,82 @@ public actor HistoryStore {
             records = Self.pruned(coalesced(records), now: now, retentionInterval: retentionInterval)
             if records != before {
                 dirty = true
-                try persist()
+                try compactSnapshot(at: now)
             }
             return records
         }
 
         let fileManager = FileManager.default
-        guard fileManager.fileExists(atPath: fileURL.path) else {
-            hasLoaded = true
-            return []
+        let hasSnapshot = fileManager.fileExists(atPath: fileURL.path)
+        let hasJournal = fileManager.fileExists(atPath: journalURL.path)
+        var snapshotRecords: [MemoryHistoryRecord] = []
+        var snapshotData = Data()
+
+        if hasSnapshot {
+            do {
+                snapshotData = try Data(contentsOf: fileURL)
+            } catch {
+                throw HistoryStoreError.readFailed
+            }
+
+            do {
+                let file = try Self.decoder().decode(MemoryHistoryFile.self, from: snapshotData)
+                guard file.version == MemoryHistoryFile.currentVersion else {
+                    throw HistoryStoreError.unsupportedVersion(file.version)
+                }
+                snapshotRecords = file.records
+            } catch let error as HistoryStoreError {
+                throw error
+            } catch {
+                throw HistoryStoreError.invalidData
+            }
         }
 
-        let data: Data
-        do {
-            data = try Data(contentsOf: fileURL)
-        } catch {
-            throw HistoryStoreError.readFailed
+        var journalRecords: [MemoryHistoryRecord] = []
+        var journalData = Data()
+        if hasJournal {
+            do {
+                journalData = try Data(contentsOf: journalURL)
+            } catch {
+                throw HistoryStoreError.readFailed
+            }
+            let decodedJournal = try decodeJournal(journalData)
+            journalRecords = decodedJournal.records
+            if decodedJournal.validByteCount < journalData.count {
+                do {
+                    journalData = Data(journalData.prefix(decodedJournal.validByteCount))
+                    try journalData.write(to: journalURL, options: [.atomic])
+                    try fileManager.setAttributes(
+                        [.posixPermissions: 0o600],
+                        ofItemAtPath: journalURL.path
+                    )
+                } catch {
+                    throw HistoryStoreError.writeFailed
+                }
+            }
         }
 
-        let file: MemoryHistoryFile
+        let coalescedRecords = coalesced(snapshotRecords + journalRecords)
+        records = Self.pruned(coalescedRecords, now: now, retentionInterval: retentionInterval)
+        hasLoaded = true
+        snapshotExists = hasSnapshot
+        journalRecordCount = journalRecords.count
+        journalByteCount = journalData.count
+        pendingRecords.removeAll(keepingCapacity: false)
+        dirty = false
+        lastPersistedMinute = records.last?.timestamp
+
+        let canonicalSnapshot: Data
         do {
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .iso8601
-            file = try decoder.decode(MemoryHistoryFile.self, from: data)
+            canonicalSnapshot = try Self.encoder().encode(MemoryHistoryFile(records: coalescedRecords))
         } catch {
             throw HistoryStoreError.invalidData
         }
-        guard file.version == MemoryHistoryFile.currentVersion else {
-            throw HistoryStoreError.unsupportedVersion(file.version)
-        }
-
-        let coalescedRecords = coalesced(file.records)
-        records = Self.pruned(coalescedRecords, now: now, retentionInterval: retentionInterval)
-        hasLoaded = true
-        dirty = records != file.records
-        lastPersistedMinute = records.last?.timestamp
-        if dirty {
-            try persist()
+        let needsCompaction = (!hasSnapshot && !journalRecords.isEmpty)
+            || (records != coalescedRecords)
+            || (hasSnapshot && !hasJournal && snapshotData != canonicalSnapshot)
+        if needsCompaction {
+            try compactSnapshot(at: now)
         }
         return records
     }
@@ -2647,12 +2778,16 @@ public actor HistoryStore {
         let sortedRecords = records.sorted { $0.timestamp < $1.timestamp }
         records = Self.pruned(sortedRecords, now: now, retentionInterval: retentionInterval)
         dirty = true
+        pendingRecords[normalized.timestamp] = normalized
 
-        // A first write and each new minute are persisted immediately. Samples
-        // within the same minute stay in memory until the next minute or flush.
+        // The first sample creates a compact snapshot. Later samples append a
+        // single line when the minute changes; updates within one minute stay
+        // in memory until the next boundary or an explicit flush.
         let removedExpiredRecords = records.count < sortedRecords.count
-        if lastPersistedMinute != normalized.timestamp || removedExpiredRecords {
-            try persist()
+        if !snapshotExists {
+            try compactSnapshot(at: now)
+        } else if lastPersistedMinute != normalized.timestamp || removedExpiredRecords {
+            try appendPending(at: now)
         }
         return records
     }
@@ -2665,39 +2800,171 @@ public actor HistoryStore {
         records = Self.pruned(records, now: now, retentionInterval: retentionInterval)
         if records != before {
             dirty = true
-            try persist()
+            pendingRecords = pendingRecords.filter { records.contains($0.value) }
+            try compactSnapshot(at: now)
         }
         return records
     }
 
     public func flush() throws {
-        guard hasLoaded, dirty else { return }
-        try persist()
+        guard hasLoaded else { return }
+        if !pendingRecords.isEmpty {
+            try appendPending(at: Date())
+        }
+        guard dirty || journalRecordCount > 0 else { return }
+        try compactSnapshot(at: Date())
     }
 
-    private func persist() throws {
-        let directory = fileURL.deletingLastPathComponent()
+    private static func encoder() -> JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }
+
+    private static func decoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
+    }
+
+    private struct JournalDecodeResult {
+        let records: [MemoryHistoryRecord]
+        let validByteCount: Int
+    }
+
+    private func decodeJournal(_ data: Data) throws -> JournalDecodeResult {
+        guard !data.isEmpty else {
+            return JournalDecodeResult(records: [], validByteCount: 0)
+        }
+
+        let lines = data.split(separator: 0x0A, omittingEmptySubsequences: false)
+        let decoder = Self.decoder()
+        var decoded = [MemoryHistoryRecord]()
+        var ignoredIncompleteTail = false
+        for index in lines.indices {
+            let line = lines[index]
+            guard !line.isEmpty else { continue }
+            do {
+                decoded.append(try decoder.decode(MemoryHistoryRecord.self, from: Data(line)))
+            } catch {
+                // A process may be terminated while the final line is being
+                // appended. Ignore only that incomplete tail; malformed data
+                // in a complete or middle line still invalidates the store.
+                let isLastLine = index == lines.index(before: lines.endIndex)
+                if isLastLine, data.last != 0x0A {
+                    ignoredIncompleteTail = true
+                    break
+                }
+                throw HistoryStoreError.invalidData
+            }
+        }
+        let validByteCount: Int
+        if ignoredIncompleteTail, let lastNewline = data.lastIndex(of: 0x0A) {
+            validByteCount = data.distance(from: data.startIndex, to: lastNewline) + 1
+        } else if ignoredIncompleteTail {
+            validByteCount = 0
+        } else {
+            validByteCount = data.count
+        }
+        return JournalDecodeResult(records: decoded, validByteCount: validByteCount)
+    }
+
+    private func appendPending(at timestamp: Date) throws {
+        guard !pendingRecords.isEmpty else { return }
+
+        let ordered = pendingRecords.values.sorted { $0.timestamp < $1.timestamp }
+        var payload = Data()
         do {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o700],
-                ofItemAtPath: directory.path
-            )
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            let data = try encoder.encode(MemoryHistoryFile(records: records))
-            // Atomic writes use a temporary sibling and rename it into place.
-            try data.write(to: fileURL, options: [.atomic])
-            try FileManager.default.setAttributes(
+            let encoder = Self.encoder()
+            for record in ordered {
+                payload.append(try encoder.encode(record))
+                payload.append(0x0A)
+            }
+
+            try prepareDirectory()
+            let fileManager = FileManager.default
+            if fileManager.fileExists(atPath: journalURL.path) {
+                let handle = try FileHandle(forWritingTo: journalURL)
+                defer { try? handle.close() }
+                try handle.seekToEnd()
+                try handle.write(contentsOf: payload)
+                try handle.synchronize()
+            } else {
+                try payload.write(to: journalURL, options: [.atomic])
+            }
+            try fileManager.setAttributes(
                 [.posixPermissions: 0o600],
-                ofItemAtPath: fileURL.path
+                ofItemAtPath: journalURL.path
             )
         } catch {
             throw HistoryStoreError.writeFailed
         }
+
+        journalRecordCount += ordered.count
+        journalByteCount += payload.count
+        pendingRecords.removeAll(keepingCapacity: false)
         dirty = false
         lastPersistedMinute = records.last?.timestamp
+
+        if journalRecordCount >= compactionRecordThreshold
+            || journalByteCount >= compactionByteThreshold {
+            try compactSnapshot(at: timestamp)
+        }
+    }
+
+    private func compactSnapshot(at timestamp: Date) throws {
+        let fileManager = FileManager.default
+        do {
+            try prepareDirectory()
+            let data = try Self.encoder().encode(MemoryHistoryFile(records: records))
+            // Keep the canonical snapshot atomic. If the process stops during
+            // this write, the previous snapshot and journal remain readable.
+            try data.write(to: fileURL, options: [.atomic])
+            try fileManager.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: fileURL.path
+            )
+
+            // Truncating the sidecar only after the snapshot is in place makes
+            // a crash recoverable: an old journal merely contributes duplicate
+            // minute records, which `coalesced` resolves on the next load.
+            if fileManager.fileExists(atPath: journalURL.path) {
+                try Data().write(to: journalURL, options: [.atomic])
+                try fileManager.setAttributes(
+                    [.posixPermissions: 0o600],
+                    ofItemAtPath: journalURL.path
+                )
+            }
+        } catch {
+            throw HistoryStoreError.writeFailed
+        }
+
+        snapshotExists = true
+        pendingRecords.removeAll(keepingCapacity: false)
+        dirty = false
+        journalRecordCount = 0
+        journalByteCount = 0
+        lastPersistedMinute = records.last?.timestamp
+        compactionCount += 1
+        lastCompactionAt = timestamp
+    }
+
+    private func prepareDirectory() throws {
+        let directory = fileURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: directory.path
+        )
+    }
+
+    private func byteCount(at url: URL) -> Int {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let value = attributes[.size] as? NSNumber else {
+            return 0
+        }
+        return max(value.intValue, 0)
     }
 
     private static func minuteStart(_ date: Date) -> Date {

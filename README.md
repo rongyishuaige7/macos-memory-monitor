@@ -527,3 +527,14 @@ open "$HOME/Library/Application Support/MemoryMonitor/dist/MemoryMonitor.app"
 - `libproc` 属于 macOS 私有接口，已在本机 arm64 macOS 验证，其他系统版本需要单独回归；
 - 事件时间线基于分钟记录推导，不能替代进程生命周期审计；过期或被压缩出 Top 排行的工作组可能只显示为排行变化；
 - 退出和强制结束能力仍保持只读边界，后续实现必须只允许当前用户且逐次确认。
+
+### Phase 6 completed：轻量历史写盘与详情面板（v0.7.0）
+
+- 24 小时历史保留兼容的 `history.json` 快照，并新增 `history.json.journal` 追加日志；分钟记录先追加到 journal，达到 120 条或 1 MiB 后再压缩回快照，降低高频整文件重写带来的写盘放大。
+- 启动时会合并快照和 journal；如果进程在最后一行写入中退出，只截断不完整尾行并保留之前的有效记录；仅有 journal、缺少快照时也可以恢复。
+- 历史文件和 journal 继续使用本地 `Application Support/MemoryMonitor` 目录，目录权限为 `0700`，文件权限为 `0600`；`HistoryStoreDiagnostics` 可观察快照/journal 大小、待写记录和压缩次数。
+- 实时进程排行支持名称、应用、Bundle ID 和脱敏工作目录搜索，支持全部/用户/系统筛选，并可按 footprint 或 RSS 降序排列；工作组排行使用同一套排序和成员搜索规则。
+- 点击进程可查看 footprint、RSS、虚拟内存、累计 CPU 时间、线程数、启动时间、应用身份、父进程链和当前工作组；点击工作组可查看归因依据、置信说明、成员明细、最近 24 小时 footprint/RSS 趋势及相关事件。
+- 详情只展示脱敏标签和汇总值，不写入 PID/启动时间到历史；进程或工作组离开当前快照时会明确标记为不可见，不把它误判为已退出。
+- 当前版本仍为只读监视，不提供优雅退出、强制结束、清缓存或自动化操作。
+- 本版核心测试共 60 项，Release App target 构建通过；后续每个小版本继续执行测试、Release 构建、本机部署、提交并推送。

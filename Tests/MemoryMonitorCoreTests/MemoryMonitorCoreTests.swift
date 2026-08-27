@@ -1137,6 +1137,108 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertEqual(loadedRecords, records)
     }
 
+    func testHistoryStoreAppendsJournalBeforeCompaction() async throws {
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let base = Date(timeIntervalSince1970: 1_699_999_980)
+        let store = HistoryStore(
+            fileURL: url,
+            compactionRecordThreshold: 100,
+            compactionByteThreshold: 1_000_000
+        )
+        _ = try await store.append(
+            snapshot: makeSystemSnapshot(timestamp: base, compressed: 10, swap: 20),
+            now: base
+        )
+        let snapshotBeforeJournal = try Data(contentsOf: url)
+
+        _ = try await store.append(
+            snapshot: makeSystemSnapshot(
+                timestamp: base.addingTimeInterval(60),
+                compressed: 20,
+                swap: 30
+            ),
+            now: base.addingTimeInterval(60)
+        )
+
+        XCTAssertEqual(try Data(contentsOf: url), snapshotBeforeJournal)
+        let diagnostics = await store.diagnostics()
+        XCTAssertGreaterThan(diagnostics.journalBytes, 0)
+        XCTAssertEqual(diagnostics.journalRecordCount, 1)
+
+        let reloaded = HistoryStore(
+            fileURL: url,
+            compactionRecordThreshold: 100,
+            compactionByteThreshold: 1_000_000
+        )
+        let loaded = try await reloaded.load(now: base.addingTimeInterval(60))
+        XCTAssertEqual(loaded.map(\.compressedBytes), [10, 20])
+
+        try await store.flush()
+        let afterFlush = await store.diagnostics()
+        XCTAssertEqual(afterFlush.journalBytes, 0)
+        XCTAssertEqual(afterFlush.journalRecordCount, 0)
+    }
+
+    func testHistoryStoreRepairsIncompleteJournalTail() async throws {
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let base = Date(timeIntervalSince1970: 1_699_999_980)
+        let store = HistoryStore(fileURL: url)
+        _ = try await store.append(
+            snapshot: makeSystemSnapshot(timestamp: base, compressed: 10, swap: 20),
+            now: base
+        )
+
+        let next = makeHistoryRecord(
+            timestamp: base.addingTimeInterval(60),
+            availableFraction: 0.40,
+            swapUsedBytes: 30
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        var journalData = try encoder.encode(next)
+        journalData.append(0x0A)
+        journalData.append(contentsOf: Data("{\"timestamp\":".utf8))
+        try journalData.write(to: store.journalURL, options: [.atomic])
+
+        let reloaded = HistoryStore(fileURL: url)
+        let loaded = try await reloaded.load(now: base.addingTimeInterval(60))
+        XCTAssertEqual(loaded.map(\.swapUsedBytes), [20, 30])
+
+        let repaired = try Data(contentsOf: store.journalURL)
+        XCTAssertTrue(repaired.last == 0x0A)
+    }
+
+    func testHistoryStoreRecoversJournalWithoutSnapshot() async throws {
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let record = makeHistoryRecord(
+            timestamp: Date(timeIntervalSince1970: 1_700_000_000),
+            availableFraction: 0.35,
+            swapUsedBytes: 42
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        var journalData = try encoder.encode(record)
+        journalData.append(0x0A)
+        let journalURL = URL(fileURLWithPath: url.path + ".journal")
+        try journalData.write(to: journalURL, options: [.atomic])
+
+        let store = HistoryStore(fileURL: url)
+        let loaded = try await store.load(now: record.timestamp)
+        XCTAssertEqual(loaded.count, 1)
+        XCTAssertEqual(loaded[0].swapUsedBytes, record.swapUsedBytes)
+        XCTAssertEqual(loaded[0].availableFraction, record.availableFraction, accuracy: 0.0001)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        let diagnostics = await store.diagnostics()
+        XCTAssertEqual(diagnostics.journalBytes, 0)
+    }
+
     func testHistoryStoreDropsRecordsOlderThanRetentionWindow() async throws {
         let (url, directory) = makeTemporaryHistoryURL()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -1243,6 +1345,18 @@ final class MemoryMonitorCoreTests: XCTestCase {
         } catch let error as HistoryStoreError {
             XCTAssertEqual(error, .unsupportedVersion(99))
         }
+    }
+
+    func testWorkloadGrouperRetainsLiveMemberIdentities() {
+        let first = makeProcess(pid: 801, name: "node", footprint: 100, workingDirectoryLabel: "api")
+        let second = makeProcess(pid: 802, name: "node", footprint: 200, workingDirectoryLabel: "api")
+
+        let group = try! XCTUnwrap(
+            WorkloadGrouper().group([first, second]).first { $0.id == "runtime-node-api" }
+        )
+
+        XCTAssertEqual(Set(group.memberProcessIdentities), Set([first.identity, second.identity]))
+        XCTAssertEqual(group.processCount, group.memberProcessIdentities.count)
     }
 
     private func makeGroup(id: String, title: String, footprint: UInt64) -> WorkloadGroupSnapshot {
