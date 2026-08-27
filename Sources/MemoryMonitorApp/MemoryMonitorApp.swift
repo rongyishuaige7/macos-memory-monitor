@@ -55,8 +55,10 @@ final class MonitorViewModel: ObservableObject {
         listedProcessCount: 0
     )
     @Published private(set) var recommendation: MemoryRecommendation?
+    @Published private(set) var healthCheckedAt = Date()
 
     let processActions: ProcessActionController
+    let loginLaunch: LoginLaunchCoordinator
     private var refreshTask: Task<Void, Never>?
     private let sampler = MonitorSampler()
     private let samplingPolicy = AdaptiveSamplingPolicy()
@@ -78,8 +80,9 @@ final class MonitorViewModel: ObservableObject {
     private var lastRecommendationAt: Date?
     private let recommendationCooldown: TimeInterval = 30 * 60
 
-    init() {
+    init(loginLaunchRuntime: (any LoginLaunchRuntime)? = nil) {
         processActions = ProcessActionController()
+        loginLaunch = LoginLaunchCoordinator(runtime: loginLaunchRuntime)
         refreshTask = Task { [weak self] in
             await self?.refreshLoop()
         }
@@ -143,6 +146,27 @@ final class MonitorViewModel: ObservableObject {
         return "\(samplingDiagnostics.mode.displayName) · 本轮 \(duration) · 进程未刷新"
     }
 
+    var healthSnapshot: MonitorHealthSnapshot {
+        MonitorHealthEvaluator.evaluate(
+            MonitorHealthInput(
+                systemStatus: systemStatus,
+                cpuStatus: cpuStatus,
+                gpuStatus: gpuStatus,
+                processStatus: processStatus,
+                observedProcessCount: observedProcessCount,
+                listedProcessCount: listedProcessCount,
+                samplingDiagnostics: samplingDiagnostics,
+                historyRecordCount: history.count,
+                historyError: historyError,
+                historyDiagnostics: historyDiagnostics,
+                auditError: processActions.auditError,
+                loginStatus: loginLaunch.status,
+                loginError: loginLaunch.lastError,
+                checkedAt: healthCheckedAt
+            )
+        )
+    }
+
     var historyAnalysis: MemoryHistoryAnalysis {
         historyAnalyzer.analyze(history)
     }
@@ -199,6 +223,11 @@ final class MonitorViewModel: ObservableObject {
         guard isPanelPresented != presented else { return }
         isPanelPresented = presented
         Task { await refreshWakeup.signal() }
+    }
+
+    func refreshHealth() {
+        healthCheckedAt = Date()
+        loginLaunch.refreshStatus()
     }
 
     private func refreshLoop() async {
@@ -552,6 +581,8 @@ private struct MonitorPopover: View {
     @State private var processSortMode: ProcessSortMode = .footprint
     @State private var searchText = ""
     @State private var detailSelection: MonitorDetailSelection?
+    @State private var showHealthPanel = false
+    @State private var showAuditPanel = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -585,6 +616,12 @@ private struct MonitorPopover: View {
                 WorkloadGroupDetailView(model: model, groupID: groupID)
             }
         }
+        .sheet(isPresented: $showHealthPanel) {
+            MonitorHealthPanel(model: model, loginLaunch: model.loginLaunch)
+        }
+        .sheet(isPresented: $showAuditPanel) {
+            OperationsAuditPanel(actions: model.processActions)
+        }
     }
 
     @ViewBuilder
@@ -614,10 +651,29 @@ private struct MonitorPopover: View {
                 }
             }
             Spacer()
-            if let updatedAt = model.updatedAt {
-                Text(updatedAt, style: .time)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                Button {
+                    showHealthPanel = true
+                } label: {
+                    Image(systemName: model.healthSnapshot.overall.iconName)
+                        .foregroundStyle(healthLevelColor(model.healthSnapshot.overall))
+                }
+                .buttonStyle(.borderless)
+                .help("运行健康与权限诊断")
+
+                Button {
+                    showAuditPanel = true
+                } label: {
+                    Image(systemName: "doc.text.magnifyingglass")
+                }
+                .buttonStyle(.borderless)
+                .help("查看操作审计")
+
+                if let updatedAt = model.updatedAt {
+                    Text(updatedAt, style: .time)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -1523,7 +1579,7 @@ private struct WorkloadHistoryPoint: Identifiable {
     var id: Date { timestamp }
 }
 
-private struct DetailSection<Content: View>: View {
+struct DetailSection<Content: View>: View {
     let title: String
     @ViewBuilder let content: () -> Content
 

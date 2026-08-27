@@ -15,8 +15,8 @@ else
 	# the signature after the build completes.
 	output_root="$HOME/Library/Application Support/MemoryMonitor/dist"
 fi
-app_version="${APP_VERSION:-0.9.0}"
-build_number="${BUILD_NUMBER:-9}"
+app_version="${APP_VERSION:-1.0.0}"
+build_number="${BUILD_NUMBER:-10}"
 signing_identity="${CODE_SIGN_IDENTITY:--}"
 skip_signing="${SKIP_SIGNING:-0}"
 binary_name="memory-monitor-app"

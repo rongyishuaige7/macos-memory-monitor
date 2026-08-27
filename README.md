@@ -6,7 +6,7 @@
 - 物理内存基线：16 GiB
 - 首版形态：菜单栏常驻 + 点击弹出详细面板
 - 首版范围（历史基线）：只监视、分析和给出建议，不执行进程退出或强制结束
-- 当前版本：v0.9.0，支持可测试、可取消且使用单调超时的受保护进程操作
+- 当前版本：v1.0.0，支持运行健康诊断、可选登录启动和只读操作审计总览
 - 文档状态：设计基线，可作为后续实现的验收依据
 
 ## 1. 产品定位
@@ -571,3 +571,23 @@ open "$HOME/Library/Application Support/MemoryMonitor/dist/MemoryMonitor.app"
 - 过期或错误进程调用强制结束接口时保留原目标的超时状态，不因陈旧 UI 行覆盖可执行的二次确认上下文；强制结束仍绑定优雅退出开始时的原始 `(PID, 启动时间)` 快照。
 - 新增 `MemoryMonitorAppTests`，以假采样、假信号和可控时钟覆盖 10 个控制器场景；核心 70 项加应用控制器 10 项，共 80 项测试，验证过程不触碰真实第三方进程。
 - 本版已通过 `swift test --parallel`（80 项）、严格并发 Release 构建、签名校验、Release 探针和本机替换部署；提交并推送按每个小版本的交付流程完成。
+
+### Phase 9 completed：系统集成与运行自检（v1.0.0）
+
+本阶段把“应用是否正在可靠工作”本身变成可观察对象，并提供明确的系统集成开关。
+
+- `LoginLaunchCoordinator` 封装 `SMAppService.mainApp`，登录启动默认关闭，只有用户在设置面板明确打开后才注册；`requiresApproval`、注册失败和应用尚未位于可注册位置都显示为可解释状态，不伪装成成功。
+- 新增运行健康快照，分别报告系统/CPU/GPU/进程采样、24 小时历史、操作审计和登录启动状态；“正常”“部分可用”“需要处理”分级，权限受限与采样失败不再混成一个错误。
+- 设置/诊断面板提供一键重新检查，并可跳转 macOS 登录项和隐私设置；应用不会自行修改系统权限，也不会要求不必要的 Full Disk Access。
+- 新增只读操作审计总览，支持按结果筛选、时间倒序查看和受限记录提示；不提供清空、批量结束或自动修复动作。
+- 使用假登录启动运行时和构造快照覆盖状态映射、注册/注销失败、健康等级、审计筛选及历史/采样降级；不在测试中改动真实登录项或系统设置。
+
+验收：`swift test --parallel` 覆盖新增状态机；Release App bundle 能显示版本和登录启动状态；在本机明确关闭登录启动时，应用持续运行且设置面板能解释当前状态；登录启动开关只在用户确认后改变系统注册状态。
+
+实际验收（2026-08-27）：
+
+- `swift test --parallel`：87/87 通过（包含登录启动、健康等级、采样性能和审计筛选测试）。
+- `swift build --configuration debug -Xswiftc -strict-concurrency=complete` 和 `swift build --configuration release -Xswiftc -strict-concurrency=complete`：通过。
+- `./scripts/build-app.sh`：成功生成 arm64 `MemoryMonitor.app`；`CFBundleShortVersionString=1.0.0`、`CFBundleVersion=10`，`codesign --verify --deep --strict` 通过，且已链接 `ServiceManagement.framework`。
+- Release probe：系统总内存 16.0 GiB，进程采样 481/728（部分进程受 macOS 权限限制），未归属 WebKit 归因总量约 13.6 GiB；受限状态按设计显示为部分可用。
+- 本机部署：`/Users/rongyi/Applications/MemoryMonitor.app` 以 `open -g` 启动并稳定运行；登录启动保持关闭，未修改真实登录项或系统设置。
