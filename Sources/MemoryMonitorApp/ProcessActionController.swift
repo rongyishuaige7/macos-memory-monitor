@@ -37,6 +37,136 @@ struct ProcessActionStatus {
     let tone: ProcessActionStatusTone
 }
 
+/// The result of one signal-delivery attempt. Keeping this separate from the
+/// controller makes the safety policy and state machine testable without ever
+/// sending a signal to a real process.
+enum ProcessActionSignalResult: Equatable, Sendable {
+    case sent
+    case alreadyExited
+    case failed(Int32)
+}
+
+/// Runtime boundary for process actions. The controller is deliberately
+/// unaware of libproc, Darwin signals, AppKit application termination, and
+/// timekeeping. Production uses `LiveProcessActionRuntime`; tests can
+/// provide a deterministic fake implementation.
+@MainActor
+protocol ProcessActionRuntime: AnyObject {
+    func sample(pid: Int32) async -> ProcessSnapshot?
+    func processExists(pid: Int32) async -> Bool
+    func sendGraceful(to process: ProcessSnapshot) async -> ProcessActionSignalResult
+    func sendForce(to process: ProcessSnapshot) async -> ProcessActionSignalResult
+    /// Wall-clock time is used only for the human-readable deadline shown in
+    /// the UI. It must not be used to decide whether an action timed out.
+    func wallClockNow() -> Date
+    /// A monotonic continuous clock is used for all timeout decisions and is
+    /// immune to manual/NTP wall-clock adjustments and system sleep.
+    func monotonicNanoseconds() -> UInt64
+    func sleep(for duration: Duration) async throws
+}
+
+/// Real macOS implementation of the runtime boundary. Potentially expensive
+/// libproc reads run on a utility task so the menu bar popover remains
+/// responsive while an action is being prepared or verified.
+@MainActor
+final class LiveProcessActionRuntime: ProcessActionRuntime {
+    private let sampler: ProcessSampler
+
+    init(sampler: ProcessSampler = ProcessSampler()) {
+        self.sampler = sampler
+    }
+
+    func sample(pid: Int32) async -> ProcessSnapshot? {
+        let sampler = sampler
+        return await Task.detached(priority: .utility) {
+            sampler.sample(pid: pid)
+        }.value
+    }
+
+    func processExists(pid: Int32) async -> Bool {
+        await Task.detached(priority: .utility) {
+            Self.processExistsSynchronously(pid)
+        }.value
+    }
+
+    func sendGraceful(to process: ProcessSnapshot) async -> ProcessActionSignalResult {
+        if let application = guiApplication(for: process) {
+            if application.terminate() {
+                return .sent
+            }
+            return Self.processExistsSynchronously(process.identity.pid)
+                ? .failed(EIO)
+                : .alreadyExited
+        }
+        return sendDarwinSignal(SIGTERM, to: process.identity.pid)
+    }
+
+    func sendForce(to process: ProcessSnapshot) async -> ProcessActionSignalResult {
+        if let application = guiApplication(for: process) {
+            if application.forceTerminate() {
+                return .sent
+            }
+            return Self.processExistsSynchronously(process.identity.pid)
+                ? .failed(EIO)
+                : .alreadyExited
+        }
+        return sendDarwinSignal(SIGKILL, to: process.identity.pid)
+    }
+
+    func wallClockNow() -> Date { Date() }
+
+    nonisolated func monotonicNanoseconds() -> UInt64 {
+        continuousNanoseconds()
+    }
+
+    func sleep(for duration: Duration) async throws {
+        try await Task.sleep(for: duration)
+    }
+
+    private func guiApplication(for process: ProcessSnapshot) -> NSRunningApplication? {
+        guard process.identity.pid > 0,
+              let application = NSRunningApplication(
+                processIdentifier: pid_t(process.identity.pid)
+              ),
+              application.bundleIdentifier != nil,
+              application.activationPolicy != .prohibited else {
+            return nil
+        }
+        return application
+    }
+
+    private func sendDarwinSignal(_ signal: Int32, to pid: Int32) -> ProcessActionSignalResult {
+        guard pid > 0 else { return .failed(EINVAL) }
+        guard Darwin.kill(pid_t(pid), signal) == 0 else {
+            let code = Int32(Darwin.errno)
+            return code == ESRCH ? .alreadyExited : .failed(code)
+        }
+        return .sent
+    }
+
+    nonisolated private static func processExistsSynchronously(_ pid: Int32) -> Bool {
+        guard pid > 0 else { return false }
+        if Darwin.kill(pid_t(pid), 0) == 0 { return true }
+        return Int32(Darwin.errno) != ESRCH
+    }
+}
+
+/// Returns a nanosecond clock that continues across system sleep. The
+/// timebase conversion is cheap compared with a process identity read and is
+/// intentionally kept outside the main-actor runtime object.
+private func continuousNanoseconds() -> UInt64 {
+    var timebase = mach_timebase_info_data_t()
+    guard mach_timebase_info(&timebase) == KERN_SUCCESS,
+          timebase.denom > 0 else {
+        return DispatchTime.now().uptimeNanoseconds
+    }
+
+    let ticks = mach_continuous_time()
+    let (scaled, overflow) = ticks.multipliedReportingOverflow(by: UInt64(timebase.numer))
+    guard !overflow else { return UInt64.max }
+    return scaled / UInt64(timebase.denom)
+}
+
 /// Serializes user-confirmed process actions and keeps all signal delivery
 /// behind the same identity/safety checks. The app never performs a force
 /// termination unless a graceful request for the same process timed out and
@@ -48,7 +178,7 @@ final class ProcessActionController: ObservableObject {
     @Published private(set) var auditError: String?
 
     private let policy: ProcessActionPolicy
-    private let sampler: ProcessSampler
+    private let runtime: any ProcessActionRuntime
     private let auditStore: ProcessActionAuditStore
     private let gracefulTimeout: TimeInterval
     private let forceVerificationTimeout: TimeInterval
@@ -62,6 +192,7 @@ final class ProcessActionController: ObservableObject {
         currentUserID: UInt32 = UInt32(getuid()),
         monitorPID: Int32 = Int32(getpid()),
         sampler: ProcessSampler = ProcessSampler(),
+        runtime: (any ProcessActionRuntime)? = nil,
         auditStore: ProcessActionAuditStore = ProcessActionAuditStore(),
         gracefulTimeout: TimeInterval = 8,
         forceVerificationTimeout: TimeInterval = 2
@@ -70,7 +201,7 @@ final class ProcessActionController: ObservableObject {
             currentUserID: currentUserID,
             monitorPID: monitorPID
         )
-        self.sampler = sampler
+        self.runtime = runtime ?? LiveProcessActionRuntime(sampler: sampler)
         self.auditStore = auditStore
         self.gracefulTimeout = max(gracefulTimeout.isFinite ? gracefulTimeout : 8, 1)
         self.forceVerificationTimeout = max(
@@ -110,6 +241,10 @@ final class ProcessActionController: ObservableObject {
     func canForceTerminate(for identity: ProcessIdentity) -> Bool {
         guard case .timedOut(let timedOutIdentity) = state else { return false }
         return timedOutIdentity == identity && targetProcess?.identity == identity
+    }
+
+    func canCancel(for identity: ProcessIdentity) -> Bool {
+        stateIdentity == identity && cancellableAction != nil
     }
 
     func status(for identity: ProcessIdentity) -> ProcessActionStatus? {
@@ -183,7 +318,14 @@ final class ProcessActionController: ObservableObject {
               let expected = targetProcess,
               expected.identity == process.identity else {
             let message = "强制结束仅在同一进程的优雅退出请求超时后可用。"
-            state = .denied(process.identity, message)
+            // Do not erase another process's timed-out state when a stale UI
+            // row invokes this method with the wrong identity.
+            if case .timedOut(let timedOutIdentity) = state,
+               timedOutIdentity != process.identity {
+                // Keep the actionable timeout visible for its original target.
+            } else {
+                state = .denied(process.identity, message)
+            }
             Task { [weak self] in
                 await self?.appendAudit(
                     action: .forceTerminate,
@@ -226,15 +368,16 @@ final class ProcessActionController: ObservableObject {
         guard stateIdentity == identity,
               let action = cancellableAction else { return }
         let previousTarget = targetProcess
+        let cancellationMessage = cancellationMessage(for: state)
         cancelCurrentTask()
-        state = .cancelled(identity, "操作已取消，未发送新的进程信号。")
+        state = .cancelled(identity, cancellationMessage)
         if let previousTarget {
             Task { [weak self] in
                 await self?.appendAudit(
                     action: action,
                     outcome: .cancelled,
                     process: previousTarget,
-                    detail: "操作已取消"
+                    detail: cancellationMessage
                 )
             }
         }
@@ -272,8 +415,8 @@ final class ProcessActionController: ObservableObject {
     ) async {
         guard isCurrent(token) else { return }
 
-        guard let current = sampler.sample(pid: expected.identity.pid) else {
-            if !processExists(expected.identity.pid) {
+        guard let current = await runtime.sample(pid: expected.identity.pid) else {
+            if !(await runtime.processExists(pid: expected.identity.pid)) {
                 await finish(
                     state: .completed(expected.identity, .gracefulExit, "进程已经退出"),
                     action: .gracefulExit,
@@ -305,7 +448,7 @@ final class ProcessActionController: ObservableObject {
         }
         guard isCurrent(token), !Task.isCancelled else { return }
 
-        switch sendGracefulSignal(to: current) {
+        switch await runtime.sendGraceful(to: current) {
         case .alreadyExited:
             await finish(
                 state: .completed(expected.identity, .gracefulExit, "进程已经退出"),
@@ -325,9 +468,14 @@ final class ProcessActionController: ObservableObject {
                 token: token
             )
         case .sent:
-            let deadline = Date().addingTimeInterval(gracefulTimeout)
+            let deadline = runtime.wallClockNow().addingTimeInterval(gracefulTimeout)
+            let deadlineNanoseconds = timeoutDeadline(after: gracefulTimeout)
             state = .waitingForGraceful(expected.identity, deadline)
-            switch await waitForOriginalExit(expected: expected, deadline: deadline, token: token) {
+            switch await waitForOriginalExit(
+                expected: expected,
+                deadlineNanoseconds: deadlineNanoseconds,
+                token: token
+            ) {
             case .exited:
                 await finish(
                     state: .completed(expected.identity, .gracefulExit, "进程已退出"),
@@ -348,6 +496,15 @@ final class ProcessActionController: ObservableObject {
                 )
             case .cancelled:
                 return
+            case .failed(let message):
+                await finish(
+                    state: .failed(expected.identity, "等待优雅退出状态失败：" + message),
+                    action: .gracefulExit,
+                    outcome: .failed,
+                    process: expected,
+                    detail: "等待优雅退出状态失败：" + message,
+                    token: token
+                )
             }
         }
     }
@@ -360,8 +517,8 @@ final class ProcessActionController: ObservableObject {
             return
         }
 
-        guard let current = sampler.sample(pid: expected.identity.pid) else {
-            if !processExists(expected.identity.pid) {
+        guard let current = await runtime.sample(pid: expected.identity.pid) else {
+            if !(await runtime.processExists(pid: expected.identity.pid)) {
                 await finish(
                     state: .completed(expected.identity, .forceTerminate, "进程已经退出"),
                     action: .forceTerminate,
@@ -393,7 +550,7 @@ final class ProcessActionController: ObservableObject {
         }
         guard isCurrent(token), !Task.isCancelled else { return }
 
-        switch sendForceSignal(to: current) {
+        switch await runtime.sendForce(to: current) {
         case .alreadyExited:
             await finish(
                 state: .completed(expected.identity, .forceTerminate, "进程已经退出"),
@@ -413,8 +570,12 @@ final class ProcessActionController: ObservableObject {
                 token: token
             )
         case .sent:
-            let deadline = Date().addingTimeInterval(forceVerificationTimeout)
-            switch await waitForOriginalExit(expected: expected, deadline: deadline, token: token) {
+            let deadlineNanoseconds = timeoutDeadline(after: forceVerificationTimeout)
+            switch await waitForOriginalExit(
+                expected: expected,
+                deadlineNanoseconds: deadlineNanoseconds,
+                token: token
+            ) {
             case .exited:
                 await finish(
                     state: .completed(expected.identity, .forceTerminate, "进程已结束"),
@@ -435,100 +596,80 @@ final class ProcessActionController: ObservableObject {
                 )
             case .cancelled:
                 return
+            case .failed(let message):
+                await finish(
+                    state: .failed(expected.identity, "等待强制结束状态失败：" + message),
+                    action: .forceTerminate,
+                    outcome: .failed,
+                    process: expected,
+                    detail: "等待强制结束状态失败：" + message,
+                    token: token
+                )
             }
         }
-    }
-
-    private enum SignalResult {
-        case sent
-        case alreadyExited
-        case failed(Int32)
-    }
-
-    private func sendGracefulSignal(to process: ProcessSnapshot) -> SignalResult {
-        if let application = guiApplication(for: process) {
-            if application.terminate() {
-                return .sent
-            }
-            return processExists(process.identity.pid)
-                ? .failed(EIO)
-                : .alreadyExited
-        }
-        return sendDarwinSignal(SIGTERM, to: process.identity.pid)
-    }
-
-    private func sendForceSignal(to process: ProcessSnapshot) -> SignalResult {
-        if let application = guiApplication(for: process) {
-            if application.forceTerminate() {
-                return .sent
-            }
-            return processExists(process.identity.pid)
-                ? .failed(EIO)
-                : .alreadyExited
-        }
-        return sendDarwinSignal(SIGKILL, to: process.identity.pid)
-    }
-
-    private func guiApplication(for process: ProcessSnapshot) -> NSRunningApplication? {
-        guard process.identity.pid > 0,
-              let application = NSRunningApplication(
-                processIdentifier: pid_t(process.identity.pid)
-              ),
-              application.bundleIdentifier != nil,
-              application.activationPolicy != .prohibited else {
-            return nil
-        }
-        return application
-    }
-
-    private func sendDarwinSignal(_ signal: Int32, to pid: Int32) -> SignalResult {
-        guard pid > 0 else { return .failed(EINVAL) }
-        guard Darwin.kill(pid_t(pid), signal) == 0 else {
-            let code = Int32(Darwin.errno)
-            return code == ESRCH ? .alreadyExited : .failed(code)
-        }
-        return .sent
-    }
-
-    private func processExists(_ pid: Int32) -> Bool {
-        guard pid > 0 else { return false }
-        if Darwin.kill(pid_t(pid), 0) == 0 { return true }
-        return Int32(Darwin.errno) != ESRCH
     }
 
     private enum ExitWaitResult {
         case exited
         case stillRunning
         case cancelled
+        case failed(String)
     }
 
     private func waitForOriginalExit(
         expected: ProcessSnapshot,
-        deadline: Date,
+        deadlineNanoseconds: UInt64,
         token: UUID
     ) async -> ExitWaitResult {
-        while Date() < deadline {
+        while runtime.monotonicNanoseconds() < deadlineNanoseconds {
             guard isCurrent(token), !Task.isCancelled else { return .cancelled }
-            if !originalProcessIsAlive(expected) { return .exited }
+            if !(await originalProcessIsAlive(expected)) { return .exited }
             do {
-                try await Task.sleep(for: pollInterval)
+                try await runtime.sleep(for: pollInterval)
             } catch {
-                return .cancelled
+                return Task.isCancelled
+                    ? .cancelled
+                    : .failed("计时器不可用")
             }
         }
         guard isCurrent(token), !Task.isCancelled else { return .cancelled }
-        return originalProcessIsAlive(expected) ? .stillRunning : .exited
+        return await originalProcessIsAlive(expected) ? .stillRunning : .exited
+    }
+
+    private func timeoutDeadline(after interval: TimeInterval) -> UInt64 {
+        guard interval.isFinite, interval > 0 else {
+            return runtime.monotonicNanoseconds()
+        }
+
+        let nanoseconds = interval * 1_000_000_000
+        guard nanoseconds < Double(UInt64.max) else { return UInt64.max }
+        let offset = UInt64(max(nanoseconds.rounded(.up), 1))
+        let (deadline, overflow) = runtime.monotonicNanoseconds().addingReportingOverflow(offset)
+        return overflow ? UInt64.max : deadline
     }
 
     /// A different start time means the original process is gone even if the
     /// kernel has already reused its PID for another process.
-    private func originalProcessIsAlive(_ expected: ProcessSnapshot) -> Bool {
-        if let current = sampler.sample(pid: expected.identity.pid) {
+    private func originalProcessIsAlive(_ expected: ProcessSnapshot) async -> Bool {
+        if let current = await runtime.sample(pid: expected.identity.pid) {
             return current.identity == expected.identity
         }
         // A missing proc_pidinfo result is conservative: EPERM/EACCES still
         // counts as present, while ESRCH means the PID no longer exists.
-        return processExists(expected.identity.pid)
+        return await runtime.processExists(pid: expected.identity.pid)
+    }
+
+    private func cancellationMessage(for state: ProcessActionState) -> String {
+        switch state {
+        case .requestingGraceful:
+            return "操作已取消；尚未确认是否发送优雅退出请求。"
+        case .waitingForGraceful:
+            return "等待已取消；优雅退出请求已发送，未发送强制结束。"
+        case .forceTerminating:
+            return "操作已取消；请重新采样确认进程状态。"
+        default:
+            return "操作已取消，未发送新的进程信号。"
+        }
     }
 
     private func finishDenied(
@@ -558,14 +699,15 @@ final class ProcessActionController: ObservableObject {
         token: UUID
     ) async {
         guard isCurrent(token) else { return }
+        // Publish the terminal state before disk I/O so a slow or unavailable
+        // audit store cannot leave the UI looking busy after the action ended.
+        state = newState
         await appendAudit(
             action: action,
             outcome: outcome,
             process: process,
             detail: detail
         )
-        guard isCurrent(token) else { return }
-        state = newState
     }
 
     private func appendAudit(

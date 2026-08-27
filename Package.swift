@@ -34,6 +34,10 @@ let package = Package(
         .testTarget(
             name: "MemoryMonitorCoreTests",
             dependencies: ["MemoryMonitorCore"]
+        ),
+        .testTarget(
+            name: "MemoryMonitorAppTests",
+            dependencies: ["MemoryMonitorCore", "MemoryMonitorApp"]
         )
     ]
 )

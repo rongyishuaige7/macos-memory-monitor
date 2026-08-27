@@ -1150,6 +1150,16 @@ private struct ProcessDetailView: View {
                         .buttonStyle(.borderedProminent)
                         .help("仅在优雅退出超时后使用")
                     }
+
+                    if actions.canCancel(for: process.identity) {
+                        Button {
+                            actions.cancel(for: process.identity)
+                        } label: {
+                            Label("取消当前操作", systemImage: "stop.circle")
+                        }
+                        .buttonStyle(.bordered)
+                        .help("停止等待或取消尚未完成的操作")
+                    }
                 }
 
                 recentActionSection
