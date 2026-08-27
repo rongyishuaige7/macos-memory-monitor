@@ -14,6 +14,13 @@ do {
     let availablePercent = system.availableFraction * 100
     print("Memory Monitor Probe")
     print("============================")
+    print("Sampling:    \(snapshot.samplingMode.displayName)")
+    print("Duration:    \(String(format: "%.1f", snapshot.diagnostics.totalDurationMilliseconds)) ms")
+    if let processDuration = snapshot.diagnostics.processDurationMilliseconds {
+        print("Process scan: \(String(format: "%.1f", processDuration)) ms")
+    } else {
+        print("Process scan: skipped")
+    }
     print("Total:       \(MemoryFormatter.bytes(system.totalBytes))")
     print("Memory used: \(String(format: "%.1f", system.usedFraction * 100))% (estimated)")
     print("Available*:  \(MemoryFormatter.bytes(system.availableEstimateBytes)) (\(String(format: "%.1f", availablePercent))%)")
@@ -60,6 +67,24 @@ do {
             evidence
         ]
         print(columns.joined(separator: " "))
+    }
+
+    if let recommendation = RecommendationEngine().evaluate(
+        RecommendationContext(current: snapshot)
+    ).first {
+        print("\nRead-only recommendation:")
+        print("  [\(recommendation.severity.displayName)] \(recommendation.title)")
+        print("  \(recommendation.detail)")
+        if !recommendation.evidence.isEmpty {
+            let evidence = recommendation.evidence
+                .prefix(3)
+                .map { "\($0.label)=\($0.value)" }
+                .joined(separator: " · ")
+            print("  Evidence: \(evidence)")
+        }
+        print("  Confidence: \(recommendation.confidencePercent)%")
+    } else {
+        print("\nRead-only recommendation: none")
     }
     print("\n* Available is an estimate based on free, inactive and purgeable pages; speculative pages are included in free.")
 } catch {

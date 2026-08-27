@@ -43,16 +43,35 @@ final class MonitorViewModel: ObservableObject {
     @Published private(set) var updatedAt: Date?
     @Published private(set) var isPanelPresented = false
     @Published private(set) var pressureLevel: MemoryPressureLevel?
+    @Published private(set) var samplingDiagnostics = SamplingDiagnostics(
+        mode: .background,
+        totalDurationMilliseconds: 0,
+        processDurationMilliseconds: nil,
+        processSamplingPerformed: false,
+        processCount: 0,
+        listedProcessCount: 0
+    )
+    @Published private(set) var recommendation: MemoryRecommendation?
 
     private var refreshTask: Task<Void, Never>?
     private let sampler = MonitorSampler()
     private let samplingPolicy = AdaptiveSamplingPolicy()
+    private let recommendationEngine = RecommendationEngine()
     private var pressureEvaluator = MemoryPressureEvaluator()
     private let refreshWakeup = RefreshWakeup()
     private let historyStore = HistoryStore()
     private var historyBuffer = MemoryHistoryBuffer(capacity: 60)
     private var historyStoreAvailable = true
     private var previousCPUTime: CPUTimeSnapshot?
+    private var lastProcessSampleAt: Date?
+    private var previousRecommendationSystem: SystemMemorySnapshot?
+    private var previousRecommendationProcessSystem: SystemMemorySnapshot?
+    private var previousRecommendationGroups: [WorkloadGroupSnapshot] = []
+    private var previousRecommendationProcessStatus: SampleStatus?
+    private var previousRecommendationPressureLevel: MemoryPressureLevel?
+    private var lastRecommendationKey: String?
+    private var lastRecommendationAt: Date?
+    private let recommendationCooldown: TimeInterval = 30 * 60
 
     init() {
         refreshTask = Task { [weak self] in
@@ -95,20 +114,27 @@ final class MonitorViewModel: ObservableObject {
         if samplingIssueDescription != nil {
             return "部分采样源失败，未用 0 覆盖已有数据"
         }
+        if !samplingDiagnostics.processSamplingPerformed, !processes.isEmpty {
+            return "后台低频观察中，进程排行显示最近一次成功采样"
+        }
         return processStatus.quality == .estimated
             ? "进程列表部分可用，已保留成功读取的条目"
             : nil
     }
 
     var samplingCadenceDescription: String {
-        let interval = samplingPolicy.intervalSeconds(
+        return samplingPolicy.cadenceDescription(
             panelPresented: isPanelPresented,
             pressureActive: pressureEvaluator.pressureActiveForSampling
         )
-        if interval.rounded() == interval {
-            return "约 \(Int(interval)) 秒刷新"
+    }
+
+    var samplingDiagnosticsDescription: String {
+        let duration = String(format: "%.0f ms", samplingDiagnostics.totalDurationMilliseconds)
+        if samplingDiagnostics.processSamplingPerformed {
+            return "\(samplingDiagnostics.mode.displayName) · 本轮 \(duration)"
         }
-        return String(format: "约 %.1f 秒刷新", interval)
+        return "\(samplingDiagnostics.mode.displayName) · 本轮 \(duration) · 进程未刷新"
     }
 
     func setPanelPresented(_ presented: Bool) {
@@ -127,14 +153,31 @@ final class MonitorViewModel: ObservableObject {
         }
 
         while !Task.isCancelled {
+            let mode = samplingPolicy.samplingMode(
+                panelPresented: isPanelPresented,
+                pressureActive: pressureEvaluator.pressureActiveForSampling,
+                now: Date(),
+                lastProcessSampleAt: lastProcessSampleAt
+            )
             let snapshot = await Task.detached(priority: .utility) { [sampler] in
-                sampler.sample()
+                sampler.sample(mode: mode)
             }.value
 
+            samplingDiagnostics = snapshot.diagnostics
             systemStatus = snapshot.systemStatus
             cpuStatus = snapshot.cpuStatus
             gpuStatus = snapshot.gpuStatus
-            processStatus = snapshot.processStatus
+
+            if snapshot.didSampleProcesses {
+                lastProcessSampleAt = snapshot.timestamp
+                processStatus = snapshot.processStatus
+                if snapshot.processStatus.quality.isUsable {
+                    processes = snapshot.processes
+                    groups = snapshot.groups
+                    observedProcessCount = snapshot.sampledProcessCount
+                    listedProcessCount = snapshot.listedProcessCount
+                }
+            }
 
             if let systemSnapshot = snapshot.system {
                 pressureLevel = pressureEvaluator.update(snapshot: systemSnapshot)
@@ -143,7 +186,7 @@ final class MonitorViewModel: ObservableObject {
                     do {
                         history = try await historyStore.append(
                             snapshot: systemSnapshot,
-                            groups: snapshot.groups,
+                            groups: groups,
                             now: snapshot.timestamp
                         )
                         historyError = nil
@@ -157,6 +200,16 @@ final class MonitorViewModel: ObservableObject {
                 }
                 system = systemSnapshot
             }
+
+            let recommendationContext = RecommendationContext(
+                current: snapshot,
+                previousSystem: previousRecommendationSystem,
+                previousProcessSystem: previousRecommendationProcessSystem,
+                previousGroups: previousRecommendationGroups,
+                previousProcessStatus: previousRecommendationProcessStatus,
+                pressureLevel: pressureLevel,
+                previousPressureLevel: previousRecommendationPressureLevel
+            )
 
             if let cpuTime = snapshot.cpuTime, snapshot.cpuStatus.quality.isUsable {
                 cpuUsageFraction = previousCPUTime.flatMap {
@@ -172,12 +225,24 @@ final class MonitorViewModel: ObservableObject {
                 ? snapshot.gpuUsageFraction
                 : nil
 
-            if snapshot.processStatus.quality.isUsable {
-                processes = snapshot.processes
-                groups = snapshot.groups
-                observedProcessCount = snapshot.sampledProcessCount
-                listedProcessCount = snapshot.listedProcessCount
+            updateRecommendation(
+                recommendationEngine.evaluate(recommendationContext).first,
+                at: snapshot.timestamp,
+                allowClearing: snapshot.didSampleProcesses
+            )
+
+            if let systemSnapshot = snapshot.system {
+                previousRecommendationSystem = systemSnapshot
             }
+            if snapshot.didSampleProcesses, snapshot.processStatus.quality.isUsable {
+                previousRecommendationProcessSystem = snapshot.system
+                previousRecommendationGroups = snapshot.groups
+                previousRecommendationProcessStatus = snapshot.processStatus
+            }
+            if let pressureLevel {
+                previousRecommendationPressureLevel = pressureLevel
+            }
+
             updatedAt = snapshot.timestamp
             lastError = samplingIssueDescription
 
@@ -187,6 +252,33 @@ final class MonitorViewModel: ObservableObject {
         if historyStoreAvailable {
             try? await historyStore.flush()
         }
+    }
+
+    private func updateRecommendation(
+        _ candidate: MemoryRecommendation?,
+        at timestamp: Date,
+        allowClearing: Bool
+    ) {
+        guard let candidate else {
+            // A system-only pass has no fresh process evidence. Keep the last
+            // actionable explanation visible until a process sample confirms
+            // that it is no longer relevant.
+            guard allowClearing else { return }
+            recommendation = nil
+            lastRecommendationKey = nil
+            lastRecommendationAt = nil
+            return
+        }
+
+        if candidate.deduplicationKey == lastRecommendationKey,
+           let lastRecommendationAt,
+           timestamp.timeIntervalSince(lastRecommendationAt) < recommendationCooldown {
+            return
+        }
+
+        recommendation = candidate
+        lastRecommendationKey = candidate.deduplicationKey
+        lastRecommendationAt = timestamp
     }
 
     private func waitForNextSample() async -> Bool {
@@ -341,6 +433,7 @@ private struct MonitorPopover: View {
         VStack(alignment: .leading, spacing: 14) {
             header
             metrics
+            recommendationCard
             samplingNotice
             processList
             footer
@@ -372,6 +465,44 @@ private struct MonitorPopover: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+        }
+    }
+
+    @ViewBuilder
+    private var recommendationCard: some View {
+        if let recommendation = model.recommendation {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 6) {
+                    Image(systemName: recommendationIcon(recommendation.severity))
+                        .imageScale(.small)
+                        .foregroundStyle(recommendationColor(recommendation.severity))
+                    Text(recommendation.title)
+                        .font(.subheadline.weight(.medium))
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Text(recommendation.severity.displayName)
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(recommendationColor(recommendation.severity))
+                }
+                Text(recommendation.detail)
+                    .font(.caption)
+                    .foregroundStyle(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !recommendation.evidence.isEmpty {
+                    Text(recommendation.evidence.prefix(3).map { "\($0.label) \($0.value)" }.joined(separator: " · "))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+                Text("置信度 \(recommendation.confidencePercent)% · 只读建议")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(9)
+            .background(
+                recommendationColor(recommendation.severity).opacity(0.10),
+                in: RoundedRectangle(cornerRadius: 7)
+            )
         }
     }
 
@@ -446,6 +577,9 @@ private struct MonitorPopover: View {
     }
 
     private var processStatusText: String {
+        if !model.samplingDiagnostics.processSamplingPerformed {
+            return sortedProcesses.isEmpty ? "等待首次进程采样" : "上次采样"
+        }
         switch model.processStatus.quality {
         case .available:
             return "共 \(sortedProcesses.count) 个"
@@ -530,9 +664,15 @@ private struct MonitorPopover: View {
 
     private var footer: some View {
         HStack {
-            Text("只读监视 · 全量进程 · \(model.samplingCadenceDescription)")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("只读监视 · \(model.samplingCadenceDescription)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text(model.samplingDiagnosticsDescription)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
             Spacer()
             Text("Apple Silicon")
                 .font(.caption2)
@@ -590,6 +730,22 @@ private func utilizationColor(_ fraction: Double?) -> Color {
     if fraction >= 0.9 { return .red }
     if fraction >= 0.75 { return .orange }
     return .primary
+}
+
+private func recommendationColor(_ severity: RecommendationSeverity) -> Color {
+    switch severity {
+    case .info: return .secondary
+    case .attention: return .orange
+    case .critical: return .red
+    }
+}
+
+private func recommendationIcon(_ severity: RecommendationSeverity) -> String {
+    switch severity {
+    case .info: return "info.circle"
+    case .attention: return "exclamationmark.triangle"
+    case .critical: return "bolt.trianglebadge.exclamationmark"
+    }
 }
 
 private struct WorkloadGroupRow: View {

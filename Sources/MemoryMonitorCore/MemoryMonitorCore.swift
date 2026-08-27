@@ -1143,6 +1143,8 @@ public struct WorkloadGrouper: Sendable {
 /// process enumeration cannot discard otherwise valid system metrics.
 public struct MonitorSnapshot: Sendable, Equatable {
     public let timestamp: Date
+    public let samplingMode: SamplingMode
+    public let diagnostics: SamplingDiagnostics
     public let system: SystemMemorySnapshot?
     public let systemStatus: SampleStatus
     public let cpuTime: CPUTimeSnapshot?
@@ -1169,9 +1171,12 @@ public struct MonitorSnapshot: Sendable, Equatable {
         processStatus: SampleStatus,
         listedProcessCount: Int,
         sampledProcessCount: Int,
-        groups: [WorkloadGroupSnapshot]
+        groups: [WorkloadGroupSnapshot],
+        samplingMode: SamplingMode = .full,
+        diagnostics: SamplingDiagnostics? = nil
     ) {
         self.timestamp = timestamp
+        self.samplingMode = samplingMode
         self.system = system
         self.systemStatus = systemStatus
         self.cpuTime = cpuTime
@@ -1180,9 +1185,23 @@ public struct MonitorSnapshot: Sendable, Equatable {
         self.gpuStatus = gpuStatus
         self.processes = processes
         self.processStatus = processStatus
-        self.listedProcessCount = max(listedProcessCount, 0)
-        self.sampledProcessCount = max(sampledProcessCount, 0)
+        let normalizedListedCount = max(listedProcessCount, 0)
+        let normalizedSampledCount = max(sampledProcessCount, 0)
+        self.listedProcessCount = max(normalizedListedCount, normalizedSampledCount)
+        self.sampledProcessCount = normalizedSampledCount
         self.groups = groups
+        self.diagnostics = diagnostics ?? SamplingDiagnostics(
+            mode: samplingMode,
+            totalDurationMilliseconds: 0,
+            processDurationMilliseconds: samplingMode.samplesProcesses ? 0 : nil,
+            processSamplingPerformed: samplingMode.samplesProcesses,
+            processCount: normalizedSampledCount,
+            listedProcessCount: max(normalizedListedCount, normalizedSampledCount)
+        )
+    }
+
+    public var didSampleProcesses: Bool {
+        diagnostics.processSamplingPerformed
     }
 }
 
@@ -1219,6 +1238,14 @@ public struct MonitorSampler: Sendable {
     }
 
     public func sample(at timestamp: Date = Date()) -> MonitorSnapshot {
+        sample(mode: .full, at: timestamp)
+    }
+
+    public func sample(
+        mode: SamplingMode,
+        at timestamp: Date = Date()
+    ) -> MonitorSnapshot {
+        let startedAt = DispatchTime.now().uptimeNanoseconds
         var system: SystemMemorySnapshot?
         let systemStatus: SampleStatus
         do {
@@ -1247,18 +1274,38 @@ public struct MonitorSampler: Sendable {
         let gpuSample = gpuProvider()
 
         var processes: [ProcessSnapshot] = []
+        let processSamplingPerformed = mode.samplesProcesses
+        let processStartedAt = processSamplingPerformed
+            ? DispatchTime.now().uptimeNanoseconds
+            : nil
         var processStatus: SampleStatus
         var listedProcessCount = 0
         var sampledProcessCount = 0
-        do {
-            let result = try processProvider()
-            processes = result.processes.sorted(by: ProcessSnapshot.memoryDescending)
-            processStatus = result.status
-            listedProcessCount = result.listedProcessCount
-            sampledProcessCount = processes.count
-        } catch {
-            processStatus = Self.errorStatus(for: error)
+        if processSamplingPerformed {
+            do {
+                let result = try processProvider()
+                processes = result.processes.sorted(by: ProcessSnapshot.memoryDescending)
+                processStatus = result.status
+                listedProcessCount = result.listedProcessCount
+                sampledProcessCount = processes.count
+            } catch {
+                processStatus = Self.errorStatus(for: error)
+            }
+        } else {
+            processStatus = SampleStatus.unavailable(message: "本轮后台采样未执行进程扫描")
         }
+
+        let processDurationMilliseconds = processStartedAt.map {
+            elapsedMilliseconds(since: $0)
+        }
+        let diagnostics = SamplingDiagnostics(
+            mode: mode,
+            totalDurationMilliseconds: elapsedMilliseconds(since: startedAt),
+            processDurationMilliseconds: processDurationMilliseconds,
+            processSamplingPerformed: processSamplingPerformed,
+            processCount: sampledProcessCount,
+            listedProcessCount: listedProcessCount
+        )
 
         return MonitorSnapshot(
             timestamp: timestamp,
@@ -1272,12 +1319,20 @@ public struct MonitorSampler: Sendable {
             processStatus: processStatus,
             listedProcessCount: listedProcessCount,
             sampledProcessCount: sampledProcessCount,
-            groups: grouper.group(processes)
+            groups: grouper.group(processes),
+            samplingMode: mode,
+            diagnostics: diagnostics
         )
     }
 
     private static func errorStatus(for error: Error) -> SampleStatus {
         SampleStatus.error(error.localizedDescription)
+    }
+
+    private func elapsedMilliseconds(since start: UInt64) -> Double {
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard now >= start else { return 0 }
+        return Double(now - start) / 1_000_000
     }
 }
 
@@ -1336,6 +1391,386 @@ public struct WorkloadTrendAnalyzer: Sendable {
     }
 }
 
+public enum RecommendationSeverity: String, Codable, Sendable, Equatable {
+    case info
+    case attention
+    case critical
+
+    public var priority: Int {
+        switch self {
+        case .info: return 1
+        case .attention: return 2
+        case .critical: return 3
+        }
+    }
+
+    public var displayName: String {
+        switch self {
+        case .info: return "提示"
+        case .attention: return "注意"
+        case .critical: return "优先处理"
+        }
+    }
+}
+
+public struct RecommendationEvidence: Codable, Sendable, Equatable {
+    public let label: String
+    public let value: String
+
+    public init(label: String, value: String) {
+        self.label = label
+        self.value = value
+    }
+}
+
+/// A read-only explanation generated from a pair of immutable observations.
+/// `id` is stable for a rule/target pair so the UI can de-duplicate repeated
+/// samples without persisting process identities or command lines.
+public struct MemoryRecommendation: Codable, Sendable, Equatable, Identifiable {
+    public let id: String
+    public let severity: RecommendationSeverity
+    public let title: String
+    public let detail: String
+    public let evidence: [RecommendationEvidence]
+    public let confidence: Double
+    public let targetGroupID: String?
+    public let generatedAt: Date
+
+    public init(
+        id: String,
+        severity: RecommendationSeverity,
+        title: String,
+        detail: String,
+        evidence: [RecommendationEvidence],
+        confidence: Double,
+        targetGroupID: String? = nil,
+        generatedAt: Date
+    ) {
+        self.id = id
+        self.severity = severity
+        self.title = title
+        self.detail = detail
+        self.evidence = evidence
+        self.confidence = min(max(confidence.isFinite ? confidence : 0, 0), 1)
+        self.targetGroupID = targetGroupID
+        self.generatedAt = generatedAt
+    }
+
+    public var confidencePercent: Int {
+        Int((confidence * 100).rounded())
+    }
+
+    public var deduplicationKey: String { id }
+}
+
+/// Inputs used by the recommendation engine. Previous process groups are
+/// supplied separately because a background system-only pass intentionally
+/// carries no fresh process list.
+public struct RecommendationContext: Sendable, Equatable {
+    public let current: MonitorSnapshot
+    /// Latest system sample used for recovery and system-only signals.
+    public let previousSystem: SystemMemorySnapshot?
+    /// System sample captured alongside `previousGroups`. Keeping this
+    /// separate prevents a cheap background system pass from shortening the
+    /// process-trend interval.
+    public let previousProcessSystem: SystemMemorySnapshot?
+    public let previousGroups: [WorkloadGroupSnapshot]
+    public let previousProcessStatus: SampleStatus?
+    /// Debounced pressure levels supplied by the monitor coordinator. When
+    /// absent, the engine falls back to the raw level derived from the current
+    /// and previous system snapshots for standalone callers and older clients.
+    public let pressureLevel: MemoryPressureLevel?
+    public let previousPressureLevel: MemoryPressureLevel?
+
+    public init(
+        current: MonitorSnapshot,
+        previousSystem: SystemMemorySnapshot? = nil,
+        previousProcessSystem: SystemMemorySnapshot? = nil,
+        previousGroups: [WorkloadGroupSnapshot] = [],
+        previousProcessStatus: SampleStatus? = nil,
+        pressureLevel: MemoryPressureLevel? = nil,
+        previousPressureLevel: MemoryPressureLevel? = nil
+    ) {
+        self.current = current
+        self.previousSystem = previousSystem
+        self.previousProcessSystem = previousProcessSystem
+        self.previousGroups = previousGroups
+        self.previousProcessStatus = previousProcessStatus
+        self.pressureLevel = pressureLevel
+        self.previousPressureLevel = previousPressureLevel
+    }
+}
+
+/// Produces conservative, explainable, read-only suggestions. The engine is
+/// deliberately pure and has no process-control or notification side effects.
+public struct RecommendationEngine: Sendable {
+    public let minimumGrowthBytes: UInt64
+    public let swapGrowthThresholdBytes: UInt64
+    public let residualSwapThresholdBytes: UInt64
+    public let criticalGroupFraction: Double
+
+    public init(
+        minimumGrowthBytes: UInt64 = 16 * 1024 * 1024,
+        swapGrowthThresholdBytes: UInt64 = 64 * 1024 * 1024,
+        residualSwapThresholdBytes: UInt64 = 1 * 1024 * 1024 * 1024,
+        criticalGroupFraction: Double = 0.10
+    ) {
+        self.minimumGrowthBytes = minimumGrowthBytes
+        self.swapGrowthThresholdBytes = swapGrowthThresholdBytes
+        self.residualSwapThresholdBytes = residualSwapThresholdBytes
+        self.criticalGroupFraction = min(max(criticalGroupFraction.isFinite ? criticalGroupFraction : 0.10, 0), 1)
+    }
+
+    public func evaluate(_ context: RecommendationContext) -> [MemoryRecommendation] {
+        guard let system = context.current.system,
+              context.current.systemStatus.quality.isUsable else {
+            return []
+        }
+
+        let observedLevel = MemoryPressureEvaluator.observedLevel(for: system)
+        let currentPressureLevel = context.pressureLevel ?? observedLevel
+        let baseConfidence = confidence(
+            systemStatus: context.current.systemStatus,
+            processStatus: context.current.processStatus,
+            hasBaseline: context.previousProcessSystem != nil || context.previousSystem != nil
+        )
+        var recommendations = [MemoryRecommendation]()
+
+        if currentPressureLevel == .critical,
+           context.current.didSampleProcesses,
+           let group = largestActionableGroup(in: context.current.groups),
+           Double(group.physicalFootprintBytes) / Double(system.totalBytes) >= criticalGroupFraction {
+            let fraction = Double(group.physicalFootprintBytes) / Double(system.totalBytes)
+            recommendations.append(
+                MemoryRecommendation(
+                    id: "critical-group-\(group.id)",
+                    severity: .critical,
+                    title: "优先检查 \(group.title)",
+                    detail: "当前内存压力严重，该用户工作组的归因总量较大；先确认它是否仍在执行当前任务。",
+                    evidence: [
+                        RecommendationEvidence(label: "压力", value: "严重"),
+                        RecommendationEvidence(label: "归因总量", value: MemoryFormatter.bytes(group.attributedFootprintBytes)),
+                        RecommendationEvidence(label: "占总内存", value: String(format: "%.0f%%", fraction * 100))
+                    ],
+                    confidence: baseConfidence,
+                    targetGroupID: group.id,
+                    generatedAt: context.current.timestamp
+                )
+            )
+        }
+
+        if context.current.didSampleProcesses,
+           context.current.processStatus.quality.isUsable,
+           context.previousProcessStatus?.quality.isUsable ?? true,
+           let previousSystem = context.previousProcessSystem ?? context.previousSystem {
+            let interval = max(
+                context.current.timestamp.timeIntervalSince(previousSystem.timestamp),
+                0.001
+            )
+            let growth = WorkloadTrendAnalyzer().growingGroups(
+                previous: context.previousGroups,
+                current: context.current.groups,
+                intervalSeconds: interval
+            )
+            if let growing = growth.first(where: { !$0.title.isEmpty && !isSystemGroup(id: $0.id) }),
+               growing.deltaBytes >= minimumGrowthBytes {
+                let swapDelta = positiveDelta(
+                    current: system.swapUsedBytes,
+                    previous: previousSystem.swapUsedBytes
+                )
+                let pressureElevated = currentPressureLevel != .normal
+                let severity: RecommendationSeverity =
+                    swapDelta >= swapGrowthThresholdBytes || pressureElevated ? .attention : .info
+                var evidence = [
+                    RecommendationEvidence(label: "增长", value: MemoryFormatter.bytes(growing.deltaBytes)),
+                    RecommendationEvidence(label: "速度", value: rateDescription(growing.rateBytesPerSecond)),
+                    RecommendationEvidence(label: "当前归因总量", value: MemoryFormatter.bytes(growing.currentFootprintBytes))
+                ]
+                if swapDelta > 0 {
+                    evidence.append(
+                        RecommendationEvidence(label: "Swap 增量", value: MemoryFormatter.bytes(swapDelta))
+                    )
+                }
+                recommendations.append(
+                    MemoryRecommendation(
+                        id: "growth-\(growing.id)",
+                        severity: severity,
+                        title: "\(growing.title) 正在增长",
+                        detail: swapDelta >= swapGrowthThresholdBytes
+                            ? "该工作组在最近采样间隔持续增加，并伴随 Swap 上升；建议检查任务是否仍有必要运行。"
+                            : "该工作组在最近采样间隔持续增加；建议继续观察下一轮趋势。",
+                        evidence: evidence,
+                        confidence: min(baseConfidence, context.current.processStatus.quality == .estimated ? 0.70 : 0.90),
+                        targetGroupID: growing.id,
+                        generatedAt: context.current.timestamp
+                    )
+                )
+            }
+
+        }
+
+        // Recovery is a system-only signal, so it must remain available when
+        // the current pass intentionally skips the expensive process scan.
+        if let previousSystem = context.previousSystem {
+            let previousPressureLevel = context.previousPressureLevel
+                ?? MemoryPressureEvaluator.observedLevel(for: previousSystem)
+            if previousPressureLevel != .normal,
+               currentPressureLevel == .normal,
+               system.availableFraction > previousSystem.availableFraction,
+               system.swapUsedBytes >= residualSwapThresholdBytes {
+                recommendations.append(
+                    MemoryRecommendation(
+                        id: "recovery-swap",
+                        severity: .info,
+                        title: "压力已下降，Swap 仍在回收",
+                        detail: "可回收内存已经改善，但 Swap 仍有存量；先观察系统回收，不要把残留 Swap 当作新的泄漏。",
+                        evidence: [
+                            RecommendationEvidence(label: "可回收内存", value: String(format: "%.0f%%", system.availableFraction * 100)),
+                            RecommendationEvidence(label: "Swap 已用", value: MemoryFormatter.bytes(system.swapUsedBytes))
+                        ],
+                        confidence: baseConfidence,
+                        generatedAt: context.current.timestamp
+                    )
+                )
+            }
+        }
+
+        if recommendations.isEmpty,
+           context.current.didSampleProcesses,
+           context.current.processStatus.quality == .estimated {
+            recommendations.append(
+                MemoryRecommendation(
+                    id: "data-quality-processes",
+                    severity: .info,
+                    title: "进程数据部分可用",
+                    detail: "本轮有进程退出或受权限限制，建议把当前排行作为方向参考，不据此执行清理。",
+                    evidence: [
+                        RecommendationEvidence(label: "成功读取", value: String(context.current.sampledProcessCount)),
+                        RecommendationEvidence(label: "已枚举", value: String(context.current.listedProcessCount))
+                    ],
+                    confidence: 0.60,
+                    generatedAt: context.current.timestamp
+                )
+            )
+        }
+
+        return recommendations.sorted {
+            if $0.severity.priority != $1.severity.priority {
+                return $0.severity.priority > $1.severity.priority
+            }
+            if $0.confidence != $1.confidence {
+                return $0.confidence > $1.confidence
+            }
+            return $0.id < $1.id
+        }
+    }
+
+    private func largestActionableGroup(in groups: [WorkloadGroupSnapshot]) -> WorkloadGroupSnapshot? {
+        groups
+            .filter { !$0.isSystem && !$0.id.hasPrefix("other-") }
+            .max {
+                if $0.attributedFootprintBytes != $1.attributedFootprintBytes {
+                    return $0.attributedFootprintBytes < $1.attributedFootprintBytes
+                }
+                return $0.id > $1.id
+            }
+    }
+
+    private func confidence(
+        systemStatus: SampleStatus,
+        processStatus: SampleStatus,
+        hasBaseline: Bool
+    ) -> Double {
+        var value = 0.90
+        if systemStatus.quality == .estimated { value -= 0.10 }
+        if processStatus.quality == .estimated { value -= 0.20 }
+        if !hasBaseline { value -= 0.15 }
+        return min(max(value, 0.20), 0.95)
+    }
+
+    private func positiveDelta(current: UInt64, previous: UInt64) -> UInt64 {
+        current >= previous ? current - previous : 0
+    }
+
+    private func rateDescription(_ bytesPerSecond: Double) -> String {
+        guard bytesPerSecond.isFinite, bytesPerSecond > 0 else { return "--" }
+        let perMinute = bytesPerSecond * 60
+        guard perMinute.isFinite, perMinute < Double(UInt64.max) else {
+            return "快速增长"
+        }
+        return "\(MemoryFormatter.bytes(UInt64(perMinute)))/分钟"
+    }
+
+    private func isSystemGroup(id: String) -> Bool {
+        id == "system" || id == "other-system"
+    }
+}
+
+/// Controls how much work a sampling pass is allowed to perform. System
+/// counters are cheap enough for every pass; a complete process enumeration is
+/// deliberately reserved for moments where the user needs fresh detail.
+public enum SamplingMode: String, Codable, Sendable, Equatable {
+    case background
+    case backgroundProcess
+    case panel
+    case pressure
+    case full
+
+    public var samplesProcesses: Bool {
+        self != .background
+    }
+
+    public var displayName: String {
+        switch self {
+        case .background:
+            return "后台系统"
+        case .backgroundProcess:
+            return "后台进程刷新"
+        case .panel:
+            return "面板"
+        case .pressure:
+            return "压力观察"
+        case .full:
+            return "完整采样"
+        }
+    }
+}
+
+/// Runtime diagnostics for one sampling pass. Durations are intentionally
+/// transient: they help tune the monitor without adding operational metadata
+/// to the privacy-preserving history file.
+public struct SamplingDiagnostics: Codable, Sendable, Equatable {
+    public let mode: SamplingMode
+    public let totalDurationMilliseconds: Double
+    public let processDurationMilliseconds: Double?
+    public let processSamplingPerformed: Bool
+    public let processCount: Int
+    public let listedProcessCount: Int
+
+    public init(
+        mode: SamplingMode,
+        totalDurationMilliseconds: Double,
+        processDurationMilliseconds: Double?,
+        processSamplingPerformed: Bool,
+        processCount: Int,
+        listedProcessCount: Int
+    ) {
+        self.mode = mode
+        self.totalDurationMilliseconds = Self.normalizedDuration(totalDurationMilliseconds)
+        self.processDurationMilliseconds = processDurationMilliseconds.map(Self.normalizedDuration)
+        self.processSamplingPerformed = processSamplingPerformed
+        let normalizedProcessCount = max(processCount, 0)
+        let normalizedListedProcessCount = max(listedProcessCount, 0)
+        self.processCount = normalizedProcessCount
+        self.listedProcessCount = max(normalizedListedProcessCount, normalizedProcessCount)
+    }
+
+    private static func normalizedDuration(_ value: Double) -> Double {
+        guard value.isFinite else { return 0 }
+        return max(value, 0)
+    }
+}
+
 /// Chooses a sampling cadence from the amount of detail the user currently needs.
 /// The values are deliberately conservative for a menu-bar process monitor: the
 /// full process scan is the expensive part, so normal background observation is
@@ -1344,15 +1779,21 @@ public struct AdaptiveSamplingPolicy: Sendable, Equatable {
     public let backgroundIntervalSeconds: TimeInterval
     public let panelIntervalSeconds: TimeInterval
     public let pressureIntervalSeconds: TimeInterval
+    public let backgroundProcessIntervalSeconds: TimeInterval
+    public let pressureProcessIntervalSeconds: TimeInterval
 
     public init(
         backgroundIntervalSeconds: TimeInterval = 20,
         panelIntervalSeconds: TimeInterval = 3,
-        pressureIntervalSeconds: TimeInterval = 5
+        pressureIntervalSeconds: TimeInterval = 5,
+        backgroundProcessIntervalSeconds: TimeInterval = 60,
+        pressureProcessIntervalSeconds: TimeInterval = 10
     ) {
         self.backgroundIntervalSeconds = Self.validatedInterval(backgroundIntervalSeconds)
         self.panelIntervalSeconds = Self.validatedInterval(panelIntervalSeconds)
         self.pressureIntervalSeconds = Self.validatedInterval(pressureIntervalSeconds)
+        self.backgroundProcessIntervalSeconds = Self.validatedInterval(backgroundProcessIntervalSeconds)
+        self.pressureProcessIntervalSeconds = Self.validatedInterval(pressureProcessIntervalSeconds)
     }
 
     public func intervalSeconds(panelPresented: Bool, pressureActive: Bool) -> TimeInterval {
@@ -1363,6 +1804,63 @@ public struct AdaptiveSamplingPolicy: Sendable, Equatable {
             return pressureIntervalSeconds
         }
         return backgroundIntervalSeconds
+    }
+
+    /// Selects the work performed by the next pass. A panel always requests
+    /// fresh process data. In normal background operation, the process scan is
+    /// independently throttled while system metrics continue at their normal
+    /// cadence.
+    public func samplingMode(
+        panelPresented: Bool,
+        pressureActive: Bool,
+        now: Date = Date(),
+        lastProcessSampleAt: Date?
+    ) -> SamplingMode {
+        if panelPresented {
+            return .panel
+        }
+        if pressureActive {
+            return processRefreshIsDue(
+                now: now,
+                lastProcessSampleAt: lastProcessSampleAt,
+                interval: pressureProcessIntervalSeconds
+            ) ? .pressure : .background
+        }
+        return processRefreshIsDue(
+            now: now,
+            lastProcessSampleAt: lastProcessSampleAt,
+            interval: backgroundProcessIntervalSeconds
+        ) ? .backgroundProcess : .background
+    }
+
+    public func cadenceDescription(panelPresented: Bool, pressureActive: Bool) -> String {
+        if panelPresented {
+            return "系统/进程约 \(formattedSeconds(panelIntervalSeconds)) 秒"
+        }
+        if pressureActive {
+            return "系统约 \(formattedSeconds(pressureIntervalSeconds)) 秒 · 进程约 \(formattedSeconds(pressureProcessIntervalSeconds)) 秒"
+        }
+        return "系统约 \(formattedSeconds(backgroundIntervalSeconds)) 秒 · 进程约 \(formattedSeconds(backgroundProcessIntervalSeconds)) 秒"
+    }
+
+    private func formattedSeconds(_ value: TimeInterval) -> String {
+        guard value.rounded() == value, value <= Double(Int.max) else {
+            return String(format: "%.1f", value)
+        }
+        return String(Int(value))
+    }
+
+    private func processRefreshIsDue(
+        now: Date,
+        lastProcessSampleAt: Date?,
+        interval: TimeInterval
+    ) -> Bool {
+        guard let lastProcessSampleAt else { return true }
+        let age = now.timeIntervalSince(lastProcessSampleAt)
+        // Treat a clock rollback or an invalid date as due instead of
+        // suppressing process refreshes indefinitely.
+        guard age.isFinite, age >= 0 else { return true }
+        return age >= interval
     }
 
     private static func validatedInterval(_ value: TimeInterval) -> TimeInterval {

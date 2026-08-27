@@ -554,6 +554,300 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertEqual(growth.map(\.id), ["large", "fast"])
     }
 
+    func testAdaptiveSamplingPolicyThrottlesBackgroundProcessScans() {
+        let policy = AdaptiveSamplingPolicy(
+            backgroundIntervalSeconds: 20,
+            panelIntervalSeconds: 3,
+            pressureIntervalSeconds: 5,
+            backgroundProcessIntervalSeconds: 60,
+            pressureProcessIntervalSeconds: 10
+        )
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+
+        XCTAssertEqual(
+            policy.samplingMode(
+                panelPresented: false,
+                pressureActive: false,
+                now: start,
+                lastProcessSampleAt: nil
+            ),
+            .backgroundProcess
+        )
+        XCTAssertEqual(
+            policy.samplingMode(
+                panelPresented: false,
+                pressureActive: false,
+                now: start.addingTimeInterval(20),
+                lastProcessSampleAt: start
+            ),
+            .background
+        )
+        XCTAssertEqual(
+            policy.samplingMode(
+                panelPresented: false,
+                pressureActive: false,
+                now: start.addingTimeInterval(60),
+                lastProcessSampleAt: start
+            ),
+            .backgroundProcess
+        )
+        XCTAssertEqual(
+            policy.samplingMode(
+                panelPresented: true,
+                pressureActive: false,
+                now: start.addingTimeInterval(1),
+                lastProcessSampleAt: start
+            ),
+            .panel
+        )
+        XCTAssertEqual(
+            policy.samplingMode(
+                panelPresented: false,
+                pressureActive: true,
+                now: start.addingTimeInterval(1),
+                lastProcessSampleAt: start
+            ),
+            .background
+        )
+        XCTAssertEqual(
+            policy.samplingMode(
+                panelPresented: false,
+                pressureActive: true,
+                now: start.addingTimeInterval(10),
+                lastProcessSampleAt: start
+            ),
+            .pressure
+        )
+        XCTAssertEqual(
+            policy.cadenceDescription(panelPresented: false, pressureActive: true),
+            "系统约 5 秒 · 进程约 10 秒"
+        )
+        XCTAssertEqual(
+            policy.samplingMode(
+                panelPresented: false,
+                pressureActive: false,
+                now: start.addingTimeInterval(-1),
+                lastProcessSampleAt: start
+            ),
+            .backgroundProcess
+        )
+    }
+
+    func testMonitorSamplerSkipsProcessEnumerationInBackgroundMode() {
+        let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let system = makeSystemSnapshot(timestamp: timestamp, compressed: 0, swap: 0)
+        let sampledProcess = makeProcess(pid: 900, name: "worker", footprint: 100)
+        let sampler = MonitorSampler(
+            systemSampler: { system },
+            cpuSampler: { CPUTimeSnapshot(userTicks: 10, systemTicks: 5, idleTicks: 85, niceTicks: 0) },
+            gpuSampler: { GPUUsageSample(fraction: nil, status: .unavailable()) },
+            processSampler: {
+                ProcessSamplingResult(
+                    processes: [sampledProcess],
+                    listedProcessCount: 1,
+                    sampledProcessCount: 1,
+                    skippedProcessCount: 0,
+                    status: .available(at: timestamp)
+                )
+            }
+        )
+
+        let snapshot = sampler.sample(mode: .background, at: timestamp)
+
+        XCTAssertFalse(snapshot.didSampleProcesses)
+        XCTAssertEqual(snapshot.samplingMode, .background)
+        XCTAssertEqual(snapshot.processStatus.quality, .unavailable)
+        XCTAssertTrue(snapshot.processes.isEmpty)
+        XCTAssertNil(snapshot.diagnostics.processDurationMilliseconds)
+    }
+
+    func testRecommendationEngineReportsGrowthWithSwapEvidence() {
+        let timestamp = Date(timeIntervalSince1970: 1_700_000_060)
+        let previousTimestamp = timestamp.addingTimeInterval(-60)
+        let previousSystem = makePressureSnapshot(
+            timestamp: previousTimestamp,
+            availableFraction: 0.25,
+            swapTotalBytes: 8 * 1024 * 1024 * 1024,
+            swapFreeBytes: 5 * 1024 * 1024 * 1024
+        )
+        let currentSystem = makePressureSnapshot(
+            timestamp: timestamp,
+            availableFraction: 0.15,
+            swapTotalBytes: 8 * 1024 * 1024 * 1024,
+            swapFreeBytes: 4 * 1024 * 1024 * 1024
+        )
+        let previousGroup = makeGroup(id: "runtime-node-api", title: "Node · api", footprint: 500 * 1024 * 1024)
+        let currentGroup = makeGroup(id: "runtime-node-api", title: "Node · api", footprint: 900 * 1024 * 1024)
+        let current = makeMonitorSnapshot(
+            timestamp: timestamp,
+            system: currentSystem,
+            groups: [currentGroup]
+        )
+
+        let recommendations = RecommendationEngine().evaluate(
+            RecommendationContext(
+                current: current,
+                previousSystem: previousSystem,
+                previousGroups: [previousGroup],
+                previousProcessStatus: .available(at: previousTimestamp)
+            )
+        )
+
+        let growth = try! XCTUnwrap(recommendations.first { $0.id == "growth-runtime-node-api" })
+        XCTAssertEqual(growth.severity, .attention)
+        XCTAssertTrue(growth.evidence.contains { $0.label == "Swap 增量" })
+        XCTAssertEqual(growth.targetGroupID, "runtime-node-api")
+        XCTAssertEqual(growth.title, "Node · api 正在增长")
+        XCTAssertTrue(growth.evidence.contains { $0.label == "速度" && $0.value.contains("/分钟") })
+    }
+
+    func testRecommendationEngineUsesProcessSampleBaselineForGrowthInterval() {
+        let firstProcessTimestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let latestTimestamp = firstProcessTimestamp.addingTimeInterval(60)
+        let previousProcessSystem = makeSystemSnapshot(
+            timestamp: firstProcessTimestamp,
+            compressed: 0,
+            swap: 0
+        )
+        let interveningSystem = makeSystemSnapshot(
+            timestamp: latestTimestamp.addingTimeInterval(-1),
+            compressed: 0,
+            swap: 0
+        )
+        let currentSystem = makeSystemSnapshot(
+            timestamp: latestTimestamp,
+            compressed: 0,
+            swap: 0
+        )
+        let currentGroup = makeGroup(
+            id: "runtime-node-api",
+            title: "Node · api",
+            footprint: 900 * 1024 * 1024
+        )
+        let previousGroup = makeGroup(
+            id: "runtime-node-api",
+            title: "Node · api",
+            footprint: 500 * 1024 * 1024
+        )
+        let current = makeMonitorSnapshot(
+            timestamp: latestTimestamp,
+            system: currentSystem,
+            groups: [currentGroup]
+        )
+
+        let recommendation = try! XCTUnwrap(
+            RecommendationEngine().evaluate(
+                RecommendationContext(
+                    current: current,
+                    previousSystem: interveningSystem,
+                    previousProcessSystem: previousProcessSystem,
+                    previousGroups: [previousGroup],
+                    previousProcessStatus: .available(at: firstProcessTimestamp)
+                )
+            ).first { $0.id == "growth-runtime-node-api" }
+        )
+
+        XCTAssertTrue(recommendation.evidence.contains { $0.value == "400.0 MiB/分钟" })
+    }
+
+    func testRecommendationEnginePrioritizesLargeUserGroupDuringCriticalPressure() {
+        let timestamp = Date(timeIntervalSince1970: 1_700_000_060)
+        let system = makePressureSnapshot(
+            timestamp: timestamp,
+            availableFraction: 0.05,
+            swapTotalBytes: 8 * 1024 * 1024 * 1024,
+            swapFreeBytes: 512 * 1024 * 1024
+        )
+        let group = makeGroup(
+            id: "chrome",
+            title: "Chrome",
+            footprint: 3 * 1024 * 1024 * 1024
+        )
+        let current = makeMonitorSnapshot(timestamp: timestamp, system: system, groups: [group])
+
+        let recommendation = try! XCTUnwrap(
+            RecommendationEngine().evaluate(RecommendationContext(current: current)).first
+        )
+
+        XCTAssertEqual(recommendation.id, "critical-group-chrome")
+        XCTAssertEqual(recommendation.severity, .critical)
+        XCTAssertEqual(recommendation.targetGroupID, "chrome")
+        XCTAssertEqual(recommendation.title, "优先检查 Chrome")
+    }
+
+    func testRecommendationEngineUsesDebouncedPressureLevelWhenProvided() {
+        let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let system = makePressureSnapshot(
+            timestamp: timestamp,
+            availableFraction: 0.05,
+            swapTotalBytes: 8 * 1024 * 1024 * 1024,
+            swapFreeBytes: 512 * 1024 * 1024
+        )
+        let group = makeGroup(id: "chrome", title: "Chrome", footprint: 3 * 1024 * 1024 * 1024)
+        let current = makeMonitorSnapshot(timestamp: timestamp, system: system, groups: [group])
+
+        let recommendations = RecommendationEngine().evaluate(
+            RecommendationContext(current: current, pressureLevel: .normal)
+        )
+
+        XCTAssertFalse(recommendations.contains { $0.id == "critical-group-chrome" })
+    }
+
+    func testRecommendationEngineExplainsRecoveryWhileSwapRemains() {
+        let previousTimestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let timestamp = previousTimestamp.addingTimeInterval(60)
+        let previousSystem = makePressureSnapshot(
+            timestamp: previousTimestamp,
+            availableFraction: 0.15,
+            swapTotalBytes: 8 * 1024 * 1024 * 1024,
+            swapFreeBytes: 3 * 1024 * 1024 * 1024
+        )
+        let currentSystem = makePressureSnapshot(
+            timestamp: timestamp,
+            availableFraction: 0.30,
+            swapTotalBytes: 8 * 1024 * 1024 * 1024,
+            swapFreeBytes: 4 * 1024 * 1024 * 1024
+        )
+        let current = makeMonitorSnapshot(
+            timestamp: timestamp,
+            system: currentSystem,
+            groups: [],
+            didSampleProcesses: false
+        )
+
+        let recommendation = try! XCTUnwrap(
+            RecommendationEngine().evaluate(
+                RecommendationContext(
+                    current: current,
+                    previousSystem: previousSystem,
+                    pressureLevel: .normal,
+                    previousPressureLevel: .attention
+                )
+            ).first
+        )
+
+        XCTAssertEqual(recommendation.id, "recovery-swap")
+        XCTAssertEqual(recommendation.severity, .info)
+    }
+
+    func testRecommendationEngineReportsPartialProcessDataOnlyWhenNoStrongerSignalExists() {
+        let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let system = makeSystemSnapshot(timestamp: timestamp, compressed: 0, swap: 0)
+        let current = makeMonitorSnapshot(
+            timestamp: timestamp,
+            system: system,
+            groups: [],
+            processStatus: .estimated(at: timestamp, message: "部分进程不可读")
+        )
+
+        let recommendation = try! XCTUnwrap(
+            RecommendationEngine().evaluate(RecommendationContext(current: current)).first
+        )
+
+        XCTAssertEqual(recommendation.id, "data-quality-processes")
+        XCTAssertEqual(recommendation.severity, .info)
+    }
+
     func testAdaptiveSamplingPolicyUsesPanelCadenceFirst() {
         let policy = AdaptiveSamplingPolicy(
             backgroundIntervalSeconds: 20,
@@ -833,6 +1127,47 @@ final class MemoryMonitorCoreTests: XCTestCase {
             residentBytes: footprint,
             isSystem: false,
             representativeProcess: title
+        )
+    }
+
+    private func makeMonitorSnapshot(
+        timestamp: Date,
+        system: SystemMemorySnapshot?,
+        groups: [WorkloadGroupSnapshot],
+        processes: [ProcessSnapshot] = [],
+        processStatus: SampleStatus? = nil,
+        didSampleProcesses: Bool = true
+    ) -> MonitorSnapshot {
+        let systemStatus = system.map {
+            SampleStatus.estimated(at: $0.timestamp, message: "内存使用率按可回收内存估算")
+        } ?? .unavailable(message: "系统数据不可用")
+        let resolvedProcessStatus = processStatus
+            ?? (didSampleProcesses
+                ? .available(at: timestamp)
+                : .unavailable(message: "本轮未执行进程扫描"))
+        let diagnostics = SamplingDiagnostics(
+            mode: didSampleProcesses ? .panel : .background,
+            totalDurationMilliseconds: 1,
+            processDurationMilliseconds: didSampleProcesses ? 1 : nil,
+            processSamplingPerformed: didSampleProcesses,
+            processCount: processes.count,
+            listedProcessCount: processes.count
+        )
+        return MonitorSnapshot(
+            timestamp: timestamp,
+            system: system,
+            systemStatus: systemStatus,
+            cpuTime: nil,
+            cpuStatus: .unavailable(message: "测试未提供 CPU 数据"),
+            gpuUsageFraction: nil,
+            gpuStatus: .unavailable(message: "测试未提供 GPU 数据"),
+            processes: processes,
+            processStatus: resolvedProcessStatus,
+            listedProcessCount: processes.count,
+            sampledProcessCount: processes.count,
+            groups: groups,
+            samplingMode: diagnostics.mode,
+            diagnostics: diagnostics
         )
     }
 
