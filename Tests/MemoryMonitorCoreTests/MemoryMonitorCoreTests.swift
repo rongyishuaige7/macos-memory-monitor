@@ -963,6 +963,133 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertEqual(history.entries.map(\.compressedBytes), [11, 12])
     }
 
+    func testMemoryHistoryAnalyzerSummarizesWindowAndPeaks() {
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let records = [
+            makeHistoryRecord(timestamp: base, availableFraction: 0.60, swapUsedBytes: 100),
+            makeHistoryRecord(timestamp: base.addingTimeInterval(60), availableFraction: 0.25, swapUsedBytes: 200),
+            makeHistoryRecord(timestamp: base.addingTimeInterval(120), availableFraction: 0.40, swapUsedBytes: 300)
+        ]
+
+        let analysis = MemoryHistoryAnalyzer().analyze(records)
+
+        XCTAssertEqual(analysis.sampleCount, 3)
+        XCTAssertEqual(analysis.firstTimestamp, base)
+        XCTAssertEqual(analysis.lastTimestamp, base.addingTimeInterval(120))
+        XCTAssertEqual(try! XCTUnwrap(analysis.latestUsedFraction), 0.60, accuracy: 0.0001)
+        XCTAssertEqual(try! XCTUnwrap(analysis.peakUsedFraction), 0.75, accuracy: 0.0001)
+        XCTAssertEqual(analysis.latestSwapUsedBytes, 300)
+        XCTAssertEqual(analysis.peakSwapUsedBytes, 300)
+        XCTAssertEqual(analysis.windowDuration, 120, accuracy: 0.001)
+        XCTAssertTrue(analysis.events.isEmpty)
+    }
+
+    func testMemoryHistoryAnalyzerEmitsPressureAndSwapThresholdEvents() {
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let records = [
+            makeHistoryRecord(timestamp: base, availableFraction: 0.30, swapUsedBytes: 0),
+            makeHistoryRecord(
+                timestamp: base.addingTimeInterval(60),
+                availableFraction: 0.15,
+                swapUsedBytes: 2 * 1024 * 1024 * 1024
+            ),
+            makeHistoryRecord(
+                timestamp: base.addingTimeInterval(120),
+                availableFraction: 0.08,
+                swapUsedBytes: 5 * 1024 * 1024 * 1024
+            ),
+            makeHistoryRecord(
+                timestamp: base.addingTimeInterval(180),
+                availableFraction: 0.25,
+                swapUsedBytes: 3 * 1024 * 1024 * 1024
+            ),
+            makeHistoryRecord(
+                timestamp: base.addingTimeInterval(240),
+                availableFraction: 0.30,
+                swapUsedBytes: 512 * 1024 * 1024
+            )
+        ]
+
+        let analysis = MemoryHistoryAnalyzer().analyze(records)
+
+        XCTAssertEqual(analysis.pressureTransitionCount, 3)
+        XCTAssertEqual(
+            analysis.events.filter { $0.kind == .pressureTransition }.count,
+            3
+        )
+        XCTAssertTrue(analysis.events.contains { $0.title == "内存压力进入注意" })
+        XCTAssertTrue(analysis.events.contains { $0.title == "内存压力进入严重" })
+        XCTAssertTrue(analysis.events.contains { $0.title == "内存压力恢复正常" })
+        XCTAssertTrue(analysis.events.contains { $0.title == "Swap 超过 1.0 GiB" })
+        XCTAssertTrue(analysis.events.contains { $0.title == "Swap 超过 4.0 GiB" })
+        XCTAssertTrue(analysis.events.contains { $0.title == "Swap 回落至 1.0 GiB 以下" })
+    }
+
+    func testMemoryHistoryAnalyzerDescribesWorkloadRankingChanges() {
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let api = makePersistedWorkload(id: "runtime-node-api", title: "Node · api", footprint: 200 * 1024 * 1024)
+        let worker = makePersistedWorkload(id: "runtime-python-worker", title: "Python · worker", footprint: 128 * 1024 * 1024)
+        let largerAPI = makePersistedWorkload(id: api.id, title: api.title, footprint: 800 * 1024 * 1024)
+
+        let records = [
+            makeHistoryRecord(timestamp: base, availableFraction: 0.40, swapUsedBytes: 0, workloads: [api]),
+            makeHistoryRecord(
+                timestamp: base.addingTimeInterval(60),
+                availableFraction: 0.40,
+                swapUsedBytes: 0,
+                workloads: [largerAPI, worker]
+            ),
+            makeHistoryRecord(
+                timestamp: base.addingTimeInterval(120),
+                availableFraction: 0.40,
+                swapUsedBytes: 0,
+                workloads: [worker]
+            )
+        ]
+
+        let analysis = MemoryHistoryAnalyzer().analyze(records)
+
+        XCTAssertTrue(analysis.events.contains {
+            $0.kind == .workloadAppeared && $0.targetID == worker.id
+        })
+        XCTAssertTrue(analysis.events.contains {
+            $0.kind == .workloadGrowth && $0.targetID == api.id
+        })
+        XCTAssertTrue(analysis.events.contains {
+            $0.kind == .workloadDisappeared && $0.targetID == api.id
+        })
+        XCTAssertFalse(analysis.events.contains { $0.targetID == "other-processes" })
+    }
+
+    func testMemoryHistoryAnalyzerHandlesDuplicateWorkloadIDs() {
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let first = makePersistedWorkload(
+            id: "runtime-node-api",
+            title: "Node · api",
+            footprint: 100 * 1024 * 1024
+        )
+        let replacement = makePersistedWorkload(
+            id: "runtime-node-api",
+            title: "Node · api",
+            footprint: 300 * 1024 * 1024
+        )
+        let records = [
+            makeHistoryRecord(timestamp: base, availableFraction: 0.40, swapUsedBytes: 0, workloads: [first]),
+            makeHistoryRecord(
+                timestamp: base.addingTimeInterval(60),
+                availableFraction: 0.40,
+                swapUsedBytes: 0,
+                workloads: [first, replacement]
+            )
+        ]
+
+        let analysis = MemoryHistoryAnalyzer().analyze(records)
+
+        XCTAssertEqual(analysis.sampleCount, 2)
+        XCTAssertFalse(analysis.events.contains { $0.kind == .workloadAppeared })
+        XCTAssertFalse(analysis.events.contains { $0.kind == .workloadDisappeared })
+    }
+
     func testHistoryStoreStartsEmptyWhenFileIsMissing() async throws {
         let (url, directory) = makeTemporaryHistoryURL()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -1127,6 +1254,37 @@ final class MemoryMonitorCoreTests: XCTestCase {
             residentBytes: footprint,
             isSystem: false,
             representativeProcess: title
+        )
+    }
+
+    private func makeHistoryRecord(
+        timestamp: Date,
+        availableFraction: Double,
+        swapUsedBytes: UInt64,
+        workloads: [PersistedWorkloadRecord] = []
+    ) -> MemoryHistoryRecord {
+        MemoryHistoryRecord(
+            timestamp: timestamp,
+            availableFraction: availableFraction,
+            compressedBytes: 0,
+            swapUsedBytes: swapUsedBytes,
+            workloads: workloads
+        )
+    }
+
+    private func makePersistedWorkload(
+        id: String,
+        title: String,
+        footprint: UInt64,
+        isSystem: Bool = false
+    ) -> PersistedWorkloadRecord {
+        PersistedWorkloadRecord(
+            id: id,
+            title: title,
+            processCount: 1,
+            attributedFootprintBytes: footprint,
+            attributedResidentBytes: footprint,
+            isSystem: isSystem
         )
     }
 

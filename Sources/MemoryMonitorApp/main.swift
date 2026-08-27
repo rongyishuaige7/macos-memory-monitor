@@ -1,4 +1,5 @@
 import AppKit
+import Charts
 import Combine
 import Foundation
 import MemoryMonitorCore
@@ -57,6 +58,7 @@ final class MonitorViewModel: ObservableObject {
     private let sampler = MonitorSampler()
     private let samplingPolicy = AdaptiveSamplingPolicy()
     private let recommendationEngine = RecommendationEngine()
+    private let historyAnalyzer = MemoryHistoryAnalyzer()
     private var pressureEvaluator = MemoryPressureEvaluator()
     private let refreshWakeup = RefreshWakeup()
     private let historyStore = HistoryStore()
@@ -135,6 +137,10 @@ final class MonitorViewModel: ObservableObject {
             return "\(samplingDiagnostics.mode.displayName) · 本轮 \(duration)"
         }
         return "\(samplingDiagnostics.mode.displayName) · 本轮 \(duration) · 进程未刷新"
+    }
+
+    var historyAnalysis: MemoryHistoryAnalysis {
+        historyAnalyzer.analyze(history)
     }
 
     func setPanelPresented(_ presented: Bool) {
@@ -425,21 +431,54 @@ private enum MonitorListMode: String, CaseIterable, Identifiable {
     }
 }
 
+private enum MonitorViewMode: String, CaseIterable, Identifiable {
+    case live
+    case history
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .live: return "实时"
+        case .history: return "24 小时"
+        }
+    }
+}
+
 private struct MonitorPopover: View {
     @ObservedObject var model: MonitorViewModel
     @State private var listMode: MonitorListMode = .processes
+    @State private var viewMode: MonitorViewMode = .live
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             header
-            metrics
-            recommendationCard
-            samplingNotice
-            processList
-            footer
+            Picker("视图", selection: $viewMode) {
+                ForEach(MonitorViewMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+
+            switch viewMode {
+            case .live:
+                liveContent
+            case .history:
+                HistoryPanel(model: model)
+            }
         }
         .padding(16)
         .frame(width: 410)
+    }
+
+    @ViewBuilder
+    private var liveContent: some View {
+        metrics
+        recommendationCard
+        samplingNotice
+        processList
+        footer
     }
 
     private var header: some View {
@@ -678,6 +717,309 @@ private struct MonitorPopover: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
+    }
+}
+
+private struct HistoryPanel: View {
+    @ObservedObject var model: MonitorViewModel
+
+    private var analysis: MemoryHistoryAnalysis {
+        model.historyAnalysis
+    }
+
+    private var chartRecords: [MemoryHistoryRecord] {
+        let records = model.history
+        guard records.count > 240 else { return records }
+
+        let lastIndex = records.count - 1
+        let step = Double(lastIndex) / Double(239)
+        return (0..<240).map { index in
+            records[Int((Double(index) * step).rounded())]
+        }
+    }
+
+    private var maxSwapGiB: Double {
+        let maximum = chartRecords
+            .map { Double($0.swapUsedBytes) / 1_073_741_824 }
+            .max() ?? 0
+        guard maximum.isFinite else { return 1 }
+        return max(maximum * 1.15, 1)
+    }
+
+    var body: some View {
+        Group {
+            if analysis.hasData {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        historyHeader
+                        historySummary
+                        memoryChart
+                        swapChart
+                        eventTimeline
+                        historyFooter
+                    }
+                }
+            } else {
+                emptyState
+            }
+        }
+        .frame(height: 540, alignment: .top)
+    }
+
+    private var historyHeader: some View {
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("24 小时趋势")
+                    .font(.headline)
+                Text("\(analysis.sampleCount) 个分钟样本 · \(windowDescription)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Image(systemName: "internaldrive")
+                .imageScale(.small)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var historySummary: some View {
+        HStack(spacing: 8) {
+            HistoryMetricTile(
+                title: "当前内存",
+                value: percentage(analysis.latestUsedFraction)
+            )
+            HistoryMetricTile(
+                title: "峰值内存",
+                value: percentage(analysis.peakUsedFraction)
+            )
+            HistoryMetricTile(
+                title: "峰值 Swap",
+                value: bytes(analysis.peakSwapUsedBytes)
+            )
+        }
+    }
+
+    private var memoryChart: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("内存使用")
+                    .font(.subheadline.weight(.medium))
+                Spacer()
+                Text("可回收内存估算")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Chart {
+                ForEach(chartRecords) { record in
+                    LineMark(
+                        x: .value("时间", record.timestamp),
+                        y: .value("使用率", record.usedFraction * 100)
+                    )
+                    .foregroundStyle(Color.accentColor)
+                    .lineStyle(StrokeStyle(lineWidth: 1.8))
+                }
+                RuleMark(y: .value("注意阈值", 75))
+                    .foregroundStyle(Color.orange.opacity(0.35))
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                RuleMark(y: .value("严重阈值", 90))
+                    .foregroundStyle(Color.red.opacity(0.35))
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
+            }
+            .chartYScale(domain: 0...100)
+            .chartXAxis {
+                AxisMarks(values: .automatic(desiredCount: 4))
+            }
+            .chartYAxis {
+                AxisMarks(values: [0, 50, 100]) {
+                    AxisGridLine()
+                    AxisValueLabel()
+                }
+            }
+            .frame(height: 126)
+        }
+    }
+
+    private var swapChart: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Swap 已用")
+                    .font(.subheadline.weight(.medium))
+                Spacer()
+                Text("GiB")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Chart {
+                ForEach(chartRecords) { record in
+                    LineMark(
+                        x: .value("时间", record.timestamp),
+                        y: .value("Swap", Double(record.swapUsedBytes) / 1_073_741_824)
+                    )
+                    .foregroundStyle(Color.orange)
+                    .lineStyle(StrokeStyle(lineWidth: 1.8))
+                }
+            }
+            .chartYScale(domain: 0...maxSwapGiB)
+            .chartXAxis {
+                AxisMarks(values: .automatic(desiredCount: 4))
+            }
+            .chartYAxis {
+                AxisMarks(values: .automatic(desiredCount: 3)) {
+                    AxisGridLine()
+                    AxisValueLabel()
+                }
+            }
+            .frame(height: 112)
+        }
+    }
+
+    private var eventTimeline: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Text("关键事件")
+                    .font(.subheadline.weight(.medium))
+                Spacer()
+                Text("\(analysis.pressureTransitionCount) 次压力切换")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            if analysis.events.isEmpty {
+                Text("暂无明显变化")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 6)
+            } else {
+                ForEach(Array(analysis.events.prefix(8))) { event in
+                    HistoryEventRow(event: event)
+                    if event.id != analysis.events.prefix(8).last?.id {
+                        Divider()
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var historyFooter: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("本地保存 · 按分钟合并 · 保留最近 24 小时")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            if let error = model.historyError {
+                Text("历史写盘受限：\(error)")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .lineLimit(2)
+            }
+        }
+    }
+
+    private var emptyState: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Image(systemName: "chart.xyaxis.line")
+                .imageScale(.large)
+                .foregroundStyle(.secondary)
+            Text("历史数据准备中")
+                .font(.subheadline.weight(.medium))
+            Text(model.historyError ?? "完成首个分钟记录后，这里会显示趋势和事件。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .padding(.top, 20)
+    }
+
+    private var windowDescription: String {
+        let seconds = analysis.windowDuration
+        guard seconds >= 60 else { return "不足 1 分钟" }
+        let hours = Int(seconds) / 3600
+        let minutes = (Int(seconds) % 3600) / 60
+        if hours > 0 {
+            return minutes > 0 ? "\(hours) 小时 \(minutes) 分钟" : "\(hours) 小时"
+        }
+        return "\(minutes) 分钟"
+    }
+
+    private func percentage(_ fraction: Double?) -> String {
+        guard let fraction, fraction.isFinite else { return "--" }
+        return String(format: "%.0f%%", min(max(fraction, 0), 1) * 100)
+    }
+
+    private func bytes(_ value: UInt64?) -> String {
+        guard let value else { return "--" }
+        return MemoryFormatter.bytes(value)
+    }
+}
+
+private struct HistoryMetricTile: View {
+    let title: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+        }
+        .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
+        .padding(8)
+        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 7))
+    }
+}
+
+private struct HistoryEventRow: View {
+    let event: MemoryHistoryEvent
+
+    private var icon: String {
+        switch event.kind {
+        case .pressureTransition:
+            return "gauge.with.dots.needle.67percent"
+        case .swapThreshold:
+            return "externaldrive.badge.timemachine"
+        case .workloadAppeared:
+            return "arrow.down.right.and.arrow.up.left"
+        case .workloadDisappeared:
+            return "arrow.up.left.and.arrow.down.right"
+        case .workloadGrowth:
+            return "chart.line.uptrend.xyaxis"
+        }
+    }
+
+    private var color: Color {
+        switch event.severity {
+        case .info: return .secondary
+        case .attention: return .orange
+        case .critical: return .red
+        }
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: icon)
+                .foregroundStyle(color)
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(event.title)
+                    .font(.caption.weight(.medium))
+                    .lineLimit(1)
+                Text(event.detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 4)
+            Text(event.timestamp, style: .time)
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 

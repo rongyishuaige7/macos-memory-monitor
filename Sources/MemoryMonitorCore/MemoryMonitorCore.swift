@@ -1874,6 +1874,14 @@ public enum MemoryPressureLevel: String, Codable, Sendable, Equatable {
     case normal
     case attention
     case critical
+
+    public var displayName: String {
+        switch self {
+        case .normal: return "正常"
+        case .attention: return "注意"
+        case .critical: return "严重"
+        }
+    }
 }
 
 /// Converts raw system metrics into a stable pressure level. A candidate level
@@ -2061,6 +2069,13 @@ public struct MemoryHistoryRecord: Codable, Sendable, Identifiable, Equatable {
 
     public var id: Date { timestamp }
 
+    /// Reclaim-aware memory usage represented by this minute-level record.
+    /// This is the same estimate used by the live pressure indicator.
+    public var usedFraction: Double {
+        guard availableFraction.isFinite else { return 0 }
+        return min(max(1 - availableFraction, 0), 1)
+    }
+
     private enum CodingKeys: String, CodingKey {
         case timestamp
         case availableFraction
@@ -2111,6 +2126,376 @@ public struct MemoryHistoryRecord: Codable, Sendable, Identifiable, Equatable {
             swapUsedBytes: try container.decode(UInt64.self, forKey: .swapUsedBytes),
             workloads: try container.decodeIfPresent([PersistedWorkloadRecord].self, forKey: .workloads) ?? []
         )
+    }
+}
+
+public enum MemoryHistoryEventKind: String, Codable, Sendable, Equatable {
+    case pressureTransition
+    case swapThreshold
+    case workloadAppeared
+    case workloadDisappeared
+    case workloadGrowth
+}
+
+/// An explainable change derived from two adjacent minute-level records.
+/// Workload events describe changes in the persisted attribution ranking; they
+/// deliberately do not claim that a process was created or terminated.
+public struct MemoryHistoryEvent: Codable, Sendable, Identifiable, Equatable {
+    public let id: String
+    public let timestamp: Date
+    public let kind: MemoryHistoryEventKind
+    public let severity: RecommendationSeverity
+    public let title: String
+    public let detail: String
+    public let targetID: String?
+
+    public init(
+        id: String,
+        timestamp: Date,
+        kind: MemoryHistoryEventKind,
+        severity: RecommendationSeverity,
+        title: String,
+        detail: String,
+        targetID: String? = nil
+    ) {
+        self.id = id
+        self.timestamp = timestamp
+        self.kind = kind
+        self.severity = severity
+        self.title = title
+        self.detail = detail
+        self.targetID = targetID
+    }
+}
+
+public struct MemoryHistoryAnalysis: Sendable, Equatable {
+    public let sampleCount: Int
+    public let firstTimestamp: Date?
+    public let lastTimestamp: Date?
+    public let latestUsedFraction: Double?
+    public let peakUsedFraction: Double?
+    public let latestSwapUsedBytes: UInt64?
+    public let peakSwapUsedBytes: UInt64?
+    public let pressureTransitionCount: Int
+    public let events: [MemoryHistoryEvent]
+
+    public init(
+        sampleCount: Int,
+        firstTimestamp: Date?,
+        lastTimestamp: Date?,
+        latestUsedFraction: Double?,
+        peakUsedFraction: Double?,
+        latestSwapUsedBytes: UInt64?,
+        peakSwapUsedBytes: UInt64?,
+        pressureTransitionCount: Int,
+        events: [MemoryHistoryEvent]
+    ) {
+        self.sampleCount = max(sampleCount, 0)
+        self.firstTimestamp = firstTimestamp
+        self.lastTimestamp = lastTimestamp
+        self.latestUsedFraction = Self.normalizedFraction(latestUsedFraction)
+        self.peakUsedFraction = Self.normalizedFraction(peakUsedFraction)
+        self.latestSwapUsedBytes = latestSwapUsedBytes
+        self.peakSwapUsedBytes = peakSwapUsedBytes
+        self.pressureTransitionCount = max(pressureTransitionCount, 0)
+        self.events = events
+    }
+
+    public static let empty = MemoryHistoryAnalysis(
+        sampleCount: 0,
+        firstTimestamp: nil,
+        lastTimestamp: nil,
+        latestUsedFraction: nil,
+        peakUsedFraction: nil,
+        latestSwapUsedBytes: nil,
+        peakSwapUsedBytes: nil,
+        pressureTransitionCount: 0,
+        events: []
+    )
+
+    public var windowDuration: TimeInterval {
+        guard let firstTimestamp, let lastTimestamp else { return 0 }
+        let duration = lastTimestamp.timeIntervalSince(firstTimestamp)
+        return duration.isFinite ? max(duration, 0) : 0
+    }
+
+    public var hasData: Bool { sampleCount > 0 }
+
+    private static func normalizedFraction(_ value: Double?) -> Double? {
+        guard let value, value.isFinite else { return nil }
+        return min(max(value, 0), 1)
+    }
+}
+
+/// Converts persisted records into a compact, privacy-preserving history
+/// explanation. No process APIs or side effects are involved.
+public struct MemoryHistoryAnalyzer: Sendable {
+    public static let defaultEventLimit = 32
+    public static let defaultWorkloadEventThresholdBytes: UInt64 = 64 * 1024 * 1024
+    public static let defaultWorkloadGrowthThresholdBytes: UInt64 = 512 * 1024 * 1024
+    public static let defaultSwapAttentionThresholdBytes: UInt64 = 1 * 1024 * 1024 * 1024
+    public static let defaultSwapCriticalThresholdBytes: UInt64 = 4 * 1024 * 1024 * 1024
+    public static let defaultWorkloadTransitionGapSeconds: TimeInterval = 5 * 60
+
+    public let eventLimit: Int
+    public let workloadEventThresholdBytes: UInt64
+    public let workloadGrowthThresholdBytes: UInt64
+    public let swapAttentionThresholdBytes: UInt64
+    public let swapCriticalThresholdBytes: UInt64
+    public let workloadTransitionGapSeconds: TimeInterval
+
+    public init(
+        eventLimit: Int = MemoryHistoryAnalyzer.defaultEventLimit,
+        workloadEventThresholdBytes: UInt64 = MemoryHistoryAnalyzer.defaultWorkloadEventThresholdBytes,
+        workloadGrowthThresholdBytes: UInt64 = MemoryHistoryAnalyzer.defaultWorkloadGrowthThresholdBytes,
+        swapAttentionThresholdBytes: UInt64 = MemoryHistoryAnalyzer.defaultSwapAttentionThresholdBytes,
+        swapCriticalThresholdBytes: UInt64 = MemoryHistoryAnalyzer.defaultSwapCriticalThresholdBytes,
+        workloadTransitionGapSeconds: TimeInterval = MemoryHistoryAnalyzer.defaultWorkloadTransitionGapSeconds
+    ) {
+        self.eventLimit = max(eventLimit, 1)
+        self.workloadEventThresholdBytes = workloadEventThresholdBytes
+        self.workloadGrowthThresholdBytes = max(workloadGrowthThresholdBytes, workloadEventThresholdBytes)
+        self.swapAttentionThresholdBytes = swapAttentionThresholdBytes
+        self.swapCriticalThresholdBytes = max(swapCriticalThresholdBytes, swapAttentionThresholdBytes)
+        self.workloadTransitionGapSeconds = max(
+            workloadTransitionGapSeconds.isFinite ? workloadTransitionGapSeconds : 0,
+            0
+        )
+    }
+
+    public func analyze(_ records: [MemoryHistoryRecord]) -> MemoryHistoryAnalysis {
+        let normalizedRecords = normalized(records)
+        guard let first = normalizedRecords.first, let latest = normalizedRecords.last else {
+            return .empty
+        }
+
+        let usedFractions = normalizedRecords.map(\.usedFraction)
+        let swapValues = normalizedRecords.map(\.swapUsedBytes)
+        var events = [MemoryHistoryEvent]()
+        var pressureTransitionCount = 0
+
+        if normalizedRecords.count > 1 {
+            for index in 1..<normalizedRecords.count {
+                let previous = normalizedRecords[index - 1]
+                let current = normalizedRecords[index]
+                let previousPressure = pressure(for: previous)
+                let currentPressure = pressure(for: current)
+
+                if previousPressure != currentPressure {
+                    pressureTransitionCount += 1
+                    events.append(makePressureEvent(
+                        previous: previousPressure,
+                        current: currentPressure,
+                        record: current
+                    ))
+                }
+
+                if let swapEvent = makeSwapEvent(previous: previous, current: current) {
+                    events.append(swapEvent)
+                }
+
+                let gap = current.timestamp.timeIntervalSince(previous.timestamp)
+                if gap.isFinite, gap >= 0, gap <= workloadTransitionGapSeconds {
+                    events.append(contentsOf: workloadEvents(previous: previous, current: current))
+                }
+            }
+        }
+
+        let sortedEvents = events
+            .sorted {
+                if $0.timestamp != $1.timestamp { return $0.timestamp > $1.timestamp }
+                if $0.severity.priority != $1.severity.priority {
+                    return $0.severity.priority > $1.severity.priority
+                }
+                return $0.id < $1.id
+            }
+            .prefix(eventLimit)
+
+        return MemoryHistoryAnalysis(
+            sampleCount: normalizedRecords.count,
+            firstTimestamp: first.timestamp,
+            lastTimestamp: latest.timestamp,
+            latestUsedFraction: latest.usedFraction,
+            peakUsedFraction: usedFractions.max(),
+            latestSwapUsedBytes: latest.swapUsedBytes,
+            peakSwapUsedBytes: swapValues.max(),
+            pressureTransitionCount: pressureTransitionCount,
+            events: Array(sortedEvents)
+        )
+    }
+
+    private func normalized(_ records: [MemoryHistoryRecord]) -> [MemoryHistoryRecord] {
+        var byTimestamp = [Date: MemoryHistoryRecord]()
+        for record in records {
+            guard record.timestamp.timeIntervalSince1970.isFinite else { continue }
+            byTimestamp[record.timestamp] = record
+        }
+        return byTimestamp.values.sorted { $0.timestamp < $1.timestamp }
+    }
+
+    private func pressure(for record: MemoryHistoryRecord) -> MemoryPressureLevel {
+        // The persisted contract intentionally omits swap capacity and total
+        // RAM. Use only the reclaim-aware available fraction here; this avoids
+        // treating residual Swap after recovery as an active pressure signal.
+        if record.availableFraction < 0.10 { return .critical }
+        if record.availableFraction < 0.20 { return .attention }
+        return .normal
+    }
+
+    private func makePressureEvent(
+        previous: MemoryPressureLevel,
+        current: MemoryPressureLevel,
+        record: MemoryHistoryRecord
+    ) -> MemoryHistoryEvent {
+        let severity: RecommendationSeverity
+        let title: String
+        if current == .normal {
+            severity = .info
+            title = "内存压力恢复正常"
+        } else {
+            severity = current == .critical ? .critical : .attention
+            title = current == .critical ? "内存压力进入严重" : "内存压力进入注意"
+        }
+        let id = eventID(kind: .pressureTransition, timestamp: record.timestamp, target: current.rawValue)
+        let detail = "可回收内存 \(String(format: "%.0f%%", record.availableFraction * 100)) · \(previous.displayName) → \(current.displayName)"
+        return MemoryHistoryEvent(
+            id: id,
+            timestamp: record.timestamp,
+            kind: .pressureTransition,
+            severity: severity,
+            title: title,
+            detail: detail
+        )
+    }
+
+    private func makeSwapEvent(
+        previous: MemoryHistoryRecord,
+        current: MemoryHistoryRecord
+    ) -> MemoryHistoryEvent? {
+        let thresholds = [swapCriticalThresholdBytes, swapAttentionThresholdBytes]
+        guard let threshold = thresholds.first(where: { threshold in
+            (previous.swapUsedBytes < threshold) != (current.swapUsedBytes < threshold)
+        }) else {
+            return nil
+        }
+        let increased = current.swapUsedBytes >= threshold
+        let severity: RecommendationSeverity = increased
+            ? (threshold == swapCriticalThresholdBytes ? .critical : .attention)
+            : .info
+        let thresholdText = MemoryFormatter.bytes(threshold)
+        let title = increased ? "Swap 超过 \(thresholdText)" : "Swap 回落至 \(thresholdText) 以下"
+        let detail = "当前 Swap 已用 \(MemoryFormatter.bytes(current.swapUsedBytes))"
+        return MemoryHistoryEvent(
+            id: eventID(
+                kind: .swapThreshold,
+                timestamp: current.timestamp,
+                target: increased ? "up-\(threshold)" : "down-\(threshold)"
+            ),
+            timestamp: current.timestamp,
+            kind: .swapThreshold,
+            severity: severity,
+            title: title,
+            detail: detail
+        )
+    }
+
+    private func workloadEvents(
+        previous: MemoryHistoryRecord,
+        current: MemoryHistoryRecord
+    ) -> [MemoryHistoryEvent] {
+        let previousByID = workloadDictionary(previous.workloads)
+        let currentByID = workloadDictionary(current.workloads)
+        var result = [MemoryHistoryEvent]()
+
+        let appeared = currentByID.values
+            .filter { previousByID[$0.id] == nil && isActionable($0) }
+            .sorted(by: workloadDescending)
+        for workload in appeared.prefix(2) {
+            result.append(
+                MemoryHistoryEvent(
+                    id: eventID(kind: .workloadAppeared, timestamp: current.timestamp, target: workload.id),
+                    timestamp: current.timestamp,
+                    kind: .workloadAppeared,
+                    severity: .info,
+                    title: "\(workload.title) 进入历史排行",
+                    detail: "归因总量 \(MemoryFormatter.bytes(workload.attributedFootprintBytes)) · 仅表示出现在保存的 Top 工作组中",
+                    targetID: workload.id
+                )
+            )
+        }
+
+        let disappeared = previousByID.values
+            .filter { currentByID[$0.id] == nil && isActionable($0) }
+            .sorted(by: workloadDescending)
+        for workload in disappeared.prefix(2) {
+            result.append(
+                MemoryHistoryEvent(
+                    id: eventID(kind: .workloadDisappeared, timestamp: current.timestamp, target: workload.id),
+                    timestamp: current.timestamp,
+                    kind: .workloadDisappeared,
+                    severity: .info,
+                    title: "\(workload.title) 离开历史排行",
+                    detail: "上一分钟归因总量 \(MemoryFormatter.bytes(workload.attributedFootprintBytes)) · 不等同于进程已退出",
+                    targetID: workload.id
+                )
+            )
+        }
+
+        if let growth = currentByID.values
+            .compactMap({ workload -> (PersistedWorkloadRecord, UInt64)? in
+                guard let prior = previousByID[workload.id], isActionable(workload),
+                      workload.attributedFootprintBytes > prior.attributedFootprintBytes else {
+                    return nil
+                }
+                let delta = workload.attributedFootprintBytes - prior.attributedFootprintBytes
+                return delta >= workloadGrowthThresholdBytes ? (workload, delta) : nil
+            })
+            .sorted(by: { lhs, rhs in
+                if lhs.1 != rhs.1 { return lhs.1 > rhs.1 }
+                return lhs.0.id < rhs.0.id
+            })
+            .first {
+            result.append(
+                MemoryHistoryEvent(
+                    id: eventID(kind: .workloadGrowth, timestamp: current.timestamp, target: growth.0.id),
+                    timestamp: current.timestamp,
+                    kind: .workloadGrowth,
+                    severity: .attention,
+                    title: "\(growth.0.title) 增长明显",
+                    detail: "单分钟归因总量增加 \(MemoryFormatter.bytes(growth.1)) · 当前 \(MemoryFormatter.bytes(growth.0.attributedFootprintBytes))",
+                    targetID: growth.0.id
+                )
+            )
+        }
+        return result
+    }
+
+    private func workloadDictionary(
+        _ workloads: [PersistedWorkloadRecord]
+    ) -> [String: PersistedWorkloadRecord] {
+        workloads.reduce(into: [String: PersistedWorkloadRecord]()) { result, workload in
+            // A malformed or hand-edited history file may contain duplicate
+            // IDs. Keep the last value instead of crashing the analyzer.
+            result[workload.id] = workload
+        }
+    }
+
+    private func isActionable(_ workload: PersistedWorkloadRecord) -> Bool {
+        !workload.isSystem
+            && !workload.id.hasPrefix("other-")
+            && workload.attributedFootprintBytes >= workloadEventThresholdBytes
+    }
+
+    private func workloadDescending(_ lhs: PersistedWorkloadRecord, _ rhs: PersistedWorkloadRecord) -> Bool {
+        if lhs.attributedFootprintBytes != rhs.attributedFootprintBytes {
+            return lhs.attributedFootprintBytes > rhs.attributedFootprintBytes
+        }
+        return lhs.id < rhs.id
+    }
+
+    private func eventID(kind: MemoryHistoryEventKind, timestamp: Date, target: String) -> String {
+        let seconds = timestamp.timeIntervalSince1970
+        return "\(kind.rawValue)-\(String(format: "%.0f", seconds))-\(target)"
     }
 }
 
