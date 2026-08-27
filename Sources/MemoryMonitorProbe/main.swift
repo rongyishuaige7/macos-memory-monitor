@@ -1,24 +1,33 @@
 import Foundation
 import MemoryMonitorCore
 
-let systemSampler = SystemMemorySampler()
-let processSampler = ProcessSampler()
+let snapshot = MonitorSampler().sample()
 
 do {
-    let system = try systemSampler.sample()
-    let processes = try processSampler.sample()
-        .sorted { $0.physicalFootprintBytes > $1.physicalFootprintBytes }
+    guard let system = snapshot.system else {
+        throw MemoryMonitorError.invalidData(
+            description: "系统指标不可用：\(snapshot.systemStatus.shortDescription)"
+        )
+    }
+    let processes = snapshot.processes
 
     let availablePercent = system.availableFraction * 100
-    print("Memory Monitor Phase 0 Probe")
+    print("Memory Monitor Probe")
     print("============================")
     print("Total:       \(MemoryFormatter.bytes(system.totalBytes))")
+    print("Memory used: \(String(format: "%.1f", system.usedFraction * 100))% (estimated)")
     print("Available*:  \(MemoryFormatter.bytes(system.availableEstimateBytes)) (\(String(format: "%.1f", availablePercent))%)")
     print("Compressed:  \(MemoryFormatter.bytes(system.compressedBytes))")
     print("Wired:       \(MemoryFormatter.bytes(system.wiredBytes))")
     print("Swap:        \(MemoryFormatter.bytes(system.swapUsedBytes)) / \(MemoryFormatter.bytes(system.swapTotalBytes))")
     print("Throttled:   \(system.throttledPages) pages")
-    print("Processes:   \(processes.count) enumerated")
+    print("CPU:         \(snapshot.cpuStatus.shortDescription)")
+    if let gpu = snapshot.gpuUsageFraction {
+        print("GPU:         \(String(format: "%.1f", gpu * 100))% (\(snapshot.gpuStatus.quality.displayName))")
+    } else {
+        print("GPU:         -- (\(snapshot.gpuStatus.shortDescription))")
+    }
+    print("Processes:   \(snapshot.sampledProcessCount)/\(snapshot.listedProcessCount) enumerated (\(snapshot.processStatus.quality.displayName))")
     print("\nTop processes by physical footprint (best effort):")
     print("PID      Name                         Footprint    RSS          Parent")
     print("-----------------------------------------------------------------------")
@@ -36,6 +45,19 @@ do {
             padded(footprint, width: 12),
             padded(MemoryFormatter.bytes(process.residentBytes), width: 12),
             padded(String(process.parentPID), width: 8)
+        ]
+        print(columns.joined(separator: " "))
+    }
+    print("\nTop workload groups by attribution footprint:")
+    print("Group                         Footprint    Processes  Evidence")
+    print("----------------------------------------------------------------")
+    for group in snapshot.groups.prefix(10) {
+        let evidence = String(group.attributionReason.displayName.prefix(28))
+        let columns = [
+            padded(String(group.title.prefix(29)), width: 30),
+            padded(MemoryFormatter.bytes(group.attributedFootprintBytes), width: 12),
+            padded(String(group.processCount), width: 10),
+            evidence
         ]
         print(columns.joined(separator: " "))
     }

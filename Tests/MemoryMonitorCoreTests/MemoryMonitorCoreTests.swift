@@ -2,6 +2,11 @@ import XCTest
 @testable import MemoryMonitorCore
 
 final class MemoryMonitorCoreTests: XCTestCase {
+    private enum TestSamplingError: Error {
+        case denied
+        case unavailable
+    }
+
     func testByteFormatting() {
         XCTAssertEqual(MemoryFormatter.bytes(0), "0 B")
         XCTAssertEqual(MemoryFormatter.bytes(1024), "1.0 KiB")
@@ -13,6 +18,21 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertGreaterThan(snapshot.totalBytes, 0)
         XCTAssertGreaterThan(snapshot.pageSize, 0)
         XCTAssertGreaterThanOrEqual(snapshot.availableEstimateBytes, snapshot.freeBytes)
+        XCTAssertTrue(snapshot.isStructurallyValid)
+    }
+
+    func testSampleStatusReportsAgeOnlyForCapturedValues() {
+        let capturedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let available = SampleStatus.available(at: capturedAt)
+        XCTAssertEqual(
+            try XCTUnwrap(available.sampleAge(at: capturedAt.addingTimeInterval(12))),
+            12,
+            accuracy: 0.001
+        )
+
+        let unavailable = SampleStatus.unavailable(message: "没有驱动数据")
+        XCTAssertNil(unavailable.sampleAge(at: capturedAt.addingTimeInterval(12)))
+        XCTAssertEqual(unavailable.quality, .unavailable)
     }
 
     func testAvailableEstimateDoesNotDoubleCountSpeculativePages() {
@@ -75,6 +95,18 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertNil(CPUUsageCalculator.usedFraction(current: current, previous: previous))
     }
 
+    func testCPUTimeSnapshotSaturatesCounterSums() {
+        let snapshot = CPUTimeSnapshot(
+            userTicks: UInt64.max,
+            systemTicks: UInt64.max,
+            idleTicks: UInt64.max,
+            niceTicks: UInt64.max
+        )
+
+        XCTAssertEqual(snapshot.activeTicks, UInt64.max)
+        XCTAssertEqual(snapshot.totalTicks, UInt64.max)
+    }
+
     func testCPUTimeSamplerReturnsNonZeroCounters() throws {
         let snapshot = try CPUTimeSampler().sample()
 
@@ -87,6 +119,127 @@ final class MemoryMonitorCoreTests: XCTestCase {
 
         XCTAssertGreaterThanOrEqual(value, 0)
         XCTAssertLessThanOrEqual(value, 1)
+    }
+
+    func testMonitorSamplerKeepsIndependentSourcesWhenProcessSamplingFails() {
+        let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let system = makeSystemSnapshot(timestamp: timestamp, compressed: 10, swap: 20)
+        let sampler = MonitorSampler(
+            systemSampler: { system },
+            cpuSampler: { CPUTimeSnapshot(userTicks: 10, systemTicks: 5, idleTicks: 85, niceTicks: 0) },
+            gpuSampler: {
+                GPUUsageSample(
+                    fraction: 0.25,
+                    status: .available(at: timestamp)
+                )
+            },
+            processSampler: { throw TestSamplingError.denied }
+        )
+
+        let snapshot = sampler.sample(at: timestamp)
+
+        XCTAssertEqual(snapshot.system, system)
+        XCTAssertEqual(snapshot.systemStatus.quality, .estimated)
+        XCTAssertEqual(snapshot.cpuStatus.quality, .available)
+        XCTAssertEqual(snapshot.gpuUsageFraction, 0.25)
+        XCTAssertEqual(snapshot.gpuStatus.quality, .available)
+        XCTAssertTrue(snapshot.processes.isEmpty)
+        XCTAssertEqual(snapshot.processStatus.quality, .error)
+        XCTAssertEqual(snapshot.groups, [])
+    }
+
+    func testMonitorSamplerMarksInvalidSystemWithoutDiscardingProcesses() {
+        let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let invalid = SystemMemorySnapshot(
+            timestamp: timestamp,
+            totalBytes: 0,
+            pageSize: 0,
+            freeBytes: 0,
+            activeBytes: 0,
+            inactiveBytes: 0,
+            speculativeBytes: 0,
+            wiredBytes: 0,
+            purgeableBytes: 0,
+            compressedBytes: 0,
+            throttledPages: 0,
+            swapTotalBytes: 0,
+            swapUsedBytes: 0,
+            swapFreeBytes: 0
+        )
+        let process = makeProcess(pid: 808, name: "worker", footprint: 100)
+        let processResult = ProcessSamplingResult(
+            processes: [process],
+            listedProcessCount: 1,
+            sampledProcessCount: 1,
+            skippedProcessCount: 0,
+            status: .available(at: timestamp)
+        )
+        let sampler = MonitorSampler(
+            systemSampler: { invalid },
+            cpuSampler: { throw TestSamplingError.unavailable },
+            gpuSampler: {
+                GPUUsageSample(
+                    fraction: nil,
+                    status: .unavailable(message: "驱动未提供")
+                )
+            },
+            processSampler: { processResult }
+        )
+
+        let snapshot = sampler.sample(at: timestamp)
+
+        XCTAssertNil(snapshot.system)
+        XCTAssertEqual(snapshot.systemStatus.quality, .error)
+        XCTAssertEqual(snapshot.cpuStatus.quality, .error)
+        XCTAssertEqual(snapshot.gpuStatus.quality, .unavailable)
+        XCTAssertEqual(snapshot.processes, [process])
+        XCTAssertEqual(snapshot.processStatus.quality, .available)
+    }
+
+    func testMonitorSamplerSortsProcessResultsByStableMemoryOrdering() {
+        let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let processes = [
+            makeProcess(pid: 12, name: "same", footprint: 100),
+            makeProcess(pid: 10, name: "same", footprint: 100),
+            makeProcess(pid: 11, name: "larger-rss", footprint: 100)
+        ].map { process in
+            if process.identity.pid == 11 {
+                return ProcessSnapshot(
+                    identity: process.identity,
+                    parentPID: process.parentPID,
+                    userID: process.userID,
+                    isSystem: process.isSystem,
+                    name: process.name,
+                    executablePath: process.executablePath,
+                    residentBytes: 200,
+                    physicalFootprintBytes: process.physicalFootprintBytes,
+                    virtualBytes: process.virtualBytes,
+                    userTimeNanos: process.userTimeNanos,
+                    systemTimeNanos: process.systemTimeNanos,
+                    threadCount: process.threadCount
+                )
+            }
+            return process
+        }
+        let result = ProcessSamplingResult(
+            processes: processes,
+            listedProcessCount: 3,
+            sampledProcessCount: 3,
+            skippedProcessCount: 0,
+            status: .available(at: timestamp)
+        )
+        let system = makeSystemSnapshot(timestamp: timestamp, compressed: 0, swap: 0)
+        let sampler = MonitorSampler(
+            systemSampler: { system },
+            cpuSampler: { CPUTimeSnapshot(userTicks: 1, systemTicks: 1, idleTicks: 1, niceTicks: 0) },
+            gpuSampler: {
+                GPUUsageSample(fraction: nil, status: .unavailable())
+            },
+            processSampler: { result }
+        )
+
+        let snapshot = sampler.sample(at: timestamp)
+        XCTAssertEqual(snapshot.processes.map { $0.identity.pid }, [11, 10, 12])
     }
 
     func testProcessSamplerFindsCurrentProcess() throws {
@@ -182,6 +335,34 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertNil(unsafe.workingDirectoryLabel)
     }
 
+    func testProcessSnapshotDecodingKeepsNewMetadataBackwardCompatibleAndSanitized() throws {
+        let process = makeProcess(pid: 11, name: "worker", footprint: 100)
+        let encoded = try JSONEncoder().encode(process)
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        object.removeValue(forKey: "applicationName")
+        object.removeValue(forKey: "bundleIdentifier")
+        let oldData = try JSONSerialization.data(withJSONObject: object)
+        let oldDecoded = try JSONDecoder().decode(ProcessSnapshot.self, from: oldData)
+        XCTAssertNil(oldDecoded.applicationName)
+        XCTAssertNil(oldDecoded.bundleIdentifier)
+
+        object["applicationName"] = "Display\nName"
+        object["bundleIdentifier"] = "com.example/app"
+        let unsafeData = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(ProcessSnapshot.self, from: unsafeData)
+        XCTAssertEqual(decoded.applicationName, "DisplayName")
+        XCTAssertEqual(decoded.bundleIdentifier, "com.example-app")
+    }
+
+    func testApplicationIdentityResolverIgnoresNonAppExecutables() {
+        XCTAssertNil(ApplicationIdentityResolver.resolve(executablePath: "/usr/bin/node"))
+        let identity = ApplicationIdentity(name: "App/Name", bundleIdentifier: "com.example/app")
+        XCTAssertEqual(identity.name, "App-Name")
+        XCTAssertEqual(identity.bundleIdentifier, "com.example-app")
+    }
+
     func testWorkloadGrouperAggregatesChromeHelpers() {
         let processes = [
             makeProcess(pid: 10, name: "Google Chrome", footprint: 500),
@@ -195,6 +376,7 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertEqual(chrome.processCount, 3)
         XCTAssertEqual(chrome.physicalFootprintBytes, 1_500)
         XCTAssertEqual(chrome.residentBytes, 1_500)
+        XCTAssertEqual(chrome.attributionReason, .chromeIdentity)
     }
 
     func testWorkloadGrouperSortsGroupsByFootprintBeforeSystemPriority() {
@@ -221,6 +403,7 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertEqual(automation.processCount, 2)
         XCTAssertEqual(automation.physicalFootprintBytes, 500)
         XCTAssertNil(groups.first { $0.id == "runtime-node-api" })
+        XCTAssertEqual(groups.first { $0.id == "codex-session" }?.attributionReason, .codexSession)
     }
 
     func testWorkloadGrouperSeparatesGenericRuntimesByWorkingDirectory() {
@@ -272,6 +455,61 @@ final class MemoryMonitorCoreTests: XCTestCase {
         let groups = WorkloadGrouper().group(processes)
         XCTAssertEqual(groups.first { $0.id == "unattributed-webkit" }?.processCount, 1)
         XCTAssertEqual(groups.first { $0.id == "safari-webkit" }?.processCount, 2)
+        XCTAssertEqual(
+            groups.first { $0.id == "unattributed-webkit" }?.attributionReason,
+            .unattributedWebKit
+        )
+        XCTAssertEqual(
+            groups.first { $0.id == "safari-webkit" }?.parentChain,
+            ["Safari"]
+        )
+    }
+
+    func testWorkloadGrouperStopsAtParentCycle() {
+        let processes = [
+            makeProcess(pid: 100, name: "node", parentPID: 101, footprint: 100, workingDirectoryLabel: "api"),
+            makeProcess(pid: 101, name: "python3", parentPID: 100, footprint: 200)
+        ]
+
+        let groups = WorkloadGrouper().group(processes)
+
+        XCTAssertEqual(groups.count, 2)
+        XCTAssertTrue(groups.allSatisfy { $0.parentChain.count <= 2 })
+    }
+
+    func testWorkloadGrouperDoesNotFollowAmbiguousReusedPID() {
+        let processes = [
+            makeProcess(
+                pid: 200,
+                name: "codex",
+                footprint: 100
+            ),
+            ProcessSnapshot(
+                identity: ProcessIdentity(pid: 200, startTimeSeconds: 2, startTimeMicroseconds: 2),
+                parentPID: 1,
+                userID: 501,
+                isSystem: false,
+                name: "unrelated",
+                executablePath: "/usr/bin/unrelated",
+                residentBytes: 100,
+                physicalFootprintBytes: 100,
+                virtualBytes: 100,
+                userTimeNanos: 0,
+                systemTimeNanos: 0,
+                threadCount: 1
+            ),
+            makeProcess(
+                pid: 201,
+                name: "Google Chrome Helper",
+                parentPID: 200,
+                footprint: 300
+            )
+        ]
+
+        let groups = WorkloadGrouper().group(processes)
+
+        XCTAssertNil(groups.first { $0.id == "codex-automation" })
+        XCTAssertEqual(groups.first { $0.id == "chrome" }?.attributionReason, .chromeIdentity)
     }
 
     func testWorkloadTrendAnalyzerReportsExistingGrowingGroups() {

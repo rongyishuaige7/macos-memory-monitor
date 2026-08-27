@@ -490,6 +490,17 @@ open "$HOME/Library/Application Support/MemoryMonitor/dist/MemoryMonitor.app"
 - CPU 使用率由 Mach 累计计数的相邻采样差计算；GPU 优先读取 Apple Silicon `IOAccelerator` 的 `Device Utilization %`，驱动不提供时显示 `--`。
 - 24 小时历史仍按分钟持久化，作为后台数据能力保留，不在当前紧凑面板展开。
 
+### Phase 3D completed：可信度与归因解释
+
+- 将系统内存、CPU、GPU、进程枚举拆成独立采样源；单个源失败时，其余指标继续更新，不把失败结果写成 0。
+- 新增 `SampleQuality`/`SampleStatus`：每个源明确标记实时、部分可用、暂无数据或采集失败，并保留实际采样时间和可计算的 sample age。
+- 内存使用百分比继续采用 `1 - (free + inactive + purgeable) / total` 的压力感知估算，因此界面和探针会标注“估算”；它不是 footprint 总和，也不等同于 `memory_pressure` 的 free percentage。
+- 进程扫描报告枚举数、成功采样数和跳过数；`phys_footprint` 不可读时以 RSS 估算，并把整次进程结果标为部分可用。
+- 进程快照增加可选应用名称和 bundle identifier（仅从本地 `.app` 元数据解析）；工作组增加归因依据和代表进程父链摘要。未找到 Safari 父链的 WebKit 明确显示“未找到 Safari 父链”，不再暗示异常归属。
+- 对重复/复用 PID、父链循环、计数器溢出和稳定排序增加防护；公开快照解码兼容旧字段并再次执行标签清理。
+- 新增可注入采样协调器，覆盖部分失败降级、无效系统数据、GPU 缺失和排序等测试；核心测试共 44 项。
+- 当前机器校准显示：`memory_pressure` 的 free percentage 与本项目的可回收内存估算口径不同，`top` 的 PhysMem 也不能与进程 footprint 行简单加总；这些差异属于指标定义，不是采集错误。
+
 ### 当前限制与下一步
 
 - 工作组识别仍是可解释的名称/父链/目录 basename 启发式；目录不可读、项目目录同名或运行时不属于 Node/Python 时仍可能需要人工区分；

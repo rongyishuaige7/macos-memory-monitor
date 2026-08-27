@@ -27,11 +27,16 @@ struct MemoryMonitorApp: App {
 @MainActor
 final class MonitorViewModel: ObservableObject {
     @Published private(set) var system: SystemMemorySnapshot?
+    @Published private(set) var systemStatus = SampleStatus.unavailable(message: "等待首次采样")
     @Published private(set) var cpuUsageFraction: Double?
+    @Published private(set) var cpuStatus = SampleStatus.unavailable(message: "等待首次采样")
     @Published private(set) var gpuUsageFraction: Double?
+    @Published private(set) var gpuStatus = SampleStatus.unavailable(message: "等待首次采样")
     @Published private(set) var processes: [ProcessSnapshot] = []
     @Published private(set) var groups: [WorkloadGroupSnapshot] = []
+    @Published private(set) var processStatus = SampleStatus.unavailable(message: "等待首次采样")
     @Published private(set) var observedProcessCount = 0
+    @Published private(set) var listedProcessCount = 0
     @Published private(set) var history: [MemoryHistoryRecord] = []
     @Published private(set) var lastError: String?
     @Published private(set) var historyError: String?
@@ -60,8 +65,39 @@ final class MonitorViewModel: ObservableObject {
     }
 
     var pressure: PressureState {
-        guard lastError == nil, let pressureLevel else { return .unknown }
+        guard systemStatus.quality.isUsable, let pressureLevel else { return .unknown }
         return PressureState(level: pressureLevel)
+    }
+
+    var processObservationDescription: String {
+        switch processStatus.quality {
+        case .available:
+            return "已采集 \(observedProcessCount) 个进程"
+        case .estimated:
+            return "已采集 \(observedProcessCount)/\(listedProcessCount) 个进程"
+        case .unavailable, .error:
+            return observedProcessCount > 0
+                ? "上次采样 \(observedProcessCount) 个进程"
+                : "进程数据 \(processStatus.quality.displayName)"
+        }
+    }
+
+    var samplingIssueDescription: String? {
+        let statuses = [systemStatus, cpuStatus, gpuStatus, processStatus]
+        let issues = statuses.compactMap { status -> String? in
+            guard status.quality == .error else { return nil }
+            return status.message
+        }
+        return issues.isEmpty ? nil : issues.joined(separator: "；")
+    }
+
+    var samplingNoticeDescription: String? {
+        if samplingIssueDescription != nil {
+            return "部分采样源失败，未用 0 覆盖已有数据"
+        }
+        return processStatus.quality == .estimated
+            ? "进程列表部分可用，已保留成功读取的条目"
+            : nil
     }
 
     var samplingCadenceDescription: String {
@@ -91,18 +127,22 @@ final class MonitorViewModel: ObservableObject {
         }
 
         while !Task.isCancelled {
-            let result = await Task.detached(priority: .utility) { [sampler] in
+            let snapshot = await Task.detached(priority: .utility) { [sampler] in
                 sampler.sample()
             }.value
 
-            switch result {
-            case let .success(snapshot):
-                pressureLevel = pressureEvaluator.update(snapshot: snapshot.system)
-                historyBuffer.append(snapshot: snapshot.system)
+            systemStatus = snapshot.systemStatus
+            cpuStatus = snapshot.cpuStatus
+            gpuStatus = snapshot.gpuStatus
+            processStatus = snapshot.processStatus
+
+            if let systemSnapshot = snapshot.system {
+                pressureLevel = pressureEvaluator.update(snapshot: systemSnapshot)
+                historyBuffer.append(snapshot: systemSnapshot)
                 if historyStoreAvailable {
                     do {
                         history = try await historyStore.append(
-                            snapshot: snapshot.system,
+                            snapshot: systemSnapshot,
                             groups: snapshot.groups,
                             now: snapshot.timestamp
                         )
@@ -115,25 +155,31 @@ final class MonitorViewModel: ObservableObject {
                 } else {
                     history = historyBuffer.entries.map { MemoryHistoryRecord(entry: $0) }
                 }
-                if let cpuTime = snapshot.cpuTime {
-                    cpuUsageFraction = previousCPUTime.flatMap {
-                        CPUUsageCalculator.usedFraction(current: cpuTime, previous: $0)
-                    }
-                    previousCPUTime = cpuTime
-                } else {
-                    cpuUsageFraction = nil
-                    previousCPUTime = nil
+                system = systemSnapshot
+            }
+
+            if let cpuTime = snapshot.cpuTime, snapshot.cpuStatus.quality.isUsable {
+                cpuUsageFraction = previousCPUTime.flatMap {
+                    CPUUsageCalculator.usedFraction(current: cpuTime, previous: $0)
                 }
-                gpuUsageFraction = snapshot.gpuUsageFraction
-                system = snapshot.system
+                previousCPUTime = cpuTime
+            } else {
+                cpuUsageFraction = nil
+                previousCPUTime = nil
+            }
+
+            gpuUsageFraction = snapshot.gpuStatus.quality.isUsable
+                ? snapshot.gpuUsageFraction
+                : nil
+
+            if snapshot.processStatus.quality.isUsable {
                 processes = snapshot.processes
                 groups = snapshot.groups
-                observedProcessCount = snapshot.processCount
-                updatedAt = snapshot.timestamp
-                lastError = nil
-            case let .failure(error):
-                lastError = error.localizedDescription
+                observedProcessCount = snapshot.sampledProcessCount
+                listedProcessCount = snapshot.listedProcessCount
             }
+            updatedAt = snapshot.timestamp
+            lastError = samplingIssueDescription
 
             guard await waitForNextSample() else { break }
         }
@@ -219,51 +265,6 @@ private actor RefreshWakeup {
     }
 }
 
-private struct MonitorSampler: Sendable {
-    private let systemSampler = SystemMemorySampler()
-    private let cpuSampler = CPUTimeSampler()
-    private let gpuSampler = GPUUsageSampler()
-    private let processSampler = ProcessSampler()
-
-    func sample() -> Result<MonitorSnapshot, Error> {
-        do {
-            let cpuTime = try? cpuSampler.sample()
-            let system = try systemSampler.sample()
-            let processes = try processSampler.sample()
-                .sorted {
-                    if $0.physicalFootprintBytes != $1.physicalFootprintBytes {
-                        return $0.physicalFootprintBytes > $1.physicalFootprintBytes
-                    }
-                    if $0.residentBytes != $1.residentBytes {
-                        return $0.residentBytes > $1.residentBytes
-                    }
-                    return $0.identity.pid < $1.identity.pid
-                }
-            return .success(MonitorSnapshot(
-                timestamp: Date(),
-                system: system,
-                cpuTime: cpuTime,
-                gpuUsageFraction: gpuSampler.sample(),
-                processes: processes,
-                groups: WorkloadGrouper().group(processes),
-                processCount: processes.count
-            ))
-        } catch {
-            return .failure(error)
-        }
-    }
-}
-
-private struct MonitorSnapshot: Sendable {
-    let timestamp: Date
-    let system: SystemMemorySnapshot
-    let cpuTime: CPUTimeSnapshot?
-    let gpuUsageFraction: Double?
-    let processes: [ProcessSnapshot]
-    let groups: [WorkloadGroupSnapshot]
-    let processCount: Int
-}
-
 enum PressureState: String {
     case normal
     case attention
@@ -309,7 +310,7 @@ private struct MenuBarStatus: View {
                 .fill(model.pressure.color)
                 .frame(width: 7, height: 7)
             Text(
-                model.lastError == nil
+                model.systemStatus.quality.isUsable
                     ? (model.system.map { "内存 \(Int($0.usedFraction * 100))%" } ?? "内存 --")
                     : "内存 --"
             )
@@ -340,6 +341,7 @@ private struct MonitorPopover: View {
         VStack(alignment: .leading, spacing: 14) {
             header
             metrics
+            samplingNotice
             processList
             footer
         }
@@ -352,14 +354,14 @@ private struct MonitorPopover: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Memory Monitor")
                     .font(.system(size: 18, weight: .semibold))
-                Text("全量进程观察 · 已采集 \(model.observedProcessCount) 个进程")
+                Text("全量进程观察 · \(model.processObservationDescription)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 HStack(spacing: 6) {
                     Circle()
                         .fill(model.pressure.color)
                         .frame(width: 8, height: 8)
-                    Text(model.lastError == nil ? model.pressure.title : "采集受限")
+                    Text(model.systemStatus.quality.isUsable ? model.pressure.title : "采集受限")
                         .font(.subheadline.weight(.medium))
                         .foregroundStyle(model.pressure.color)
                 }
@@ -377,15 +379,18 @@ private struct MonitorPopover: View {
         HStack(spacing: 8) {
             MetricTile(
                 title: "CPU",
-                fraction: model.cpuUsageFraction
+                fraction: model.cpuUsageFraction,
+                status: model.cpuStatus
             )
             MetricTile(
                 title: "内存",
-                fraction: model.system?.usedFraction
+                fraction: model.systemStatus.quality.isUsable ? model.system?.usedFraction : nil,
+                status: model.systemStatus
             )
             MetricTile(
                 title: "GPU",
-                fraction: model.gpuUsageFraction
+                fraction: model.gpuUsageFraction,
+                status: model.gpuStatus
             )
         }
     }
@@ -418,15 +423,36 @@ private struct MonitorPopover: View {
         }
     }
 
+    @ViewBuilder
+    private var samplingNotice: some View {
+        if let notice = model.samplingNoticeDescription {
+            HStack(spacing: 6) {
+                Image(systemName: model.samplingIssueDescription == nil
+                    ? "info.circle"
+                    : "exclamationmark.triangle")
+                    .imageScale(.small)
+                Text(notice)
+                    .font(.caption2)
+                    .foregroundStyle(
+                        model.samplingIssueDescription == nil ? Color.secondary : Color.orange
+                    )
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
     private var sortedProcesses: [ProcessSnapshot] {
-        model.processes.sorted {
-            if $0.physicalFootprintBytes != $1.physicalFootprintBytes {
-                return $0.physicalFootprintBytes > $1.physicalFootprintBytes
-            }
-            if $0.residentBytes != $1.residentBytes {
-                return $0.residentBytes > $1.residentBytes
-            }
-            return $0.identity.pid < $1.identity.pid
+        model.processes.sorted(by: ProcessSnapshot.memoryDescending)
+    }
+
+    private var processStatusText: String {
+        switch model.processStatus.quality {
+        case .available:
+            return "共 \(sortedProcesses.count) 个"
+        case .estimated:
+            return "\(sortedProcesses.count) 个 · 部分可用"
+        case .unavailable, .error:
+            return sortedProcesses.isEmpty ? model.processStatus.quality.displayName : "上次数据"
         }
     }
 
@@ -437,7 +463,7 @@ private struct MonitorPopover: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                 Spacer()
-                Text("共 \(sortedProcesses.count) 个")
+                Text(processStatusText)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -518,6 +544,7 @@ private struct MonitorPopover: View {
 private struct MetricTile: View {
     let title: String
     let fraction: Double?
+    let status: SampleStatus
 
     private var value: String {
         guard let fraction, fraction.isFinite else { return "--" }
@@ -525,7 +552,16 @@ private struct MetricTile: View {
     }
 
     private var detail: String {
-        fraction == nil ? "暂不可用" : "已使用"
+        guard fraction != nil else {
+            if title == "CPU", status.quality.isUsable {
+                return "等待下一次采样"
+            }
+            return status.quality == .available ? "暂无数据" : status.quality.displayName
+        }
+        if title == "内存", status.quality == .estimated {
+            return "估算"
+        }
+        return status.quality == .available ? "已使用" : status.quality.displayName
     }
 
     var body: some View {
@@ -568,6 +604,16 @@ private struct WorkloadGroupRow: View {
                 Text("\(group.processCount) 个进程 · \(group.representativeProcess)")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+                Text("依据：\(group.attributionReason.displayName)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                if !group.parentChain.isEmpty {
+                    Text("父链：\(group.parentChain.joined(separator: " > "))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             }
             Spacer(minLength: 4)
             VStack(alignment: .trailing, spacing: 2) {
@@ -596,6 +642,10 @@ private struct ProcessRow: View {
 
     private var detailText: String {
         var details = ["PID \(process.identity.pid)", process.isSystem ? "系统" : "用户"]
+        if let applicationName = process.applicationName,
+           applicationName.caseInsensitiveCompare(process.name) != .orderedSame {
+            details.append(applicationName)
+        }
         if let label = process.workingDirectoryLabel {
             details.append(label)
         }

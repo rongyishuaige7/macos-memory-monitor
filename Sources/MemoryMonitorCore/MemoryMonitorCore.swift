@@ -18,7 +18,78 @@ public enum MemoryMonitorError: Error, CustomStringConvertible, LocalizedError, 
     public var errorDescription: String? { description }
 }
 
-public struct SystemMemorySnapshot: Codable, Sendable {
+/// Describes how trustworthy a value is for the current sampling pass.
+/// `estimated` means a value was obtained through a documented fallback;
+/// it is not interchangeable with an unavailable or failed measurement.
+public enum SampleQuality: String, Codable, Sendable, Equatable {
+    case available
+    case estimated
+    case unavailable
+    case error
+
+    public var displayName: String {
+        switch self {
+        case .available: return "实时"
+        case .estimated: return "部分可用"
+        case .unavailable: return "暂无数据"
+        case .error: return "采集失败"
+        }
+    }
+
+    public var isUsable: Bool {
+        self == .available || self == .estimated
+    }
+}
+
+/// Lightweight metadata attached to each independent metric source.
+/// `sampledAt` is nil when no value was captured, so a failure cannot look
+/// like a fresh zero-valued sample.
+public struct SampleStatus: Codable, Sendable, Equatable {
+    public let quality: SampleQuality
+    public let message: String?
+    public let sampledAt: Date?
+
+    public init(
+        quality: SampleQuality,
+        message: String? = nil,
+        sampledAt: Date? = nil
+    ) {
+        self.quality = quality
+        self.message = message
+        self.sampledAt = sampledAt
+    }
+
+    public static func available(at date: Date, message: String? = nil) -> SampleStatus {
+        SampleStatus(quality: .available, message: message, sampledAt: date)
+    }
+
+    public static func estimated(at date: Date, message: String? = nil) -> SampleStatus {
+        SampleStatus(quality: .estimated, message: message, sampledAt: date)
+    }
+
+    public static func unavailable(message: String? = nil) -> SampleStatus {
+        SampleStatus(quality: .unavailable, message: message)
+    }
+
+    public static func error(_ message: String) -> SampleStatus {
+        SampleStatus(quality: .error, message: message)
+    }
+
+    public func sampleAge(at now: Date = Date()) -> TimeInterval? {
+        guard let sampledAt else { return nil }
+        let age = now.timeIntervalSince(sampledAt)
+        return age.isFinite ? max(age, 0) : nil
+    }
+
+    public var shortDescription: String {
+        if let message, !message.isEmpty {
+            return "\(quality.displayName) · \(message)"
+        }
+        return quality.displayName
+    }
+}
+
+public struct SystemMemorySnapshot: Codable, Sendable, Equatable {
     public let timestamp: Date
     public let totalBytes: UInt64
     public let pageSize: UInt64
@@ -57,6 +128,10 @@ public struct SystemMemorySnapshot: Codable, Sendable {
     public var availableFraction: Double {
         guard totalBytes > 0 else { return 0 }
         return min(max(Double(availableEstimateBytes) / Double(totalBytes), 0), 1)
+    }
+
+    public var isStructurallyValid: Bool {
+        totalBytes > 0 && pageSize > 0
     }
 
     public init(
@@ -127,8 +202,12 @@ public struct SystemMemorySampler: Sendable {
         }
 
         let pageBytes = UInt64(pageSize)
+        let totalBytes = try sysctlUInt64(named: "hw.memsize")
+        guard pageBytes > 0, totalBytes > 0 else {
+            throw MemoryMonitorError.invalidData(description: "系统内存采样返回了无效的总量或页大小")
+        }
         return SystemMemorySnapshot(
-            totalBytes: try sysctlUInt64(named: "hw.memsize"),
+            totalBytes: totalBytes,
             pageSize: pageBytes,
             freeBytes: UInt64(statistics.free_count) * pageBytes,
             activeBytes: UInt64(statistics.active_count) * pageBytes,
@@ -165,11 +244,16 @@ public struct CPUTimeSnapshot: Sendable, Equatable {
     }
 
     public var activeTicks: UInt64 {
-        userTicks + systemTicks + niceTicks
+        saturatingAdd(saturatingAdd(userTicks, systemTicks), niceTicks)
     }
 
     public var totalTicks: UInt64 {
-        activeTicks + idleTicks
+        saturatingAdd(activeTicks, idleTicks)
+    }
+
+    private func saturatingAdd(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
+        let (value, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? UInt64.max : value
     }
 }
 
@@ -222,6 +306,16 @@ public enum CPUUsageCalculator {
 /// Reads the aggregate GPU utilization exposed by Apple's IOAccelerator
 /// service. The property is intentionally optional: some macOS versions or
 /// restricted environments do not expose performance statistics to user apps.
+public struct GPUUsageSample: Sendable, Equatable {
+    public let fraction: Double?
+    public let status: SampleStatus
+
+    public init(fraction: Double?, status: SampleStatus) {
+        self.fraction = fraction
+        self.status = status
+    }
+}
+
 public struct GPUUsageSampler: Sendable {
     private static let utilizationKeys = [
         "Device Utilization %",
@@ -233,14 +327,23 @@ public struct GPUUsageSampler: Sendable {
     public init() {}
 
     public func sample() -> Double? {
+        sampleDetailed().fraction
+    }
+
+    public func sampleDetailed(at timestamp: Date = Date()) -> GPUUsageSample {
         var iterator: io_iterator_t = 0
         let matching = IOServiceMatching("IOAccelerator")
-        guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == KERN_SUCCESS else {
-            return nil
+        let matchingStatus = IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator)
+        guard matchingStatus == KERN_SUCCESS else {
+            return GPUUsageSample(
+                fraction: nil,
+                status: SampleStatus.error("IOAccelerator 查询失败（\(matchingStatus)）")
+            )
         }
         defer { IOObjectRelease(iterator) }
 
         var values: [Double] = []
+        var propertyFailures = 0
         while true {
             let service = IOIteratorNext(iterator)
             guard service != 0 else { break }
@@ -257,12 +360,28 @@ public struct GPUUsageSampler: Sendable {
                 if let performance = dictionary["PerformanceStatistics"] as? NSDictionary,
                    let utilization = utilization(in: performance) {
                     values.append(utilization)
+                } else {
+                    propertyFailures += 1
                 }
+            } else {
+                propertyFailures += 1
             }
             IOObjectRelease(service)
         }
 
-        return values.max()
+        guard let value = values.max() else {
+            let message = propertyFailures > 0
+                ? "IOAccelerator 未提供可读利用率"
+                : "未发现可用 GPU 利用率"
+            return GPUUsageSample(
+                fraction: nil,
+                status: SampleStatus.unavailable(message: message)
+            )
+        }
+        return GPUUsageSample(
+            fraction: value,
+            status: SampleStatus.available(at: timestamp)
+        )
     }
 
     private func utilization(in performance: NSDictionary) -> Double? {
@@ -374,13 +493,51 @@ public enum WorkingDirectoryLabelSanitizer {
     }
 }
 
-public struct ProcessSnapshot: Codable, Sendable, Identifiable {
+/// Optional application metadata resolved from the nearest `.app` bundle in
+/// an executable path. It is intentionally absent for command-line tools and
+/// system daemons; callers must continue to use the process name as fallback.
+public struct ApplicationIdentity: Codable, Sendable, Equatable {
+    public let name: String?
+    public let bundleIdentifier: String?
+
+    public init(name: String? = nil, bundleIdentifier: String? = nil) {
+        self.name = name.flatMap(WorkingDirectoryLabelSanitizer.label(fromComponent:))
+        self.bundleIdentifier = bundleIdentifier.flatMap(WorkingDirectoryLabelSanitizer.label(fromComponent:))
+    }
+}
+
+public enum ApplicationIdentityResolver {
+    public static func resolve(executablePath: String?) -> ApplicationIdentity? {
+        guard let executablePath, executablePath.hasPrefix("/") else { return nil }
+        let url = URL(fileURLWithPath: executablePath).standardizedFileURL
+        let components = url.pathComponents
+        guard let appIndex = components.lastIndex(where: { $0.lowercased().hasSuffix(".app") }) else {
+            return nil
+        }
+
+        let appPath = NSString.path(withComponents: Array(components.prefix(appIndex + 1)))
+        guard let bundle = Bundle(path: appPath) else { return nil }
+
+        let displayName = (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
+            ?? (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String)
+        let bundleIdentifier = bundle.bundleIdentifier
+        guard displayName != nil || bundleIdentifier != nil else { return nil }
+        return ApplicationIdentity(
+            name: displayName.flatMap(WorkingDirectoryLabelSanitizer.label(fromComponent:)),
+            bundleIdentifier: bundleIdentifier.flatMap(WorkingDirectoryLabelSanitizer.label(fromComponent:))
+        )
+    }
+}
+
+public struct ProcessSnapshot: Codable, Sendable, Identifiable, Equatable {
     public let identity: ProcessIdentity
     public let parentPID: Int32
     public let userID: UInt32
     public let isSystem: Bool
     public let name: String
     public let executablePath: String?
+    public let applicationName: String?
+    public let bundleIdentifier: String?
     public let residentBytes: UInt64
     public let physicalFootprintBytes: UInt64
     /// True when libproc could not provide phys_footprint and RSS was used as a fallback.
@@ -394,6 +551,20 @@ public struct ProcessSnapshot: Codable, Sendable, Identifiable {
 
     public var id: ProcessIdentity { identity }
 
+    public var footprintQuality: SampleQuality {
+        physicalFootprintIsEstimated ? .estimated : .available
+    }
+
+    public static func memoryDescending(_ lhs: ProcessSnapshot, _ rhs: ProcessSnapshot) -> Bool {
+        if lhs.physicalFootprintBytes != rhs.physicalFootprintBytes {
+            return lhs.physicalFootprintBytes > rhs.physicalFootprintBytes
+        }
+        if lhs.residentBytes != rhs.residentBytes {
+            return lhs.residentBytes > rhs.residentBytes
+        }
+        return lhs.identity.pid < rhs.identity.pid
+    }
+
     public init(
         identity: ProcessIdentity,
         parentPID: Int32,
@@ -401,6 +572,8 @@ public struct ProcessSnapshot: Codable, Sendable, Identifiable {
         isSystem: Bool,
         name: String,
         executablePath: String?,
+        applicationName: String? = nil,
+        bundleIdentifier: String? = nil,
         residentBytes: UInt64,
         physicalFootprintBytes: UInt64,
         physicalFootprintIsEstimated: Bool = false,
@@ -416,6 +589,8 @@ public struct ProcessSnapshot: Codable, Sendable, Identifiable {
         self.isSystem = isSystem
         self.name = name
         self.executablePath = executablePath
+        self.applicationName = applicationName.flatMap(WorkingDirectoryLabelSanitizer.label(fromComponent:))
+        self.bundleIdentifier = bundleIdentifier.flatMap(WorkingDirectoryLabelSanitizer.label(fromComponent:))
         self.residentBytes = residentBytes
         self.physicalFootprintBytes = physicalFootprintBytes
         self.physicalFootprintIsEstimated = physicalFootprintIsEstimated
@@ -430,12 +605,87 @@ public struct ProcessSnapshot: Codable, Sendable, Identifiable {
         self.systemTimeNanos = systemTimeNanos
         self.threadCount = threadCount
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case identity
+        case parentPID
+        case userID
+        case isSystem
+        case name
+        case executablePath
+        case applicationName
+        case bundleIdentifier
+        case residentBytes
+        case physicalFootprintBytes
+        case physicalFootprintIsEstimated
+        case workingDirectoryLabel
+        case virtualBytes
+        case userTimeNanos
+        case systemTimeNanos
+        case threadCount
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            identity: try container.decode(ProcessIdentity.self, forKey: .identity),
+            parentPID: try container.decode(Int32.self, forKey: .parentPID),
+            userID: try container.decode(UInt32.self, forKey: .userID),
+            isSystem: try container.decode(Bool.self, forKey: .isSystem),
+            name: try container.decode(String.self, forKey: .name),
+            executablePath: try container.decodeIfPresent(String.self, forKey: .executablePath),
+            applicationName: try container.decodeIfPresent(String.self, forKey: .applicationName),
+            bundleIdentifier: try container.decodeIfPresent(String.self, forKey: .bundleIdentifier),
+            residentBytes: try container.decode(UInt64.self, forKey: .residentBytes),
+            physicalFootprintBytes: try container.decode(UInt64.self, forKey: .physicalFootprintBytes),
+            physicalFootprintIsEstimated: try container.decodeIfPresent(Bool.self, forKey: .physicalFootprintIsEstimated) ?? false,
+            workingDirectoryLabel: try container.decodeIfPresent(String.self, forKey: .workingDirectoryLabel),
+            virtualBytes: try container.decode(UInt64.self, forKey: .virtualBytes),
+            userTimeNanos: try container.decode(UInt64.self, forKey: .userTimeNanos),
+            systemTimeNanos: try container.decode(UInt64.self, forKey: .systemTimeNanos),
+            threadCount: try container.decode(Int32.self, forKey: .threadCount)
+        )
+    }
+}
+
+public struct ProcessSamplingResult: Sendable, Equatable {
+    public let processes: [ProcessSnapshot]
+    public let listedProcessCount: Int
+    public let sampledProcessCount: Int
+    public let skippedProcessCount: Int
+    public let status: SampleStatus
+
+    public init(
+        processes: [ProcessSnapshot],
+        listedProcessCount: Int,
+        sampledProcessCount: Int,
+        skippedProcessCount: Int,
+        status: SampleStatus
+    ) {
+        self.processes = processes
+        let normalizedSampledCount = processes.count
+        let normalizedListedCount = max(max(listedProcessCount, 0), normalizedSampledCount)
+        self.listedProcessCount = normalizedListedCount
+        self.sampledProcessCount = normalizedSampledCount
+        self.skippedProcessCount = max(
+            max(skippedProcessCount, 0),
+            normalizedListedCount - normalizedSampledCount
+        )
+        self.status = status
+    }
 }
 
 public struct ProcessSampler: Sendable {
     public init() {}
 
     public func sample() throws -> [ProcessSnapshot] {
+        try sampleDetailed().processes
+    }
+
+    /// Enumerates all visible processes and reports processes that disappear
+    /// or become inaccessible during the scan instead of silently hiding the
+    /// partial result.
+    public func sampleDetailed(at timestamp: Date = Date()) throws -> ProcessSamplingResult {
         let requestedBytes = proc_listpids(UInt32(PROC_ALL_PIDS), 0, nil, 0)
         guard requestedBytes > 0 else {
             throw MemoryMonitorError.systemCall(name: "proc_listpids(size)", code: requestedBytes)
@@ -462,10 +712,35 @@ public struct ProcessSampler: Sendable {
         }
 
         let returnedCount = min(Int(returnedBytes) / MemoryLayout<pid_t>.stride, pids.count)
-        return pids.prefix(returnedCount).compactMap { pid in
-            guard pid > 0 else { return nil }
-            return snapshot(pid: pid)
+        var seenPIDs = Set<pid_t>()
+        let candidatePIDs = pids.prefix(returnedCount).filter { pid in
+            pid > 0 && seenPIDs.insert(pid).inserted
         }
+        let processes: [ProcessSnapshot] = candidatePIDs.compactMap { pid in
+            snapshot(pid: pid)
+        }
+        let skippedCount = candidatePIDs.count - processes.count
+        let hasEstimatedFootprint = processes.contains { $0.physicalFootprintIsEstimated }
+        let status: SampleStatus
+        if skippedCount == 0, !hasEstimatedFootprint {
+            status = SampleStatus.available(at: timestamp)
+        } else {
+            var reasons = [String]()
+            if skippedCount > 0 {
+                reasons.append("\(skippedCount) 个进程在扫描期间退出或受权限限制")
+            }
+            if hasEstimatedFootprint {
+                reasons.append("部分 footprint 使用 RSS 估算")
+            }
+            status = SampleStatus.estimated(at: timestamp, message: reasons.joined(separator: "；"))
+        }
+        return ProcessSamplingResult(
+            processes: processes,
+            listedProcessCount: candidatePIDs.count,
+            sampledProcessCount: processes.count,
+            skippedProcessCount: skippedCount,
+            status: status
+        )
     }
 
     private func snapshot(pid: pid_t) -> ProcessSnapshot? {
@@ -497,6 +772,8 @@ public struct ProcessSampler: Sendable {
             ? workingDirectoryLabel(for: pid)
             : nil
 
+        let path = executablePath(for: pid)
+        let application = ApplicationIdentityResolver.resolve(executablePath: path)
         return ProcessSnapshot(
             identity: ProcessIdentity(
                 pid: Int32(bsd.pbi_pid),
@@ -507,7 +784,9 @@ public struct ProcessSampler: Sendable {
             userID: UInt32(bsd.pbi_uid),
             isSystem: (bsd.pbi_flags & UInt32(PROC_FLAG_SYSTEM)) != 0,
             name: processName,
-            executablePath: executablePath(for: pid),
+            executablePath: path,
+            applicationName: application?.name,
+            bundleIdentifier: application?.bundleIdentifier,
             residentBytes: task.pti_resident_size,
             physicalFootprintBytes: footprint,
             physicalFootprintIsEstimated: !footprintAvailable,
@@ -551,7 +830,41 @@ public struct ProcessSampler: Sendable {
     }
 }
 
-public struct WorkloadGroupSnapshot: Codable, Sendable, Identifiable {
+public enum WorkloadAttributionReason: String, Codable, Sendable, Equatable {
+    case systemProcess
+    case codexSession
+    case codexAncestor
+    case safariAncestor
+    case unattributedWebKit
+    case chromeIdentity
+    case ghosttyAncestor
+    case maibotIdentity
+    case virtualizationIdentity
+    case runtimeWorkingDirectory
+    case runtimeAncestorWorkingDirectory
+    case runtimeFallback
+    case processName
+
+    public var displayName: String {
+        switch self {
+        case .systemProcess: return "系统标记或 UID 0"
+        case .codexSession: return "进程或应用标识包含 Codex"
+        case .codexAncestor: return "父链包含 Codex，并包含浏览器或运行时"
+        case .safariAncestor: return "父链包含 Safari"
+        case .unattributedWebKit: return "未找到 Safari 父链"
+        case .chromeIdentity: return "进程或应用标识包含 Chrome/Chromium"
+        case .ghosttyAncestor: return "父链包含 Ghostty"
+        case .maibotIdentity: return "进程或可执行路径包含 MaiBot"
+        case .virtualizationIdentity: return "进程标识包含虚拟化运行时"
+        case .runtimeWorkingDirectory: return "运行时名称 + 工作目录标签"
+        case .runtimeAncestorWorkingDirectory: return "运行时名称 + 父链工作目录标签"
+        case .runtimeFallback: return "运行时名称，未取得工作目录"
+        case .processName: return "进程名称"
+        }
+    }
+}
+
+public struct WorkloadGroupSnapshot: Codable, Sendable, Identifiable, Equatable {
     public let id: String
     public let title: String
     public let processCount: Int
@@ -560,6 +873,11 @@ public struct WorkloadGroupSnapshot: Codable, Sendable, Identifiable {
     public let containsEstimatedFootprint: Bool
     public let isSystem: Bool
     public let representativeProcess: String
+    public let attributionReason: WorkloadAttributionReason
+    /// Names of the representative process's ancestors, nearest first.
+    /// Only short process names are retained; paths and command lines never
+    /// enter this field.
+    public let parentChain: [String]
 
     /// Sum of member footprints attributed to this group; shared mappings are
     /// intentionally counted in each member and must not be treated as a
@@ -577,7 +895,9 @@ public struct WorkloadGroupSnapshot: Codable, Sendable, Identifiable {
         residentBytes: UInt64,
         containsEstimatedFootprint: Bool = false,
         isSystem: Bool,
-        representativeProcess: String
+        representativeProcess: String,
+        attributionReason: WorkloadAttributionReason = .processName,
+        parentChain: [String] = []
     ) {
         self.id = id
         self.title = title
@@ -587,6 +907,41 @@ public struct WorkloadGroupSnapshot: Codable, Sendable, Identifiable {
         self.containsEstimatedFootprint = containsEstimatedFootprint
         self.isSystem = isSystem
         self.representativeProcess = representativeProcess
+        self.attributionReason = attributionReason
+        self.parentChain = Array(
+            parentChain
+                .compactMap { WorkingDirectoryLabelSanitizer.label(fromComponent: $0) }
+                .prefix(8)
+        )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case processCount
+        case physicalFootprintBytes
+        case residentBytes
+        case containsEstimatedFootprint
+        case isSystem
+        case representativeProcess
+        case attributionReason
+        case parentChain
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            id: try container.decode(String.self, forKey: .id),
+            title: try container.decode(String.self, forKey: .title),
+            processCount: try container.decode(Int.self, forKey: .processCount),
+            physicalFootprintBytes: try container.decode(UInt64.self, forKey: .physicalFootprintBytes),
+            residentBytes: try container.decode(UInt64.self, forKey: .residentBytes),
+            containsEstimatedFootprint: try container.decodeIfPresent(Bool.self, forKey: .containsEstimatedFootprint) ?? false,
+            isSystem: try container.decode(Bool.self, forKey: .isSystem),
+            representativeProcess: try container.decode(String.self, forKey: .representativeProcess),
+            attributionReason: try container.decodeIfPresent(WorkloadAttributionReason.self, forKey: .attributionReason) ?? .processName,
+            parentChain: try container.decodeIfPresent([String].self, forKey: .parentChain) ?? []
+        )
     }
 }
 
@@ -595,34 +950,53 @@ public struct WorkloadGrouper: Sendable {
     public init() {}
 
     public func group(_ processes: [ProcessSnapshot]) -> [WorkloadGroupSnapshot] {
-        let byPID = Dictionary(
-            processes.map { ($0.identity.pid, $0) },
-            uniquingKeysWith: { first, _ in first }
-        )
-        var buckets: [String: (title: String, processes: [ProcessSnapshot], isSystem: Bool)] = [:]
+        // A PID can be reused after a process exits. If one pass contains
+        // ambiguous entries, do not follow that PID and accidentally inherit
+        // the wrong application's attribution.
+        let byPID = Dictionary(grouping: processes, by: { $0.identity.pid })
+            .compactMapValues { candidates -> ProcessSnapshot? in
+                guard let first = candidates.first,
+                      candidates.dropFirst().allSatisfy({ $0.identity == first.identity }) else {
+                    return nil
+                }
+                return first
+            }
+        var buckets: [String: (
+            title: String,
+            processes: [ProcessSnapshot],
+            isSystem: Bool,
+            reason: WorkloadAttributionReason
+        )] = [:]
 
         for process in processes {
             let classification = classify(process, byPID: byPID)
             var bucket = buckets[classification.id] ?? (
                 title: classification.title,
                 processes: [],
-                isSystem: classification.isSystem
+                isSystem: classification.isSystem,
+                reason: classification.reason
             )
             bucket.processes.append(process)
             buckets[classification.id] = bucket
         }
 
         return buckets.map { id, bucket in
-            let largest = bucket.processes.max { $0.physicalFootprintBytes < $1.physicalFootprintBytes }
+            let largest = bucket.processes.sorted(by: ProcessSnapshot.memoryDescending).first
             return WorkloadGroupSnapshot(
                 id: id,
                 title: bucket.title,
                 processCount: bucket.processes.count,
-                physicalFootprintBytes: bucket.processes.reduce(0) { $0 + $1.physicalFootprintBytes },
-                residentBytes: bucket.processes.reduce(0) { $0 + $1.residentBytes },
+                physicalFootprintBytes: bucket.processes.reduce(0) {
+                    Self.saturatingAdd($0, $1.physicalFootprintBytes)
+                },
+                residentBytes: bucket.processes.reduce(0) {
+                    Self.saturatingAdd($0, $1.residentBytes)
+                },
                 containsEstimatedFootprint: bucket.processes.contains { $0.physicalFootprintIsEstimated },
                 isSystem: bucket.isSystem,
-                representativeProcess: largest?.name ?? "(unknown)"
+                representativeProcess: largest?.name ?? "(unknown)",
+                attributionReason: bucket.reason,
+                parentChain: largest.map { parentChain(for: $0, byPID: byPID) } ?? []
             )
         }
         .sorted {
@@ -634,52 +1008,77 @@ public struct WorkloadGrouper: Sendable {
         }
     }
 
+    private struct Classification {
+        let id: String
+        let title: String
+        let isSystem: Bool
+        let reason: WorkloadAttributionReason
+    }
+
     private func classify(
         _ process: ProcessSnapshot,
         byPID: [Int32: ProcessSnapshot]
-    ) -> (id: String, title: String, isSystem: Bool) {
+    ) -> Classification {
         let names = ancestorNames(for: process, byPID: byPID)
         let combined = names.joined(separator: " ").lowercased()
         let own = process.name.lowercased()
         let path = process.executablePath?.lowercased() ?? ""
-        let identityText = "\(own) \(path)"
+        let applicationText = "\(process.applicationName ?? "") \(process.bundleIdentifier ?? "")".lowercased()
+        let identityText = "\(own) \(path) \(applicationText)"
 
         if process.isSystem || process.userID == 0 || ["kernel_task", "windowserver", "controlcenter", "launchd"].contains(own) {
-            return ("system", "系统", true)
+            return Classification(id: "system", title: "系统", isSystem: true, reason: .systemProcess)
+        }
+        if own == "codex" || path.contains("/codex") || applicationText.contains("codex") {
+            let hasAutomationDescendant = identityText.contains("chrome")
+                || identityText.contains("chromium")
+                || identityText.contains("node")
+                || identityText.contains("webkit")
+                || identityText.contains("python")
+            return hasAutomationDescendant
+                ? Classification(id: "codex-automation", title: "Codex 自动化", isSystem: false, reason: .codexAncestor)
+                : Classification(id: "codex-session", title: "Codex 会话", isSystem: false, reason: .codexSession)
         }
         if combined.contains("codex") && (identityText.contains("chrome") || identityText.contains("chromium") || identityText.contains("node")) {
-            return ("codex-automation", "Codex 自动化", false)
+            return Classification(id: "codex-automation", title: "Codex 自动化", isSystem: false, reason: .codexAncestor)
         }
         if own.contains("safari") || path.contains("safari") || combined.contains("safari") {
-            return ("safari-webkit", "Safari/WebKit", false)
+            return Classification(id: "safari-webkit", title: "Safari/WebKit", isSystem: false, reason: .safariAncestor)
         }
         if own.contains("webkit") || path.contains("webkit") {
-            return ("unattributed-webkit", "未归属 WebKit", false)
+            return Classification(id: "unattributed-webkit", title: "未归属 WebKit", isSystem: false, reason: .unattributedWebKit)
         }
         if identityText.contains("chrome") || identityText.contains("chromium") {
-            return ("chrome", "Chrome", false)
+            return Classification(id: "chrome", title: "Chrome", isSystem: false, reason: .chromeIdentity)
         }
         if combined.contains("ghostty") {
-            return ("ghostty-services", "Ghostty/开发服务", false)
+            return Classification(id: "ghostty-services", title: "Ghostty/开发服务", isSystem: false, reason: .ghosttyAncestor)
         }
         if identityText.contains("maibot") || path.contains("maibot") {
-            return ("maibot", "MaiBot", false)
+            return Classification(id: "maibot", title: "MaiBot", isSystem: false, reason: .maibotIdentity)
         }
         if identityText.contains("virtualization") || identityText.contains("virtual machine") || identityText.contains("vmm") {
-            return ("virtual-machines", "虚拟机", false)
+            return Classification(id: "virtual-machines", title: "虚拟机", isSystem: false, reason: .virtualizationIdentity)
         }
         if let runtime = runtimeDescriptor(for: own) {
-            if let label = workingDirectoryLabel(for: process, byPID: byPID) {
+            if let resolution = workingDirectoryResolution(for: process, byPID: byPID) {
+                let label = resolution.label
                 let component = WorkingDirectoryLabelSanitizer.identifierComponent(for: label)
-                return (
-                    "runtime-\(runtime.id)-\(component)",
-                    "\(runtime.title) · \(label)",
-                    false
+                return Classification(
+                    id: "runtime-\(runtime.id)-\(component)",
+                    title: "\(runtime.title) · \(label)",
+                    isSystem: false,
+                    reason: resolution.inherited ? .runtimeAncestorWorkingDirectory : .runtimeWorkingDirectory
                 )
             }
-            return ("runtime-\(runtime.id)", runtime.title, false)
+            return Classification(
+                id: "runtime-\(runtime.id)",
+                title: runtime.title,
+                isSystem: false,
+                reason: .runtimeFallback
+            )
         }
-        return ("process-\(own)", process.name, false)
+        return Classification(id: "process-\(own)", title: process.name, isSystem: false, reason: .processName)
     }
 
     private func runtimeDescriptor(for name: String) -> (id: String, title: String)? {
@@ -692,16 +1091,17 @@ public struct WorkloadGrouper: Sendable {
         return nil
     }
 
-    private func workingDirectoryLabel(
+    private func workingDirectoryResolution(
         for process: ProcessSnapshot,
         byPID: [Int32: ProcessSnapshot]
-    ) -> String? {
+    ) -> (label: String, inherited: Bool)? {
         var current = process
         var visited = Set<Int32>()
+        var inherited = false
         while true {
             if let label = current.workingDirectoryLabel,
                let sanitized = WorkingDirectoryLabelSanitizer.label(fromComponent: label) {
-                return sanitized
+                return (sanitized, inherited)
             }
 
             let parentPID = current.parentPID
@@ -711,6 +1111,7 @@ public struct WorkloadGrouper: Sendable {
                 return nil
             }
             current = parent
+            inherited = true
         }
     }
 
@@ -723,6 +1124,160 @@ public struct WorkloadGrouper: Sendable {
             parentPID = parent.parentPID
         }
         return names
+    }
+
+    private func parentChain(for process: ProcessSnapshot, byPID: [Int32: ProcessSnapshot]) -> [String] {
+        ancestorNames(for: process, byPID: byPID)
+            .dropFirst()
+            .prefix(8)
+            .compactMap { WorkingDirectoryLabelSanitizer.label(fromComponent: $0) }
+    }
+
+    private static func saturatingAdd(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
+        let (value, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? UInt64.max : value
+    }
+}
+
+/// A complete sampling pass. Every source has its own status so a failure in
+/// process enumeration cannot discard otherwise valid system metrics.
+public struct MonitorSnapshot: Sendable, Equatable {
+    public let timestamp: Date
+    public let system: SystemMemorySnapshot?
+    public let systemStatus: SampleStatus
+    public let cpuTime: CPUTimeSnapshot?
+    public let cpuStatus: SampleStatus
+    public let gpuUsageFraction: Double?
+    public let gpuStatus: SampleStatus
+    public let processes: [ProcessSnapshot]
+    public let processStatus: SampleStatus
+    public let listedProcessCount: Int
+    public let sampledProcessCount: Int
+    public let groups: [WorkloadGroupSnapshot]
+
+    public var processCount: Int { sampledProcessCount }
+
+    public init(
+        timestamp: Date,
+        system: SystemMemorySnapshot?,
+        systemStatus: SampleStatus,
+        cpuTime: CPUTimeSnapshot?,
+        cpuStatus: SampleStatus,
+        gpuUsageFraction: Double?,
+        gpuStatus: SampleStatus,
+        processes: [ProcessSnapshot],
+        processStatus: SampleStatus,
+        listedProcessCount: Int,
+        sampledProcessCount: Int,
+        groups: [WorkloadGroupSnapshot]
+    ) {
+        self.timestamp = timestamp
+        self.system = system
+        self.systemStatus = systemStatus
+        self.cpuTime = cpuTime
+        self.cpuStatus = cpuStatus
+        self.gpuUsageFraction = gpuUsageFraction
+        self.gpuStatus = gpuStatus
+        self.processes = processes
+        self.processStatus = processStatus
+        self.listedProcessCount = max(listedProcessCount, 0)
+        self.sampledProcessCount = max(sampledProcessCount, 0)
+        self.groups = groups
+    }
+}
+
+/// Coordinates independent native samplers and degrades each source in
+/// isolation. Providers are injectable to keep failure behavior testable
+/// without trying to manufacture kernel or IORegistry failures.
+public struct MonitorSampler: Sendable {
+    private let systemProvider: @Sendable () throws -> SystemMemorySnapshot
+    private let cpuProvider: @Sendable () throws -> CPUTimeSnapshot
+    private let gpuProvider: @Sendable () -> GPUUsageSample
+    private let processProvider: @Sendable () throws -> ProcessSamplingResult
+    private let grouper: WorkloadGrouper
+
+    public init(
+        systemSampler: @escaping @Sendable () throws -> SystemMemorySnapshot = {
+            try SystemMemorySampler().sample()
+        },
+        cpuSampler: @escaping @Sendable () throws -> CPUTimeSnapshot = {
+            try CPUTimeSampler().sample()
+        },
+        gpuSampler: @escaping @Sendable () -> GPUUsageSample = {
+            GPUUsageSampler().sampleDetailed()
+        },
+        processSampler: @escaping @Sendable () throws -> ProcessSamplingResult = {
+            try ProcessSampler().sampleDetailed()
+        },
+        grouper: WorkloadGrouper = WorkloadGrouper()
+    ) {
+        self.systemProvider = systemSampler
+        self.cpuProvider = cpuSampler
+        self.gpuProvider = gpuSampler
+        self.processProvider = processSampler
+        self.grouper = grouper
+    }
+
+    public func sample(at timestamp: Date = Date()) -> MonitorSnapshot {
+        var system: SystemMemorySnapshot?
+        let systemStatus: SampleStatus
+        do {
+            let value = try systemProvider()
+            guard value.isStructurallyValid else {
+                throw MemoryMonitorError.invalidData(description: "系统内存采样返回了无效数据")
+            }
+            system = value
+            systemStatus = SampleStatus.estimated(
+                at: value.timestamp,
+                message: "内存使用率按可回收内存估算"
+            )
+        } catch {
+            systemStatus = Self.errorStatus(for: error)
+        }
+
+        var cpuTime: CPUTimeSnapshot?
+        let cpuStatus: SampleStatus
+        do {
+            cpuTime = try cpuProvider()
+            cpuStatus = SampleStatus.available(at: timestamp)
+        } catch {
+            cpuStatus = Self.errorStatus(for: error)
+        }
+
+        let gpuSample = gpuProvider()
+
+        var processes: [ProcessSnapshot] = []
+        var processStatus: SampleStatus
+        var listedProcessCount = 0
+        var sampledProcessCount = 0
+        do {
+            let result = try processProvider()
+            processes = result.processes.sorted(by: ProcessSnapshot.memoryDescending)
+            processStatus = result.status
+            listedProcessCount = result.listedProcessCount
+            sampledProcessCount = processes.count
+        } catch {
+            processStatus = Self.errorStatus(for: error)
+        }
+
+        return MonitorSnapshot(
+            timestamp: timestamp,
+            system: system,
+            systemStatus: systemStatus,
+            cpuTime: cpuTime,
+            cpuStatus: cpuStatus,
+            gpuUsageFraction: gpuSample.fraction,
+            gpuStatus: gpuSample.status,
+            processes: processes,
+            processStatus: processStatus,
+            listedProcessCount: listedProcessCount,
+            sampledProcessCount: sampledProcessCount,
+            groups: grouper.group(processes)
+        )
+    }
+
+    private static func errorStatus(for error: Error) -> SampleStatus {
+        SampleStatus.error(error.localizedDescription)
     }
 }
 
