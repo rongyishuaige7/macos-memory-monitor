@@ -248,6 +248,231 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertTrue(processes.contains { $0.identity.pid == getpid() })
     }
 
+    func testProcessSamplerCanReadOneCurrentProcessByPID() throws {
+        let process = try XCTUnwrap(ProcessSampler().sample(pid: getpid()))
+        XCTAssertEqual(process.identity.pid, getpid())
+        XCTAssertGreaterThan(process.identity.startTimeSeconds, 0)
+    }
+
+    func testProcessActionPolicyAllowsCurrentUserProcess() {
+        let process = makeProcess(pid: 700, name: "worker", footprint: 100)
+        let validation = ProcessActionPolicy(currentUserID: 501, monitorPID: 999)
+            .validate(expected: process, current: process)
+
+        XCTAssertTrue(validation.allowed)
+        XCTAssertNil(validation.reason)
+    }
+
+    func testProcessActionPolicyRejectsOtherUsersAndProtectedProcesses() {
+        let otherUser = makeProcess(pid: 701, name: "worker", footprint: 100, userID: 502)
+        let systemFlagged = makeProcess(pid: 702, name: "worker", footprint: 100, isSystem: true)
+        let protectedName = makeProcess(pid: 703, name: "launchd", footprint: 100)
+        let protectedPath = makeProcess(
+            pid: 704,
+            name: "helper",
+            footprint: 100,
+            executablePath: "/usr/libexec/helper"
+        )
+        let policy = ProcessActionPolicy(currentUserID: 501, monitorPID: 999)
+
+        XCTAssertEqual(
+            policy.validate(expected: otherUser, current: otherUser).reason,
+            .userMismatch
+        )
+        XCTAssertEqual(
+            policy.validate(expected: systemFlagged, current: systemFlagged).reason,
+            .protectedProcess
+        )
+        XCTAssertEqual(
+            policy.validate(expected: protectedName, current: protectedName).reason,
+            .protectedProcess
+        )
+        XCTAssertEqual(
+            policy.validate(expected: protectedPath, current: protectedPath).reason,
+            .protectedProcess
+        )
+    }
+
+    func testProcessActionPolicyRejectsSelfAndMissingIdentityData() {
+        let selfProcess = makeProcess(pid: 705, name: "worker", footprint: 100)
+        let noPath = makeProcess(pid: 706, name: "worker", footprint: 100, omitExecutablePath: true)
+        let policy = ProcessActionPolicy(currentUserID: 501, monitorPID: 705)
+
+        XCTAssertEqual(
+            policy.validate(expected: selfProcess, current: selfProcess).reason,
+            .selfProcess
+        )
+        XCTAssertEqual(
+            policy.validate(expected: noPath, current: noPath).reason,
+            .executablePathUnavailable
+        )
+        XCTAssertEqual(
+            policy.validate(expected: selfProcess, current: nil).reason,
+            .missingSnapshot
+        )
+    }
+
+    func testProcessActionPolicyRejectsPIDParentAndPathChanges() {
+        let expected = makeProcess(pid: 707, name: "worker", parentPID: 10, footprint: 100)
+        let identityChanged = makeProcess(
+            pid: 707,
+            name: "worker",
+            parentPID: 10,
+            footprint: 100,
+            startTimeSeconds: 2
+        )
+        let parentChanged = makeProcess(pid: 707, name: "worker", parentPID: 11, footprint: 100)
+        let pathChanged = makeProcess(
+            pid: 707,
+            name: "worker",
+            parentPID: 10,
+            footprint: 100,
+            executablePath: "/Users/test/bin/worker"
+        )
+        let policy = ProcessActionPolicy(currentUserID: 501, monitorPID: 999)
+
+        XCTAssertEqual(
+            policy.validate(expected: expected, current: identityChanged).reason,
+            .identityChanged
+        )
+        XCTAssertEqual(
+            policy.validate(expected: expected, current: parentChanged).reason,
+            .parentChanged
+        )
+        XCTAssertEqual(
+            policy.validate(expected: expected, current: pathChanged).reason,
+            .executablePathChanged
+        )
+    }
+
+    func testProcessActionPolicyRejectsInvalidIdentityUIDAndParent() {
+        let policy = ProcessActionPolicy(currentUserID: 501, monitorPID: 999)
+        let invalidPID = makeProcess(pid: 0, name: "worker", footprint: 100)
+        let invalidSeconds = makeProcess(
+            pid: 708,
+            name: "worker",
+            footprint: 100,
+            startTimeSeconds: 0
+        )
+        let invalidMicroseconds = makeProcess(
+            pid: 709,
+            name: "worker",
+            footprint: 100,
+            startTimeMicroseconds: 1_000_000
+        )
+        let rootProcess = makeProcess(pid: 710, name: "worker", footprint: 100, userID: 0)
+        let missingParent = makeProcess(pid: 711, name: "worker", parentPID: 0, footprint: 100)
+
+        XCTAssertEqual(
+            policy.validate(expected: invalidPID, current: invalidPID).reason,
+            .invalidIdentity
+        )
+        XCTAssertEqual(
+            policy.validate(expected: invalidSeconds, current: invalidSeconds).reason,
+            .invalidIdentity
+        )
+        XCTAssertEqual(
+            policy.validate(expected: invalidMicroseconds, current: invalidMicroseconds).reason,
+            .invalidIdentity
+        )
+        XCTAssertEqual(
+            policy.validate(expected: rootProcess, current: rootProcess).reason,
+            .protectedProcess
+        )
+        XCTAssertEqual(
+            policy.validate(expected: missingParent, current: missingParent).reason,
+            .parentUnavailable
+        )
+    }
+
+    func testProcessActionAuditEventRedactsIdentityDetails() throws {
+        let event = ProcessActionAuditEvent(
+            id: "event-1",
+            timestamp: Date(timeIntervalSince1970: 1_700_000_000),
+            action: .gracefulExit,
+            outcome: .failed,
+            processLabel: "worker",
+            applicationName: "Worker",
+            detail: "PID 12345 failed at /Users/test/project\u{001B}[31m"
+        )
+
+        XCTAssertFalse(event.detail.contains("12345"))
+        XCTAssertFalse(event.detail.contains("/Users/test"))
+        XCTAssertFalse(event.detail.unicodeScalars.contains { $0.value < 0x20 })
+
+        let encoder = JSONEncoder()
+        let encoded = try encoder.encode(event)
+        let payload = try XCTUnwrap(String(data: encoded, encoding: .utf8))
+        XCTAssertFalse(payload.contains("/Users/test"))
+        XCTAssertFalse(payload.contains("12345"))
+    }
+
+    func testProcessActionAuditEventSanitizesValuesWhenDecoded() throws {
+        let payload = """
+        {"id":"event-2","timestamp":"2023-11-14T22:13:20Z","action":"gracefulExit","outcome":"failed","processLabel":"worker","applicationName":"Worker","detail":"PID 9876 /Users/test/private"}
+        """.data(using: .utf8)!
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+
+        let event = try decoder.decode(ProcessActionAuditEvent.self, from: payload)
+        XCTAssertFalse(event.detail.contains("9876"))
+        XCTAssertFalse(event.detail.contains("/Users/test"))
+    }
+
+    func testProcessActionAuditStorePersistsWithRetentionLimitAndPermissions() async throws {
+        let paths = makeTemporaryActionURL()
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let store = ProcessActionAuditStore(
+            fileURL: paths.file,
+            retentionInterval: 1_000,
+            maximumEvents: 2
+        )
+
+        let old = makeAuditEvent(id: "old", timestamp: now.addingTimeInterval(-2_000))
+        let first = makeAuditEvent(id: "first", timestamp: now.addingTimeInterval(-10))
+        let second = makeAuditEvent(id: "second", timestamp: now)
+        _ = try await store.append(old, now: now)
+        _ = try await store.append(first, now: now)
+        let events = try await store.append(second, now: now)
+
+        XCTAssertEqual(events.map(\.id), ["second", "first"])
+        let reloaded = ProcessActionAuditStore(
+            fileURL: paths.file,
+            retentionInterval: 1_000,
+            maximumEvents: 2
+        )
+        let reloadedEvents = try await reloaded.load(now: now)
+        XCTAssertEqual(reloadedEvents.map(\.id), ["second", "first"])
+
+        let directoryAttributes = try FileManager.default.attributesOfItem(atPath: paths.directory.path)
+        let fileAttributes = try FileManager.default.attributesOfItem(atPath: paths.file.path)
+        let directoryMode = (directoryAttributes[.posixPermissions] as? NSNumber)?.intValue ?? 0
+        let fileMode = (fileAttributes[.posixPermissions] as? NSNumber)?.intValue ?? 0
+        XCTAssertEqual(directoryMode & 0o777, 0o700)
+        XCTAssertEqual(fileMode & 0o777, 0o600)
+    }
+
+    func testProcessActionAuditStoreRepairsIncompleteTail() async throws {
+        let paths = makeTemporaryActionURL()
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+        try FileManager.default.createDirectory(at: paths.directory, withIntermediateDirectories: true)
+        let event = makeAuditEvent(id: "valid", timestamp: Date(timeIntervalSince1970: 1_700_000_000))
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        var data = try encoder.encode(event)
+        data.append(0x0A)
+        data.append(contentsOf: Data(#"{"id":"incomplete"}"#.utf8).dropLast(2))
+        try data.write(to: paths.file)
+
+        let store = ProcessActionAuditStore(fileURL: paths.file)
+        let loaded = try await store.load(now: Date(timeIntervalSince1970: 1_700_000_000))
+        XCTAssertEqual(loaded.map(\.id), ["valid"])
+        let repaired = try Data(contentsOf: paths.file)
+        XCTAssertTrue(repaired.last == 0x0A)
+        XCTAssertFalse(String(data: repaired, encoding: .utf8)?.contains("incomplete") == true)
+    }
+
     func testWorkingDirectoryLabelSanitizerFiltersCommonRoots() {
         XCTAssertEqual(
             WorkingDirectoryLabelSanitizer.label(
@@ -1498,15 +1723,24 @@ final class MemoryMonitorCoreTests: XCTestCase {
         parentPID: Int32 = 1,
         footprint: UInt64,
         isSystem: Bool = false,
-        workingDirectoryLabel: String? = nil
+        workingDirectoryLabel: String? = nil,
+        userID: UInt32 = 501,
+        startTimeSeconds: UInt64 = 1,
+        startTimeMicroseconds: UInt64? = nil,
+        executablePath: String? = nil,
+        omitExecutablePath: Bool = false
     ) -> ProcessSnapshot {
         ProcessSnapshot(
-            identity: ProcessIdentity(pid: pid, startTimeSeconds: 1, startTimeMicroseconds: UInt64(pid)),
+            identity: ProcessIdentity(
+                pid: pid,
+                startTimeSeconds: startTimeSeconds,
+                startTimeMicroseconds: startTimeMicroseconds ?? UInt64(max(pid, 0))
+            ),
             parentPID: parentPID,
-            userID: 501,
+            userID: userID,
             isSystem: isSystem,
             name: name,
-            executablePath: "/usr/bin/\(name)",
+            executablePath: omitExecutablePath ? nil : (executablePath ?? "/usr/bin/\(name)"),
             residentBytes: footprint,
             physicalFootprintBytes: footprint,
             workingDirectoryLabel: workingDirectoryLabel,
@@ -1517,9 +1751,26 @@ final class MemoryMonitorCoreTests: XCTestCase {
         )
     }
 
+    private func makeAuditEvent(id: String, timestamp: Date) -> ProcessActionAuditEvent {
+        ProcessActionAuditEvent(
+            id: id,
+            timestamp: timestamp,
+            action: .gracefulExit,
+            outcome: .completed,
+            processLabel: "worker",
+            detail: "请求已完成"
+        )
+    }
+
     private func makeTemporaryHistoryURL() -> (file: URL, directory: URL) {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("MemoryMonitorTests-" + UUID().uuidString, isDirectory: true)
         return (directory.appendingPathComponent("history.json"), directory)
+    }
+
+    private func makeTemporaryActionURL() -> (file: URL, directory: URL) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MemoryMonitorActionTests-" + UUID().uuidString, isDirectory: true)
+        return (directory.appendingPathComponent("actions.jsonl"), directory)
     }
 }

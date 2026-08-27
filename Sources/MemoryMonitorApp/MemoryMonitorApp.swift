@@ -1,6 +1,7 @@
 import AppKit
 import Charts
 import Combine
+import Darwin
 import Foundation
 import MemoryMonitorCore
 import SwiftUI
@@ -55,6 +56,7 @@ final class MonitorViewModel: ObservableObject {
     )
     @Published private(set) var recommendation: MemoryRecommendation?
 
+    let processActions: ProcessActionController
     private var refreshTask: Task<Void, Never>?
     private let sampler = MonitorSampler()
     private let samplingPolicy = AdaptiveSamplingPolicy()
@@ -77,6 +79,7 @@ final class MonitorViewModel: ObservableObject {
     private let recommendationCooldown: TimeInterval = 30 * 60
 
     init() {
+        processActions = ProcessActionController()
         refreshTask = Task { [weak self] in
             await self?.refreshLoop()
         }
@@ -573,7 +576,11 @@ private struct MonitorPopover: View {
         .sheet(item: $detailSelection) { selection in
             switch selection {
             case .process(let identity):
-                ProcessDetailView(model: model, identity: identity)
+                ProcessDetailView(
+                    model: model,
+                    actions: model.processActions,
+                    identity: identity
+                )
             case .group(let groupID):
                 WorkloadGroupDetailView(model: model, groupID: groupID)
             }
@@ -911,7 +918,7 @@ private struct MonitorPopover: View {
     private var footer: some View {
         HStack {
             VStack(alignment: .leading, spacing: 2) {
-                Text("只读监视 · \(model.samplingCadenceDescription)")
+            Text("本地监视 · 操作需确认 · \(model.samplingCadenceDescription)")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                 Text(model.samplingDiagnosticsDescription)
@@ -929,8 +936,11 @@ private struct MonitorPopover: View {
 
 private struct ProcessDetailView: View {
     @ObservedObject var model: MonitorViewModel
+    @ObservedObject var actions: ProcessActionController
     let identity: ProcessIdentity
     @Environment(\.dismiss) private var dismiss
+    @State private var showGracefulConfirmation = false
+    @State private var showForceConfirmation = false
 
     var body: some View {
         Group {
@@ -961,9 +971,33 @@ private struct ProcessDetailView: View {
                 identitySection(process)
                 groupSection(process)
                 parentSection(process)
-                readOnlyNotice
+                processActionSection(process)
             }
             .padding(20)
+        }
+        .confirmationDialog(
+            "确认请求优雅退出？",
+            isPresented: $showGracefulConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("请求优雅退出", role: .destructive) {
+                actions.requestGracefulExit(for: process)
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("应用或进程会先收到正常退出请求，并有机会保存数据。若在约 \(Int(actions.gracefulTimeoutForDisplay)) 秒内仍未退出，才会出现强制结束选项。")
+        }
+        .confirmationDialog(
+            "确认强制结束？",
+            isPresented: $showForceConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("强制结束", role: .destructive) {
+                actions.requestForceTerminate(for: process)
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("这会立即终止进程，可能丢失未保存的数据。执行前会再次校验进程身份。")
         }
     }
 
@@ -1083,14 +1117,92 @@ private struct ProcessDetailView: View {
         }
     }
 
-    private var readOnlyNotice: some View {
-        Label("当前版本只读：不会退出、强制结束或修改任何进程。", systemImage: "lock.shield")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
-            .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 7))
+    @ViewBuilder
+    private func processActionSection(_ process: ProcessSnapshot) -> some View {
+        let validation = actions.eligibility(for: process)
+        DetailSection(title: "进程操作") {
+            if validation.allowed {
+                Text("仅允许当前用户的非系统进程。每次发送信号前都会重新校验启动身份、父 PID 和可执行路径。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let status = actions.status(for: process.identity) {
+                    ProcessActionStatusRow(status: status)
+                }
+
+                HStack(spacing: 8) {
+                    Button {
+                        showGracefulConfirmation = true
+                    } label: {
+                        Label("请求优雅退出", systemImage: "rectangle.portrait.and.arrow.right")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(actions.isBusy || actions.canForceTerminate(for: process.identity))
+                    .help("先请求应用正常退出")
+
+                    if actions.canForceTerminate(for: process.identity) {
+                        Button(role: .destructive) {
+                            showForceConfirmation = true
+                        } label: {
+                            Label("强制结束", systemImage: "xmark.octagon")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .help("仅在优雅退出超时后使用")
+                    }
+                }
+
+                recentActionSection
+            } else {
+                Label(validation.message, systemImage: "lock.shield")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("此进程仍可观察；为保护系统或避免身份不完整，不提供退出或强制结束入口。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var recentActionSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("最近操作记录")
+                    .font(.caption.weight(.medium))
+                Spacer()
+                if let error = actions.auditError {
+                    Text("记录受限")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                        .help(error)
+                }
+            }
+            if actions.recentEvents.isEmpty {
+                Text("暂无已确认的操作记录")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(Array(actions.recentEvents.prefix(5))) { event in
+                    HStack(spacing: 6) {
+                        Text(event.action.displayName)
+                            .font(.caption2.weight(.medium))
+                        Text(event.processLabel)
+                            .font(.caption2)
+                            .lineLimit(1)
+                        Spacer(minLength: 4)
+                        Text(event.outcome.displayName)
+                            .font(.caption2)
+                            .foregroundStyle(actionOutcomeColor(event.outcome))
+                        Text(event.timestamp, style: .time)
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .padding(.top, 4)
     }
 
     private var processGoneContent: some View {
@@ -1104,7 +1216,10 @@ private struct ProcessDetailView: View {
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            readOnlyNotice
+            Label("进程不在当前快照中，因此没有可执行操作。", systemImage: "lock.shield")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -1380,7 +1495,7 @@ private struct WorkloadGroupDetailView: View {
     }
 
     private var readOnlyNotice: some View {
-        Label("当前版本只读：不会退出、强制结束或修改任何进程。", systemImage: "lock.shield")
+        Label("工作组详情不提供批量操作；请在单个用户进程详情中逐次确认。", systemImage: "lock.shield")
             .font(.caption)
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
@@ -1409,6 +1524,29 @@ private struct DetailSection<Content: View>: View {
             VStack(alignment: .leading, spacing: 7, content: content)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct ProcessActionStatusRow: View {
+    let status: ProcessActionStatus
+
+    private var color: Color {
+        switch status.tone {
+        case .neutral: return .secondary
+        case .success: return .green
+        case .warning: return .orange
+        case .failure: return .red
+        }
+    }
+
+    var body: some View {
+        Label(status.message, systemImage: status.tone.iconName)
+            .font(.caption)
+            .foregroundStyle(color)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(color.opacity(0.10), in: RoundedRectangle(cornerRadius: 7))
     }
 }
 
@@ -1901,6 +2039,15 @@ private func recommendationIcon(_ severity: RecommendationSeverity) -> String {
     case .info: return "info.circle"
     case .attention: return "exclamationmark.triangle"
     case .critical: return "bolt.trianglebadge.exclamationmark"
+    }
+}
+
+private func actionOutcomeColor(_ outcome: ProcessActionOutcome) -> Color {
+    switch outcome {
+    case .completed: return .green
+    case .timedOut: return .orange
+    case .denied, .failed: return .red
+    case .cancelled: return .secondary
     }
 }
 

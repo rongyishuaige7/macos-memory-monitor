@@ -665,6 +665,282 @@ public struct ProcessSnapshot: Codable, Sendable, Identifiable, Equatable {
     }
 }
 
+public enum ProcessActionKind: String, Codable, Sendable, Equatable {
+    case gracefulExit
+    case forceTerminate
+
+    public var displayName: String {
+        switch self {
+        case .gracefulExit: return "优雅退出"
+        case .forceTerminate: return "强制结束"
+        }
+    }
+}
+
+public enum ProcessActionOutcome: String, Codable, Sendable, Equatable {
+    case completed
+    case timedOut
+    case denied
+    case failed
+    case cancelled
+
+    public var displayName: String {
+        switch self {
+        case .completed: return "已完成"
+        case .timedOut: return "等待超时"
+        case .denied: return "已拒绝"
+        case .failed: return "失败"
+        case .cancelled: return "已取消"
+        }
+    }
+}
+
+public enum ProcessActionBlockReason: String, Codable, Sendable, Equatable {
+    case missingSnapshot
+    case invalidIdentity
+    case identityChanged
+    case userMismatch
+    case protectedProcess
+    case selfProcess
+    case executablePathUnavailable
+    case executablePathChanged
+    case parentUnavailable
+    case parentChanged
+
+    public var displayMessage: String {
+        switch self {
+        case .missingSnapshot:
+            return "无法重新读取进程，进程可能已退出或受到权限限制。"
+        case .invalidIdentity:
+            return "无法确认进程的有效 PID 或启动时间，已拒绝操作。"
+        case .identityChanged:
+            return "进程启动身份已变化，已拒绝继续操作。"
+        case .userMismatch:
+            return "只允许操作当前登录用户的进程。"
+        case .protectedProcess:
+            return "系统或受保护进程不可操作。"
+        case .selfProcess:
+            return "不会操作 Memory Monitor 自身。"
+        case .executablePathUnavailable:
+            return "无法确认可执行路径，已拒绝操作。"
+        case .executablePathChanged:
+            return "可执行路径在确认前发生变化，已拒绝操作。"
+        case .parentUnavailable:
+            return "无法确认父进程关系，已拒绝操作。"
+        case .parentChanged:
+            return "父进程关系在确认前发生变化，已拒绝操作。"
+        }
+    }
+}
+
+/// Result of the final identity and safety check immediately before sending
+/// a termination request. A missing or changed field is a hard denial.
+public struct ProcessActionValidation: Codable, Sendable, Equatable {
+    public let allowed: Bool
+    public let reason: ProcessActionBlockReason?
+    public let message: String
+
+    public init(
+        allowed: Bool,
+        reason: ProcessActionBlockReason? = nil,
+        message: String
+    ) {
+        self.allowed = allowed
+        self.reason = reason
+        self.message = message
+    }
+
+    public static let allowedResult = ProcessActionValidation(
+        allowed: true,
+        message: "已通过身份和安全校验。"
+    )
+
+    public static func denied(_ reason: ProcessActionBlockReason) -> ProcessActionValidation {
+        ProcessActionValidation(
+            allowed: false,
+            reason: reason,
+            message: reason.displayMessage
+        )
+    }
+}
+
+/// Conservative policy for process controls. It intentionally rejects
+/// uncertain data instead of trying to infer whether a PID is safe to reuse.
+public struct ProcessActionPolicy: Sendable, Equatable {
+    public let currentUserID: UInt32
+    public let monitorPID: Int32?
+
+    public init(currentUserID: UInt32, monitorPID: Int32? = nil) {
+        self.currentUserID = currentUserID
+        self.monitorPID = monitorPID
+    }
+
+    public func validate(
+        expected: ProcessSnapshot,
+        current: ProcessSnapshot?
+    ) -> ProcessActionValidation {
+        guard let current else {
+            return .denied(.missingSnapshot)
+        }
+        guard Self.isValidIdentity(expected.identity),
+              Self.isValidIdentity(current.identity) else {
+            return .denied(.invalidIdentity)
+        }
+        guard expected.identity == current.identity else {
+            return .denied(.identityChanged)
+        }
+        guard expected.userID != 0, current.userID != 0 else {
+            return .denied(.protectedProcess)
+        }
+        guard expected.userID == current.userID, current.userID == currentUserID else {
+            return .denied(.userMismatch)
+        }
+        guard !expected.isSystem, !current.isSystem else {
+            return .denied(.protectedProcess)
+        }
+        if let monitorPID, current.identity.pid == monitorPID {
+            return .denied(.selfProcess)
+        }
+        guard expected.parentPID > 0, current.parentPID > 0 else {
+            return .denied(.parentUnavailable)
+        }
+        guard expected.parentPID == current.parentPID else {
+            return .denied(.parentChanged)
+        }
+        guard let expectedPath = expected.executablePath,
+              let currentPath = current.executablePath,
+              expectedPath.hasPrefix("/"),
+              currentPath.hasPrefix("/"),
+              !expectedPath.isEmpty,
+              !currentPath.isEmpty else {
+            return .denied(.executablePathUnavailable)
+        }
+        guard Self.normalizedPath(expectedPath) == Self.normalizedPath(currentPath) else {
+            return .denied(.executablePathChanged)
+        }
+        guard !Self.isProtected(process: current) else {
+            return .denied(.protectedProcess)
+        }
+        return .allowedResult
+    }
+
+    private static func normalizedPath(_ path: String) -> String {
+        URL(fileURLWithPath: path)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+            .path
+    }
+
+    private static func isValidIdentity(_ identity: ProcessIdentity) -> Bool {
+        identity.pid > 0
+            && identity.startTimeSeconds > 0
+            && identity.startTimeMicroseconds < 1_000_000
+    }
+
+    private static func isProtected(process: ProcessSnapshot) -> Bool {
+        let name = process.name.lowercased()
+        let executable = normalizedPath(process.executablePath ?? "").lowercased()
+        if protectedNames.contains(name) {
+            return true
+        }
+        return protectedPathPrefixes.contains { executable.hasPrefix($0) }
+    }
+
+    private static let protectedNames: Set<String> = [
+        "kernel_task",
+        "launchd",
+        "windowserver",
+        "controlcenter",
+        "runningboardd",
+        "loginwindow",
+        "memory-monitor-app"
+    ]
+
+    private static let protectedPathPrefixes = [
+        "/system/",
+        "/system/library/core services/",
+        "/system/library/launchservices/",
+        "/usr/libexec/",
+        "/private/var/db/"
+    ]
+}
+
+/// A privacy-preserving record of a user-confirmed action attempt. Process
+/// IDs, start times, command lines and paths are deliberately absent.
+public struct ProcessActionAuditEvent: Codable, Sendable, Equatable, Identifiable {
+    public let id: String
+    public let timestamp: Date
+    public let action: ProcessActionKind
+    public let outcome: ProcessActionOutcome
+    public let processLabel: String
+    public let applicationName: String?
+    public let detail: String
+
+    public init(
+        id: String = UUID().uuidString,
+        timestamp: Date = Date(),
+        action: ProcessActionKind,
+        outcome: ProcessActionOutcome,
+        processLabel: String,
+        applicationName: String? = nil,
+        detail: String
+    ) {
+        self.id = String(id.prefix(80))
+        self.timestamp = timestamp
+        self.action = action
+        self.outcome = outcome
+        self.processLabel = WorkingDirectoryLabelSanitizer.label(fromComponent: processLabel) ?? "未知进程"
+        self.applicationName = applicationName.flatMap(WorkingDirectoryLabelSanitizer.label(fromComponent:))
+        self.detail = Self.sanitizedDetail(detail)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case timestamp
+        case action
+        case outcome
+        case processLabel
+        case applicationName
+        case detail
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            id: try container.decode(String.self, forKey: .id),
+            timestamp: try container.decode(Date.self, forKey: .timestamp),
+            action: try container.decode(ProcessActionKind.self, forKey: .action),
+            outcome: try container.decode(ProcessActionOutcome.self, forKey: .outcome),
+            processLabel: try container.decode(String.self, forKey: .processLabel),
+            applicationName: try container.decodeIfPresent(String.self, forKey: .applicationName),
+            detail: try container.decode(String.self, forKey: .detail)
+        )
+    }
+
+    private static func sanitizedDetail(_ value: String) -> String {
+        let filtered = value.unicodeScalars.filter { scalar in
+            let code = scalar.value
+            return !(code < 0x20 || (0x7F...0x9F).contains(code))
+        }
+        var sanitized = String(String.UnicodeScalarView(filtered))
+
+        // Details are generated by the app today, but keep the storage type
+        // defensive if a future caller accidentally passes an identity value.
+        // Redact absolute paths and explicit PID labels before truncating.
+        sanitized = sanitized.replacingOccurrences(
+            of: #"(?i)\bpid\s*[:#]?\s*\d+\b"#,
+            with: "PID [已隐藏]",
+            options: .regularExpression
+        )
+        sanitized = sanitized.replacingOccurrences(
+            of: #"(?<![A-Za-z0-9_])/(?:[^\s/]+/)*[^\s]+"#,
+            with: "[路径已隐藏]",
+            options: .regularExpression
+        )
+        return String(sanitized.prefix(240))
+    }
+}
+
 public struct ProcessSamplingResult: Sendable, Equatable {
     public let processes: [ProcessSnapshot]
     public let listedProcessCount: Int
@@ -697,6 +973,15 @@ public struct ProcessSampler: Sendable {
 
     public func sample() throws -> [ProcessSnapshot] {
         try sampleDetailed().processes
+    }
+
+    /// Reads one process by PID for an immediate identity re-check before a
+    /// user-confirmed action. A nil result is intentionally ambiguous: the
+    /// caller must separately determine whether the process exited or became
+    /// unavailable.
+    public func sample(pid: Int32) -> ProcessSnapshot? {
+        guard pid > 0 else { return nil }
+        return snapshot(pid: pid_t(pid))
     }
 
     /// Enumerates all visible processes and reports processes that disappear
@@ -3058,6 +3343,239 @@ public actor HistoryStore {
         let cutoff = now.timeIntervalSince1970 - retentionInterval
         guard cutoff.isFinite else { return source }
         return source.filter { $0.timestamp.timeIntervalSince1970 >= cutoff }
+    }
+}
+
+public enum ProcessActionAuditStoreError: Error, CustomStringConvertible, LocalizedError, Sendable, Equatable {
+    case readFailed
+    case writeFailed
+    case invalidData
+
+    public var description: String {
+        switch self {
+        case .readFailed:
+            return "无法读取进程操作记录"
+        case .writeFailed:
+            return "无法写入进程操作记录"
+        case .invalidData:
+            return "进程操作记录格式无效或已损坏"
+        }
+    }
+
+    public var errorDescription: String? { description }
+}
+
+/// Small append-only audit log for explicitly confirmed process actions.
+/// Records are local, bounded, and contain no PID, start time, command line,
+/// executable path, or other process identity data.
+public actor ProcessActionAuditStore {
+    public static let defaultRetentionInterval: TimeInterval = 7 * 24 * 60 * 60
+    public static let defaultMaximumEvents = 200
+
+    public static var defaultFileURL: URL {
+        HistoryStore.defaultFileURL
+            .deletingLastPathComponent()
+            .appendingPathComponent("actions.jsonl", isDirectory: false)
+    }
+
+    public nonisolated let fileURL: URL
+    public let retentionInterval: TimeInterval
+    public let maximumEvents: Int
+
+    private var events: [ProcessActionAuditEvent] = []
+    private var hasLoaded = false
+
+    public init(
+        fileURL: URL = ProcessActionAuditStore.defaultFileURL,
+        retentionInterval: TimeInterval = ProcessActionAuditStore.defaultRetentionInterval,
+        maximumEvents: Int = ProcessActionAuditStore.defaultMaximumEvents
+    ) {
+        self.fileURL = fileURL
+        self.retentionInterval = max(retentionInterval, 0)
+        self.maximumEvents = max(maximumEvents, 1)
+    }
+
+    @discardableResult
+    public func load(now: Date = Date()) throws -> [ProcessActionAuditEvent] {
+        guard !hasLoaded else {
+            let prunedEvents = Self.pruned(events, now: now, retentionInterval: retentionInterval, limit: maximumEvents)
+            if prunedEvents != events {
+                events = prunedEvents
+                try persist()
+            }
+            return events
+        }
+
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: fileURL.path) else {
+            hasLoaded = true
+            return []
+        }
+
+        let data: Data
+        do {
+            data = try Data(contentsOf: fileURL)
+        } catch {
+            throw ProcessActionAuditStoreError.readFailed
+        }
+
+        let decoded = try decode(data)
+        events = Self.pruned(decoded.events, now: now, retentionInterval: retentionInterval, limit: maximumEvents)
+        hasLoaded = true
+
+        if decoded.validByteCount < data.count || events.count != decoded.events.count {
+            try persist()
+        } else if data.isEmpty {
+            try setFilePermissionsIfPresent()
+        }
+        return events
+    }
+
+    @discardableResult
+    public func append(
+        _ event: ProcessActionAuditEvent,
+        now: Date = Date()
+    ) throws -> [ProcessActionAuditEvent] {
+        if !hasLoaded {
+            _ = try load(now: now)
+        }
+
+        let beforeCount = events.count
+        events.append(event)
+        let prunedEvents = Self.pruned(events, now: now, retentionInterval: retentionInterval, limit: maximumEvents)
+        let requiresRewrite = prunedEvents.count != beforeCount + 1
+        events = prunedEvents
+
+        if requiresRewrite {
+            try persist()
+        } else {
+            try appendLine(event)
+        }
+        return events
+    }
+
+    public func flush() throws {
+        guard hasLoaded else { return }
+        try persist()
+    }
+
+    private struct DecodeResult {
+        let events: [ProcessActionAuditEvent]
+        let validByteCount: Int
+    }
+
+    private func decode(_ data: Data) throws -> DecodeResult {
+        guard !data.isEmpty else { return DecodeResult(events: [], validByteCount: 0) }
+
+        let lines = data.split(separator: 0x0A, omittingEmptySubsequences: false)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        var decoded: [ProcessActionAuditEvent] = []
+        var ignoredIncompleteTail = false
+
+        for index in lines.indices {
+            let line = lines[index]
+            guard !line.isEmpty else { continue }
+            do {
+                decoded.append(try decoder.decode(ProcessActionAuditEvent.self, from: Data(line)))
+            } catch {
+                let isLastLine = index == lines.index(before: lines.endIndex)
+                if isLastLine, data.last != 0x0A {
+                    ignoredIncompleteTail = true
+                    break
+                }
+                throw ProcessActionAuditStoreError.invalidData
+            }
+        }
+
+        let validByteCount: Int
+        if ignoredIncompleteTail, let lastNewline = data.lastIndex(of: 0x0A) {
+            validByteCount = data.distance(from: data.startIndex, to: lastNewline) + 1
+        } else if ignoredIncompleteTail {
+            validByteCount = 0
+        } else {
+            validByteCount = data.count
+        }
+        return DecodeResult(events: decoded, validByteCount: validByteCount)
+    }
+
+    private func appendLine(_ event: ProcessActionAuditEvent) throws {
+        do {
+            try prepareDirectory()
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            encoder.outputFormatting = [.sortedKeys]
+            var payload = try encoder.encode(event)
+            payload.append(0x0A)
+
+            let fileManager = FileManager.default
+            if fileManager.fileExists(atPath: fileURL.path) {
+                let handle = try FileHandle(forWritingTo: fileURL)
+                defer { try? handle.close() }
+                try handle.seekToEnd()
+                try handle.write(contentsOf: payload)
+                try handle.synchronize()
+            } else {
+                try payload.write(to: fileURL, options: [.atomic])
+            }
+            try setFilePermissionsIfPresent()
+        } catch {
+            throw ProcessActionAuditStoreError.writeFailed
+        }
+    }
+
+    private func persist() throws {
+        do {
+            try prepareDirectory()
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            encoder.outputFormatting = [.sortedKeys]
+            var payload = Data()
+            for event in events {
+                payload.append(try encoder.encode(event))
+                payload.append(0x0A)
+            }
+            try payload.write(to: fileURL, options: [.atomic])
+            try setFilePermissionsIfPresent()
+        } catch {
+            throw ProcessActionAuditStoreError.writeFailed
+        }
+    }
+
+    private func prepareDirectory() throws {
+        let directory = fileURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: directory.path
+        )
+    }
+
+    private func setFilePermissionsIfPresent() throws {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: fileURL.path
+        )
+    }
+
+    private static func pruned(
+        _ source: [ProcessActionAuditEvent],
+        now: Date,
+        retentionInterval: TimeInterval,
+        limit: Int
+    ) -> [ProcessActionAuditEvent] {
+        let cutoff = now.timeIntervalSince1970 - retentionInterval
+        let retained = source
+            .filter { event in
+                let timestamp = event.timestamp.timeIntervalSince1970
+                return timestamp.isFinite && timestamp >= cutoff
+            }
+            .sorted {
+                if $0.timestamp != $1.timestamp { return $0.timestamp > $1.timestamp }
+                return $0.id < $1.id
+            }
+        return Array(retained.prefix(limit))
     }
 }
 
