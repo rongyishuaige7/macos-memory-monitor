@@ -4221,6 +4221,10 @@ public struct MemoryHistoryAnalyzer: Sendable {
     public static let defaultSwapAttentionThresholdBytes: UInt64 = 1 * 1024 * 1024 * 1024
     public static let defaultSwapCriticalThresholdBytes: UInt64 = 4 * 1024 * 1024 * 1024
     public static let defaultWorkloadTransitionGapSeconds: TimeInterval = 5 * 60
+    /// A workload marker must describe an observation near the minute record
+    /// that carries it. This prevents an old or future process snapshot from
+    /// being interpreted as a change in the current history bucket.
+    public static let defaultWorkloadMarkerRecordSkewSeconds: TimeInterval = 5 * 60
 
     public let eventLimit: Int
     public let workloadEventThresholdBytes: UInt64
@@ -4228,6 +4232,7 @@ public struct MemoryHistoryAnalyzer: Sendable {
     public let swapAttentionThresholdBytes: UInt64
     public let swapCriticalThresholdBytes: UInt64
     public let workloadTransitionGapSeconds: TimeInterval
+    public let workloadMarkerRecordSkewSeconds: TimeInterval
 
     public init(
         eventLimit: Int = MemoryHistoryAnalyzer.defaultEventLimit,
@@ -4235,7 +4240,8 @@ public struct MemoryHistoryAnalyzer: Sendable {
         workloadGrowthThresholdBytes: UInt64 = MemoryHistoryAnalyzer.defaultWorkloadGrowthThresholdBytes,
         swapAttentionThresholdBytes: UInt64 = MemoryHistoryAnalyzer.defaultSwapAttentionThresholdBytes,
         swapCriticalThresholdBytes: UInt64 = MemoryHistoryAnalyzer.defaultSwapCriticalThresholdBytes,
-        workloadTransitionGapSeconds: TimeInterval = MemoryHistoryAnalyzer.defaultWorkloadTransitionGapSeconds
+        workloadTransitionGapSeconds: TimeInterval = MemoryHistoryAnalyzer.defaultWorkloadTransitionGapSeconds,
+        workloadMarkerRecordSkewSeconds: TimeInterval = MemoryHistoryAnalyzer.defaultWorkloadMarkerRecordSkewSeconds
     ) {
         self.eventLimit = max(eventLimit, 1)
         self.workloadEventThresholdBytes = workloadEventThresholdBytes
@@ -4244,6 +4250,10 @@ public struct MemoryHistoryAnalyzer: Sendable {
         self.swapCriticalThresholdBytes = max(swapCriticalThresholdBytes, swapAttentionThresholdBytes)
         self.workloadTransitionGapSeconds = max(
             workloadTransitionGapSeconds.isFinite ? workloadTransitionGapSeconds : 0,
+            0
+        )
+        self.workloadMarkerRecordSkewSeconds = max(
+            workloadMarkerRecordSkewSeconds.isFinite ? workloadMarkerRecordSkewSeconds : 0,
             0
         )
     }
@@ -4288,7 +4298,7 @@ public struct MemoryHistoryAnalyzer: Sendable {
         // source markers.
         var previousWorkloadObservation: MemoryHistoryRecord?
         for current in normalizedRecords {
-            guard current.workloadInventoryIsComplete == true,
+            guard isValidWorkloadObservation(current),
                   let currentSampleAt = current.workloadsSampledAt else {
                 continue
             }
@@ -4300,8 +4310,13 @@ public struct MemoryHistoryAnalyzer: Sendable {
             // A duplicate or rolled-back marker is not a new observation and
             // must not replace the valid baseline.
             guard currentSampleAt > previousSampleAt else { continue }
-            let gap = currentSampleAt.timeIntervalSince(previousSampleAt)
-            if gap.isFinite, gap <= workloadTransitionGapSeconds {
+            let markerGap = currentSampleAt.timeIntervalSince(previousSampleAt)
+            let recordGap = current.timestamp.timeIntervalSince(previous.timestamp)
+            if markerGap.isFinite,
+               markerGap <= workloadTransitionGapSeconds,
+               recordGap.isFinite,
+               recordGap > 0,
+               recordGap <= workloadTransitionGapSeconds {
                 events.append(contentsOf: workloadEvents(previous: previous, current: current))
             }
             previousWorkloadObservation = current
@@ -4352,6 +4367,19 @@ public struct MemoryHistoryAnalyzer: Sendable {
         candidate: MemoryHistoryRecord
     ) -> MemoryHistoryRecord {
         HistoryStore.preferredRecord(existing: existing, candidate: candidate)
+    }
+
+    private func isValidWorkloadObservation(_ record: MemoryHistoryRecord) -> Bool {
+        guard record.workloadInventoryIsComplete == true,
+              let marker = record.workloadsSampledAt,
+              isPersistableDate(record.timestamp),
+              isPersistableDate(marker),
+              workloadMarkerRecordSkewSeconds.isFinite,
+              workloadMarkerRecordSkewSeconds >= 0 else {
+            return false
+        }
+        let skew = marker.timeIntervalSince(record.timestamp)
+        return skew.isFinite && abs(skew) <= workloadMarkerRecordSkewSeconds
     }
 
     private func pressure(for record: MemoryHistoryRecord) -> MemoryPressureLevel {
@@ -5040,6 +5068,10 @@ public actor HistoryStore {
     /// Tolerate a small clock skew, but never let a far-future sample stay in
     /// a retention window indefinitely.
     public static let maximumFutureSkew: TimeInterval = 5 * 60
+    /// Freshness markers describe the sample carried by a minute bucket. A
+    /// marker from a distant wall-clock era is rejected at write boundaries;
+    /// old files remain readable and are filtered by history analysis.
+    public static let maximumFreshnessMarkerRecordSkew: TimeInterval = 5 * 60
     /// Prevent floating-point retention arithmetic from overflowing and
     /// turning a bounded store into an effectively unbounded one.
     public static let maximumRetentionInterval: TimeInterval = 10 * 365 * 24 * 60 * 60
@@ -5660,6 +5692,7 @@ public actor HistoryStore {
         } ?? true
         guard isPersistableDate(now),
               record.hasValidPersistedFields,
+              Self.hasFreshnessMarkersNearRecord(record),
               isWithinFutureSkew(record.timestamp, now: now, allowance: Self.maximumFutureSkew),
               sourceSampleIsFresh,
               workloadSampleIsFresh else {
@@ -5843,6 +5876,7 @@ public actor HistoryStore {
         guard isPersistableDate(now),
               incoming.allSatisfy({ record in
                   record.hasValidPersistedFields
+                      && Self.hasFreshnessMarkersNearRecord(record)
                       && isWithinFutureSkew(record.timestamp, now: now, allowance: Self.maximumFutureSkew)
                       && (record.sourceSampledAt.map {
                           isWithinFutureSkew($0, now: now, allowance: Self.maximumFutureSkew)
@@ -6487,6 +6521,25 @@ public actor HistoryStore {
             }
             return true
         }
+    }
+
+    private nonisolated static func hasFreshnessMarkersNearRecord(
+        _ record: MemoryHistoryRecord
+    ) -> Bool {
+        // Compare against the persisted minute bucket, rather than the
+        // caller's unnormalized subsecond timestamp.
+        let recordSeconds = minuteStart(record.timestamp).timeIntervalSince1970
+        guard recordSeconds.isFinite,
+              maximumFreshnessMarkerRecordSkew.isFinite,
+              maximumFreshnessMarkerRecordSkew >= 0 else {
+            return false
+        }
+        return [record.sourceSampledAt, record.workloadsSampledAt]
+            .compactMap { $0 }
+            .allSatisfy { marker in
+                let skew = marker.timeIntervalSince1970 - recordSeconds
+                return skew.isFinite && abs(skew) <= maximumFreshnessMarkerRecordSkew
+            }
     }
 }
 

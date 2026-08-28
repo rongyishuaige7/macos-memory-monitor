@@ -3548,6 +3548,139 @@ final class MemoryMonitorCoreTests: XCTestCase {
         })
     }
 
+    func testMemoryHistoryAnalyzerSkipsWorkloadMarkerFarFromRecordTimestamp() {
+        let base = Date(timeIntervalSince1970: 1_700_004_000)
+        let api = makePersistedWorkload(
+            id: "runtime-node-api",
+            title: "Node · api",
+            footprint: 200 * 1024 * 1024
+        )
+        let worker = makePersistedWorkload(
+            id: "runtime-python-worker",
+            title: "Python · worker",
+            footprint: 128 * 1024 * 1024
+        )
+        let baseline = MemoryHistoryRecord(
+            timestamp: base,
+            availableFraction: 0.4,
+            compressedBytes: 0,
+            swapUsedBytes: 0,
+            workloads: [api],
+            workloadsSampledAt: base,
+            workloadInventoryIsComplete: true,
+            sourceSampledAt: base
+        )
+        let staleMarker = MemoryHistoryRecord(
+            timestamp: base.addingTimeInterval(60),
+            availableFraction: 0.4,
+            compressedBytes: 0,
+            swapUsedBytes: 0,
+            workloads: [api, worker],
+            workloadsSampledAt: base.addingTimeInterval(-8 * 60 * 60),
+            workloadInventoryIsComplete: true,
+            sourceSampledAt: base.addingTimeInterval(60)
+        )
+
+        let events = MemoryHistoryAnalyzer().analyze([baseline, staleMarker]).events
+
+        XCTAssertFalse(events.contains {
+            $0.kind == .workloadAppeared
+                || $0.kind == .workloadDisappeared
+                || $0.kind == .workloadGrowth
+        })
+    }
+
+    func testMemoryHistoryAnalyzerRejectsLargeRecordGapWithCloseMarkers() {
+        let base = Date(timeIntervalSince1970: 1_700_005_000)
+        let api = makePersistedWorkload(
+            id: "runtime-node-api",
+            title: "Node · api",
+            footprint: 200 * 1024 * 1024
+        )
+        let worker = makePersistedWorkload(
+            id: "runtime-python-worker",
+            title: "Python · worker",
+            footprint: 128 * 1024 * 1024
+        )
+        func record(
+            timestamp: Date,
+            marker: Date,
+            workloads: [PersistedWorkloadRecord]
+        ) -> MemoryHistoryRecord {
+            MemoryHistoryRecord(
+                timestamp: timestamp,
+                availableFraction: 0.4,
+                compressedBytes: 0,
+                swapUsedBytes: 0,
+                workloads: workloads,
+                workloadsSampledAt: marker,
+                workloadInventoryIsComplete: true,
+                sourceSampledAt: timestamp
+            )
+        }
+
+        let events = MemoryHistoryAnalyzer().analyze([
+            record(
+                timestamp: base,
+                marker: base.addingTimeInterval(4 * 60),
+                workloads: [api]
+            ),
+            record(
+                timestamp: base.addingTimeInterval(8 * 60),
+                marker: base.addingTimeInterval(5 * 60),
+                workloads: [api, worker]
+            )
+        ]).events
+
+        XCTAssertFalse(events.contains {
+            $0.kind == .workloadAppeared
+                || $0.kind == .workloadDisappeared
+                || $0.kind == .workloadGrowth
+        })
+    }
+
+    func testMemoryHistoryAnalyzerKeepsSubsecondMarkersNearMinuteRecord() {
+        let minute = Date(timeIntervalSince1970: 1_700_006_000)
+        let api = makePersistedWorkload(
+            id: "runtime-node-api",
+            title: "Node · api",
+            footprint: 200 * 1024 * 1024
+        )
+        let worker = makePersistedWorkload(
+            id: "runtime-python-worker",
+            title: "Python · worker",
+            footprint: 128 * 1024 * 1024
+        )
+        let firstAt = minute.addingTimeInterval(20.1)
+        let secondAt = minute.addingTimeInterval(20.9)
+        let events = MemoryHistoryAnalyzer().analyze([
+            MemoryHistoryRecord(
+                timestamp: firstAt,
+                availableFraction: 0.4,
+                compressedBytes: 0,
+                swapUsedBytes: 0,
+                workloads: [api],
+                workloadsSampledAt: firstAt,
+                workloadInventoryIsComplete: true,
+                sourceSampledAt: firstAt
+            ),
+            MemoryHistoryRecord(
+                timestamp: secondAt,
+                availableFraction: 0.4,
+                compressedBytes: 0,
+                swapUsedBytes: 0,
+                workloads: [api, worker],
+                workloadsSampledAt: secondAt,
+                workloadInventoryIsComplete: true,
+                sourceSampledAt: secondAt
+            )
+        ]).events
+
+        XCTAssertTrue(events.contains {
+            $0.kind == .workloadAppeared && $0.targetID == worker.id
+        })
+    }
+
     func testMemoryHistoryAnalyzerTreatsLegacyWorkloadCompletenessAsUnknown() throws {
         let base = Date(timeIntervalSince1970: 1_700_003_000)
         let api = makePersistedWorkload(
@@ -4478,6 +4611,29 @@ final class MemoryMonitorCoreTests: XCTestCase {
         do {
             _ = try await HistoryStore(fileURL: url).append(invalid, now: now)
             XCTFail("Expected invalid freshness marker to fail")
+        } catch let error as HistoryStoreError {
+            XCTAssertEqual(error, .invalidData)
+        }
+    }
+
+    func testHistoryStoreRejectsFreshnessMarkerFarFromRecordTimestamp() async throws {
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let now = Date(timeIntervalSince1970: 1_700_007_000)
+        let invalid = MemoryHistoryRecord(
+            timestamp: now,
+            availableFraction: 0.4,
+            compressedBytes: 0,
+            swapUsedBytes: 0,
+            workloads: [],
+            workloadsSampledAt: nil,
+            workloadInventoryIsComplete: nil,
+            sourceSampledAt: now.addingTimeInterval(-8 * 60 * 60)
+        )
+        do {
+            _ = try await HistoryStore(fileURL: url).append(invalid, now: now)
+            XCTFail("Expected freshness marker skew to fail")
         } catch let error as HistoryStoreError {
             XCTAssertEqual(error, .invalidData)
         }
