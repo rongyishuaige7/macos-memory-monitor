@@ -1117,6 +1117,7 @@ public enum ProcessActionBlockReason: String, Codable, Sendable, Equatable {
     case executablePathChanged
     case parentUnavailable
     case parentChanged
+    case kernelIdentityUnavailable
 
     public var displayMessage: String {
         switch self {
@@ -1140,6 +1141,8 @@ public enum ProcessActionBlockReason: String, Codable, Sendable, Equatable {
             return "无法确认父进程关系，已拒绝操作。"
         case .parentChanged:
             return "父进程关系在确认前发生变化，已拒绝操作。"
+        case .kernelIdentityUnavailable:
+            return "无法建立内核绑定的进程身份，已拒绝强制结束。"
         }
     }
 }

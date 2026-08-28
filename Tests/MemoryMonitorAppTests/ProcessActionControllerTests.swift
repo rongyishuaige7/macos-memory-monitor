@@ -119,6 +119,35 @@ final class ProcessActionControllerTests: XCTestCase {
         XCTAssertTrue(runtime.sentActions.isEmpty)
     }
 
+    func testIdentityChangeAtGracefulSignalBoundaryIsDenied() async throws {
+        let process = makeProcess(pid: 4120, name: "boundary-worker")
+        let runtime = FakeProcessActionRuntime()
+        runtime.setSamples([process], for: process.identity.pid)
+        runtime.gracefulResult = .denied(.identityChanged)
+        let paths = makeActionPaths()
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let controller = ProcessActionController(
+            currentUserID: process.userID,
+            monitorPID: 9999,
+            runtime: runtime,
+            auditStore: ProcessActionAuditStore(fileURL: paths.file)
+        )
+
+        controller.requestGracefulExit(for: process)
+        await waitUntil { !controller.isBusy }
+
+        guard case .denied(let identity, let message) = controller.state else {
+            return XCTFail("expected boundary identity denial, got \(controller.state)")
+        }
+        XCTAssertEqual(identity, process.identity)
+        XCTAssertTrue(message.contains("启动身份"))
+        await waitUntil {
+            controller.recentEvents.contains {
+                $0.action == .gracefulExit && $0.outcome == .denied
+            }
+        }
+    }
+
     func testForceVerificationRejectsChangedParentAndPath() async throws {
         let process = makeProcess(pid: 4107, name: "worker")
         let changed = ProcessSnapshot(
@@ -222,6 +251,39 @@ final class ProcessActionControllerTests: XCTestCase {
         }
         XCTAssertEqual(identity, process.identity)
         XCTAssertTrue(message.contains("错误码"))
+        XCTAssertEqual(runtime.sentActions, [.gracefulExit, .forceTerminate])
+    }
+
+    func testForceTerminationRejectsUnavailableKernelIdentityBinding() async throws {
+        let process = makeProcess(pid: 4121, name: "force-boundary-worker")
+        let runtime = FakeProcessActionRuntime()
+        runtime.advancePerSleep = 0.25
+        runtime.setSamples([process], for: process.identity.pid)
+        let paths = makeActionPaths()
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let controller = ProcessActionController(
+            currentUserID: process.userID,
+            monitorPID: 9999,
+            runtime: runtime,
+            auditStore: ProcessActionAuditStore(fileURL: paths.file),
+            gracefulTimeout: 1
+        )
+
+        controller.requestGracefulExit(for: process)
+        await waitUntil {
+            if case .timedOut = controller.state { return true }
+            return false
+        }
+
+        runtime.forceResult = .denied(.kernelIdentityUnavailable)
+        controller.requestForceTerminate(for: process)
+        await waitUntil { !controller.isBusy }
+
+        guard case .denied(let identity, let message) = controller.state else {
+            return XCTFail("expected kernel binding denial, got \(controller.state)")
+        }
+        XCTAssertEqual(identity, process.identity)
+        XCTAssertTrue(message.contains("内核绑定"))
         XCTAssertEqual(runtime.sentActions, [.gracefulExit, .forceTerminate])
     }
 

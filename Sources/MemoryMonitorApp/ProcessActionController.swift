@@ -1,4 +1,3 @@
-import AppKit
 import Combine
 import Darwin
 import Foundation
@@ -44,6 +43,7 @@ struct ProcessActionStatus {
 enum ProcessActionSignalResult: Equatable, Sendable {
     case sent
     case alreadyExited
+    case denied(ProcessActionBlockReason)
     case failed(Int32)
 }
 
@@ -72,9 +72,11 @@ protocol ProcessActionRuntime: AnyObject {
 @MainActor
 final class LiveProcessActionRuntime: ProcessActionRuntime {
     private let sampler: ProcessSampler
+    private let policy: ProcessActionPolicy
 
-    init(sampler: ProcessSampler = ProcessSampler()) {
+    init(sampler: ProcessSampler = ProcessSampler(), policy: ProcessActionPolicy) {
         self.sampler = sampler
+        self.policy = policy
     }
 
     func sample(pid: Int32) async -> ProcessSnapshot? {
@@ -91,27 +93,31 @@ final class LiveProcessActionRuntime: ProcessActionRuntime {
     }
 
     func sendGraceful(to process: ProcessSnapshot) async -> ProcessActionSignalResult {
-        if let application = guiApplication(for: process) {
-            if application.terminate() {
-                return .sent
-            }
-            return Self.processExistsSynchronously(process.identity.pid)
-                ? .failed(EIO)
-                : .alreadyExited
-        }
-        return sendDarwinSignal(SIGTERM, to: process.identity.pid)
+        let sampler = sampler
+        let policy = policy
+        return await Task.detached(priority: .userInitiated) {
+            Self.sendSignal(
+                SIGTERM,
+                to: process,
+                sampler: sampler,
+                policy: policy,
+                allowsUnboundFallback: true
+            )
+        }.value
     }
 
     func sendForce(to process: ProcessSnapshot) async -> ProcessActionSignalResult {
-        if let application = guiApplication(for: process) {
-            if application.forceTerminate() {
-                return .sent
-            }
-            return Self.processExistsSynchronously(process.identity.pid)
-                ? .failed(EIO)
-                : .alreadyExited
-        }
-        return sendDarwinSignal(SIGKILL, to: process.identity.pid)
+        let sampler = sampler
+        let policy = policy
+        return await Task.detached(priority: .userInitiated) {
+            Self.sendSignal(
+                SIGKILL,
+                to: process,
+                sampler: sampler,
+                policy: policy,
+                allowsUnboundFallback: false
+            )
+        }.value
     }
 
     func wallClockNow() -> Date { Date() }
@@ -124,25 +130,113 @@ final class LiveProcessActionRuntime: ProcessActionRuntime {
         try await Task.sleep(for: duration)
     }
 
-    private func guiApplication(for process: ProcessSnapshot) -> NSRunningApplication? {
-        guard process.identity.pid > 0,
-              let application = NSRunningApplication(
-                processIdentifier: pid_t(process.identity.pid)
-              ),
-              application.bundleIdentifier != nil,
-              application.activationPolicy != .prohibited else {
-            return nil
-        }
-        return application
+    private enum AuditTokenLookup {
+        case found(audit_token_t)
+        case unavailable
     }
 
-    private func sendDarwinSignal(_ signal: Int32, to pid: Int32) -> ProcessActionSignalResult {
+    /// Acquires a PID-version-bearing token before the last policy check. If
+    /// the PID is replaced at any point, either that check rejects the new
+    /// process or the token-bound signal fails without reaching the reuse.
+    nonisolated private static func sendSignal(
+        _ signal: Int32,
+        to expected: ProcessSnapshot,
+        sampler: ProcessSampler,
+        policy: ProcessActionPolicy,
+        allowsUnboundFallback: Bool
+    ) -> ProcessActionSignalResult {
+        let pid = expected.identity.pid
         guard pid > 0 else { return .failed(EINVAL) }
+
+        switch auditToken(for: pid) {
+        case .found(var auditToken):
+            guard let final = sampler.sample(pid: pid) else {
+                return missingFinalSnapshotResult(pid: pid)
+            }
+            let validation = policy.validate(expected: expected, current: final)
+            guard validation.allowed else {
+                return .denied(validation.reason ?? .identityChanged)
+            }
+            return sendAuditBoundSignal(signal, token: &auditToken)
+
+        case .unavailable:
+            guard allowsUnboundFallback else {
+                return processExistsSynchronously(pid)
+                    ? .denied(.kernelIdentityUnavailable)
+                    : .alreadyExited
+            }
+            guard let final = sampler.sample(pid: pid) else {
+                return missingFinalSnapshotResult(pid: pid)
+            }
+            let validation = policy.validate(expected: expected, current: final)
+            guard validation.allowed else {
+                return .denied(validation.reason ?? .identityChanged)
+            }
+            return sendDarwinSignal(signal, to: pid)
+        }
+    }
+
+    nonisolated private static func auditToken(for pid: Int32) -> AuditTokenLookup {
+        var task = mach_port_name_t(MACH_PORT_NULL)
+        let taskResult = task_name_for_pid(mach_task_self_, pid_t(pid), &task)
+        guard taskResult == KERN_SUCCESS,
+              task != mach_port_name_t(MACH_PORT_NULL) else {
+            return .unavailable
+        }
+        defer { mach_port_deallocate(mach_task_self_, task) }
+
+        var token = audit_token_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<audit_token_t>.size / MemoryLayout<natural_t>.size
+        )
+        let infoResult = withUnsafeMutablePointer(to: &token) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(
+                    task,
+                    task_flavor_t(TASK_AUDIT_TOKEN),
+                    $0,
+                    &count
+                )
+            }
+        }
+        guard infoResult == KERN_SUCCESS,
+              count == mach_msg_type_number_t(
+                MemoryLayout<audit_token_t>.size / MemoryLayout<natural_t>.size
+              ) else {
+            return .unavailable
+        }
+        return .found(token)
+    }
+
+    nonisolated private static func sendAuditBoundSignal(
+        _ signal: Int32,
+        token: inout audit_token_t
+    ) -> ProcessActionSignalResult {
+        let result = proc_signal_with_audittoken(&token, signal)
+        guard result != 0 else { return .sent }
+        let code = Int32(result == -1 ? Darwin.errno : result)
+        if code == ESRCH { return .alreadyExited }
+        if code == EINVAL { return .denied(.kernelIdentityUnavailable) }
+        return .failed(code)
+    }
+
+    nonisolated private static func sendDarwinSignal(
+        _ signal: Int32,
+        to pid: Int32
+    ) -> ProcessActionSignalResult {
         guard Darwin.kill(pid_t(pid), signal) == 0 else {
             let code = Int32(Darwin.errno)
             return code == ESRCH ? .alreadyExited : .failed(code)
         }
         return .sent
+    }
+
+    nonisolated private static func missingFinalSnapshotResult(
+        pid: Int32
+    ) -> ProcessActionSignalResult {
+        processExistsSynchronously(pid)
+            ? .denied(.kernelIdentityUnavailable)
+            : .alreadyExited
     }
 
     nonisolated private static func processExistsSynchronously(_ pid: Int32) -> Bool {
@@ -216,11 +310,15 @@ final class ProcessActionController: ObservableObject {
         gracefulTimeout: TimeInterval = 8,
         forceVerificationTimeout: TimeInterval = 2
     ) {
-        self.policy = ProcessActionPolicy(
+        let policy = ProcessActionPolicy(
             currentUserID: currentUserID,
             monitorPID: monitorPID
         )
-        self.runtime = runtime ?? LiveProcessActionRuntime(sampler: sampler)
+        self.policy = policy
+        self.runtime = runtime ?? LiveProcessActionRuntime(
+            sampler: sampler,
+            policy: policy
+        )
         self.auditStore = auditStore
         self.gracefulTimeout = min(
             max(gracefulTimeout.isFinite ? gracefulTimeout : 8, 1),
@@ -500,6 +598,13 @@ final class ProcessActionController: ObservableObject {
                 detail: "进程在请求发送前已经退出",
                 token: token
             )
+        case .denied(let reason):
+            await finishDenied(
+                expected: expected,
+                action: .gracefulExit,
+                reason: reason,
+                token: token
+            )
         case .failed(let code):
             await finish(
                 state: .failed(expected.identity, "优雅退出请求失败（系统错误码 \(code)）。"),
@@ -609,6 +714,13 @@ final class ProcessActionController: ObservableObject {
                 outcome: .completed,
                 process: expected,
                 detail: "进程在强制结束请求前已经退出",
+                token: token
+            )
+        case .denied(let reason):
+            await finishDenied(
+                expected: expected,
+                action: .forceTerminate,
+                reason: reason,
                 token: token
             )
         case .failed(let code):
