@@ -1808,6 +1808,9 @@ private struct MonitorPopover: View {
                 leftValue = $0.attributedResidentBytes
                 rightValue = $1.attributedResidentBytes
             }
+            if $0.containsEstimatedFootprint != $1.containsEstimatedFootprint {
+                return !$0.containsEstimatedFootprint
+            }
             if leftValue != rightValue {
                 return leftValue > rightValue
             }

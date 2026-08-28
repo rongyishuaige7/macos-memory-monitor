@@ -4672,6 +4672,47 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertEqual(group.processCount, group.memberProcessIdentities.count)
     }
 
+    func testWorkloadGrouperRanksExactFootprintsBeforeRSSFallbacks() {
+        let estimated = makeProcess(
+            pid: 811,
+            name: "estimated",
+            footprint: 900,
+            physicalFootprintIsEstimated: true
+        )
+        let exact = makeProcess(pid: 812, name: "exact", footprint: 100)
+
+        let groups = WorkloadGrouper().group([estimated, exact])
+
+        XCTAssertEqual(groups.map(\.containsEstimatedFootprint), [false, true])
+        XCTAssertEqual(groups.map(\.id), ["process-exact", "process-estimated"])
+    }
+
+    func testWorkloadTrendRanksExactGrowthBeforeEstimatedGrowth() {
+        let previousExact = makeGroup(id: "exact", title: "Exact", footprint: 100)
+        let currentExact = makeGroup(id: "exact", title: "Exact", footprint: 200)
+        let previousEstimated = makeGroup(
+            id: "estimated",
+            title: "Estimated",
+            footprint: 100,
+            containsEstimatedFootprint: true
+        )
+        let currentEstimated = makeGroup(
+            id: "estimated",
+            title: "Estimated",
+            footprint: 900,
+            containsEstimatedFootprint: true
+        )
+
+        let growth = WorkloadTrendAnalyzer().growingGroups(
+            previous: [previousExact, previousEstimated],
+            current: [currentExact, currentEstimated],
+            intervalSeconds: 60
+        )
+
+        XCTAssertEqual(growth.map(\.id), ["exact", "estimated"])
+        XCTAssertEqual(growth.first?.containsEstimatedFootprint, false)
+    }
+
     func testWorkloadGrouperUsesStableHighestConfidenceReasonWithinBucket() {
         let parent = makeProcess(
             pid: 901,

@@ -547,6 +547,7 @@ open "$HOME/Library/Application Support/MemoryMonitor/dist/MemoryMonitor.app"
 - 启动时会合并快照和 journal；如果进程在最后一行写入中退出，只截断不完整尾行并保留之前的有效记录；仅有 journal、缺少快照时也可以恢复。
 - 历史文件和 journal 继续使用本地 `Application Support/MemoryMonitor` 目录，目录权限为 `0700`，文件权限为 `0600`；`HistoryStoreDiagnostics` 可观察快照/journal 大小、待写记录和压缩次数。
 - 实时进程排行支持名称、应用、Bundle ID 和脱敏工作目录搜索，支持全部/用户/系统筛选，并可按 footprint 或 RSS 降序排列；工作组排行使用同一套排序和成员搜索规则。
+- 工作组和历史 Top 排名会先展示精确 footprint，再展示 RSS 估算值；不同口径不再仅按数值大小混排，增长趋势也沿用同一质量优先规则。
 - 点击进程可查看 footprint、RSS、虚拟内存、累计 CPU 时间、线程数、启动时间、应用身份、父进程链和当前工作组；点击工作组可查看归因依据、置信说明、成员明细、最近 24 小时 footprint/RSS 趋势及相关事件。
 - 详情只展示脱敏标签和汇总值，不写入 PID/启动时间到历史；进程或工作组离开当前快照时会明确标记为不可见，不把它误判为已退出。
 - 本阶段的实时监视与详情能力保持无副作用；进程操作在下一阶段单独加入并受独立安全策略约束。

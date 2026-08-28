@@ -1850,6 +1850,19 @@ public struct WorkloadGroupSnapshot: Codable, Sendable, Identifiable, Equatable 
     /// Sum of member RSS values attributed to this group.
     public var attributedResidentBytes: UInt64 { residentBytes }
 
+    /// Exact physical-footprint samples are not numerically comparable with
+    /// RSS fallbacks. Consumers that rank groups should place exact groups
+    /// first and only then compare the selected memory metric.
+    public static func qualityComesBefore(
+        _ lhs: WorkloadGroupSnapshot,
+        _ rhs: WorkloadGroupSnapshot
+    ) -> Bool {
+        if lhs.containsEstimatedFootprint != rhs.containsEstimatedFootprint {
+            return !lhs.containsEstimatedFootprint
+        }
+        return false
+    }
+
     public init(
         id: String,
         title: String,
@@ -1978,6 +1991,8 @@ public struct WorkloadGrouper: Sendable {
             )
         }
         .sorted {
+            if WorkloadGroupSnapshot.qualityComesBefore($0, $1) { return true }
+            if WorkloadGroupSnapshot.qualityComesBefore($1, $0) { return false }
             if $0.physicalFootprintBytes != $1.physicalFootprintBytes {
                 return $0.physicalFootprintBytes > $1.physicalFootprintBytes
             }
@@ -2626,19 +2641,46 @@ public struct WorkloadGrowth: Codable, Sendable, Equatable, Identifiable {
     public let deltaBytes: UInt64
     public let currentFootprintBytes: UInt64
     public let rateBytesPerSecond: Double
+    public let containsEstimatedFootprint: Bool
 
     public init(
         id: String,
         title: String,
         deltaBytes: UInt64,
         currentFootprintBytes: UInt64,
-        rateBytesPerSecond: Double
+        rateBytesPerSecond: Double,
+        containsEstimatedFootprint: Bool = false
     ) {
         self.id = id
         self.title = title
         self.deltaBytes = deltaBytes
         self.currentFootprintBytes = currentFootprintBytes
         self.rateBytesPerSecond = rateBytesPerSecond
+        self.containsEstimatedFootprint = containsEstimatedFootprint
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case deltaBytes
+        case currentFootprintBytes
+        case rateBytesPerSecond
+        case containsEstimatedFootprint
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            id: try container.decode(String.self, forKey: .id),
+            title: try container.decode(String.self, forKey: .title),
+            deltaBytes: try container.decode(UInt64.self, forKey: .deltaBytes),
+            currentFootprintBytes: try container.decode(UInt64.self, forKey: .currentFootprintBytes),
+            rateBytesPerSecond: try container.decode(Double.self, forKey: .rateBytesPerSecond),
+            containsEstimatedFootprint: try container.decodeIfPresent(
+                Bool.self,
+                forKey: .containsEstimatedFootprint
+            ) ?? false
+        )
     }
 }
 
@@ -2666,10 +2708,14 @@ public struct WorkloadTrendAnalyzer: Sendable {
                 title: group.title,
                 deltaBytes: delta,
                 currentFootprintBytes: group.physicalFootprintBytes,
-                rateBytesPerSecond: rate
+                rateBytesPerSecond: rate,
+                containsEstimatedFootprint: group.containsEstimatedFootprint
             )
         }
         .sorted {
+            if $0.containsEstimatedFootprint != $1.containsEstimatedFootprint {
+                return !$0.containsEstimatedFootprint
+            }
             if $0.rateBytesPerSecond != $1.rateBytesPerSecond {
                 return $0.rateBytesPerSecond > $1.rateBytesPerSecond
             }
@@ -4508,6 +4554,9 @@ public struct MemoryHistoryAnalyzer: Sendable {
     }
 
     private func workloadDescending(_ lhs: PersistedWorkloadRecord, _ rhs: PersistedWorkloadRecord) -> Bool {
+        if lhs.containsEstimatedFootprint != rhs.containsEstimatedFootprint {
+            return !lhs.containsEstimatedFootprint
+        }
         if lhs.attributedFootprintBytes != rhs.attributedFootprintBytes {
             return lhs.attributedFootprintBytes > rhs.attributedFootprintBytes
         }
@@ -6330,6 +6379,9 @@ public actor HistoryStore {
     ) -> [PersistedWorkloadRecord] {
         let safeLimit = max(limit, 1)
         let ranked = source.sorted {
+            if $0.containsEstimatedFootprint != $1.containsEstimatedFootprint {
+                return !$0.containsEstimatedFootprint
+            }
             if $0.attributedFootprintBytes != $1.attributedFootprintBytes {
                 return $0.attributedFootprintBytes > $1.attributedFootprintBytes
             }
@@ -6379,6 +6431,9 @@ public actor HistoryStore {
             )
         }
         return result.sorted {
+            if $0.containsEstimatedFootprint != $1.containsEstimatedFootprint {
+                return !$0.containsEstimatedFootprint
+            }
             if $0.attributedFootprintBytes != $1.attributedFootprintBytes {
                 return $0.attributedFootprintBytes > $1.attributedFootprintBytes
             }
