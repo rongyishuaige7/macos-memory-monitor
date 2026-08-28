@@ -758,7 +758,10 @@ enum AuditEventFilter: String, CaseIterable, Identifiable, Sendable {
         case .completed:
             return event.phase == .terminal && event.outcome == .completed
         case .attention:
-            return event.phase != .terminal || event.outcome != .completed
+            // Intent and signal-sent records are successful lifecycle stages,
+            // not attention-worthy outcomes. Only terminal failures,
+            // cancellations, and timeouts belong in this result filter.
+            return event.phase == .terminal && event.outcome != .completed
         }
     }
 }
