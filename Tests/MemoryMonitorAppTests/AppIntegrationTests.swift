@@ -1684,6 +1684,26 @@ final class AppIntegrationTests: XCTestCase {
             processLabel: "Chrome Helper",
             detail: "系统拒绝了请求"
         )
+        let intent = ProcessActionAuditEvent(
+            id: "intent",
+            operationID: "operation-1",
+            timestamp: now.addingTimeInterval(-20),
+            action: .gracefulExit,
+            phase: .intent,
+            outcome: .completed,
+            processLabel: "Node Worker",
+            detail: "用户已确认操作"
+        )
+        let sent = ProcessActionAuditEvent(
+            id: "sent",
+            operationID: "operation-1",
+            timestamp: now.addingTimeInterval(-10),
+            action: .gracefulExit,
+            phase: .signalSent,
+            outcome: .completed,
+            processLabel: "Node Worker",
+            detail: "已发送优雅退出请求"
+        )
 
         let attention = AuditEventFiltering.apply(
             events: [completed, failed],
@@ -1691,6 +1711,20 @@ final class AppIntegrationTests: XCTestCase {
             query: "chrome"
         )
         XCTAssertEqual(attention.map(\.id), ["failed"])
+
+        let inFlight = AuditEventFiltering.apply(
+            events: [completed, intent, sent],
+            filter: .completed,
+            query: ""
+        )
+        XCTAssertEqual(inFlight.map(\.id), ["completed"])
+
+        let allStages = AuditEventFiltering.apply(
+            events: [completed, intent, sent],
+            filter: .all,
+            query: ""
+        )
+        XCTAssertEqual(allStages.map(\.statusDisplayName), ["已发送", "已确认", "已完成"])
 
         let all = AuditEventFiltering.apply(
             events: [completed, failed],

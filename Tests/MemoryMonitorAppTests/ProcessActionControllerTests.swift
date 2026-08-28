@@ -464,6 +464,73 @@ final class ProcessActionControllerTests: XCTestCase {
         XCTAssertTrue(runtime.sentActions.isEmpty)
     }
 
+    func testFailedAuditEventRetriesBeforeLaterOperationWithSameEventID() async throws {
+        let first = makeProcess(pid: 4117, name: "first-audit")
+        let second = makeProcess(pid: 4118, name: "second-audit")
+        let runtime = FakeProcessActionRuntime()
+        runtime.setSamples([second, nil], for: second.identity.pid)
+        let paths = makeActionPaths()
+        try FileManager.default.createDirectory(at: paths.file, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let store = ProcessActionAuditStore(fileURL: paths.file)
+        let controller = ProcessActionController(
+            currentUserID: first.userID,
+            monitorPID: 9999,
+            runtime: runtime,
+            auditStore: store,
+            gracefulTimeout: 1
+        )
+
+        controller.requestGracefulExit(for: first)
+        await waitUntil { !controller.isBusy }
+        XCTAssertTrue(runtime.sentActions.isEmpty)
+        XCTAssertNotNil(controller.auditError)
+
+        try FileManager.default.removeItem(at: paths.file)
+        controller.requestGracefulExit(for: second)
+        await waitUntil {
+            if case .completed(let identity, let action, _) = controller.state {
+                return identity == second.identity && action == .gracefulExit
+            }
+            return false
+        }
+
+        let events = try await store.load(now: runtime.wallClockNow())
+        XCTAssertEqual(events.filter { $0.phase == .intent }.count, 2)
+        XCTAssertEqual(events.filter { $0.phase == .signalSent }.count, 1)
+        XCTAssertEqual(events.filter { $0.phase == .terminal }.count, 1)
+        XCTAssertEqual(Set(events.map(\.operationID)).count, 2)
+        XCTAssertEqual(runtime.sentActions, [.gracefulExit])
+        XCTAssertNil(controller.auditError)
+    }
+
+    func testShutdownRetriesFailedAuditEvent() async throws {
+        let process = makeProcess(pid: 4119, name: "shutdown-audit")
+        let runtime = FakeProcessActionRuntime()
+        let paths = makeActionPaths()
+        try FileManager.default.createDirectory(at: paths.file, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let store = ProcessActionAuditStore(fileURL: paths.file)
+        let controller = ProcessActionController(
+            currentUserID: process.userID,
+            monitorPID: 9999,
+            runtime: runtime,
+            auditStore: store
+        )
+
+        controller.requestGracefulExit(for: process)
+        await waitUntil { !controller.isBusy }
+        XCTAssertTrue(runtime.sentActions.isEmpty)
+
+        try FileManager.default.removeItem(at: paths.file)
+        await controller.shutdown()
+
+        let events = try await store.load(now: runtime.wallClockNow())
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(events[0].phase, .intent)
+        XCTAssertNil(controller.auditError)
+    }
+
     func testGracefulTimeoutDisplayClampsExtremeFiniteInput() {
         let runtime = FakeProcessActionRuntime()
         let controller = ProcessActionController(

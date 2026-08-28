@@ -303,6 +303,9 @@ final class ProcessActionController: ObservableObject {
     /// Every audit request gets a publication generation. A slower append or
     /// initial load must never put an older result back over a newer list.
     private var auditPublicationGeneration: UInt64 = 0
+    /// Events are created once and retained with their original IDs when a
+    /// write fails. Replaying the same event is idempotent in the audit store.
+    private var pendingAuditEvents: [String: ProcessActionAuditEvent] = [:]
 
     init(
         currentUserID: UInt32 = UInt32(getuid()),
@@ -570,6 +573,9 @@ final class ProcessActionController: ObservableObject {
     ) async {
         guard isCurrent(token) else { return }
 
+        await retryPendingAudits()
+        guard isCurrent(token), !Task.isCancelled else { return }
+
         guard await appendAuditIntent(
             action: .gracefulExit,
             process: expected,
@@ -723,6 +729,9 @@ final class ProcessActionController: ObservableObject {
         guard isCurrent(token), state == .forceTerminating(expected.identity) else {
             return
         }
+
+        await retryPendingAudits()
+        guard isCurrent(token), !Task.isCancelled else { return }
 
         guard await appendAuditIntent(
             action: .forceTerminate,
@@ -1000,12 +1009,15 @@ final class ProcessActionController: ObservableObject {
                 self.initialAuditLoadTask = nil
             }
             await self.drainBackgroundAuditTasks()
+            await self.retryPendingAudits()
 
             do {
                 let now = self.runtime.wallClockNow()
                 try await self.auditStore.flush(now: now)
                 self.recentEvents = try await self.auditStore.load(now: now)
-                self.auditError = nil
+                if self.pendingAuditEvents.isEmpty {
+                    self.auditError = nil
+                }
             } catch {
                 self.auditError = error.localizedDescription
             }
@@ -1027,6 +1039,7 @@ final class ProcessActionController: ObservableObject {
         let id = UUID()
         backgroundAuditTasks[id] = Task { @MainActor [weak self] in
             guard let self else { return }
+            await self.retryPendingAudits()
             _ = await self.appendAudit(
                 action: action,
                 outcome: outcome,
@@ -1055,8 +1068,6 @@ final class ProcessActionController: ObservableObject {
         operationID: String? = nil,
         phase: ProcessActionAuditPhase = .terminal
     ) async -> Bool {
-        auditPublicationGeneration &+= 1
-        let generation = auditPublicationGeneration
         let event = ProcessActionAuditEvent(
             operationID: operationID,
             action: action,
@@ -1066,14 +1077,29 @@ final class ProcessActionController: ObservableObject {
             applicationName: process.applicationName,
             detail: detail
         )
+        let result = await appendAuditEvent(event, queueOnFailure: true)
+        return result.appended
+    }
+
+    private func appendAuditEvent(
+        _ event: ProcessActionAuditEvent,
+        queueOnFailure: Bool
+    ) async -> (appended: Bool, published: Bool) {
+        auditPublicationGeneration &+= 1
+        let generation = auditPublicationGeneration
         do {
             // A durable append is the execution gate. A later UI reload may
             // fail without invalidating the fact that the intent was stored.
             _ = try await auditStore.append(event)
         } catch {
-            guard generation == auditPublicationGeneration else { return false }
+            if queueOnFailure {
+                pendingAuditEvents[event.id] = event
+            }
+            guard generation == auditPublicationGeneration else {
+                return (false, false)
+            }
             auditError = error.localizedDescription
-            return false
+            return (false, false)
         }
 
         do {
@@ -1082,14 +1108,42 @@ final class ProcessActionController: ObservableObject {
             // generation check below prevents a stale reload from replacing a
             // newer publication.
             let latestEvents = try await auditStore.load()
-            guard generation == auditPublicationGeneration else { return true }
+            guard generation == auditPublicationGeneration else {
+                return (true, false)
+            }
             recentEvents = latestEvents
-            auditError = nil
+            if pendingAuditEvents.isEmpty {
+                auditError = nil
+            }
         } catch {
-            guard generation == auditPublicationGeneration else { return true }
+            guard generation == auditPublicationGeneration else {
+                return (true, false)
+            }
             auditError = error.localizedDescription
+            return (true, false)
         }
-        return true
+        return (true, true)
+    }
+
+    /// Retries failed audit writes without manufacturing a new event ID. The
+    /// store's idempotent append handles a write that actually succeeded just
+    /// before its caller observed an error.
+    private func retryPendingAudits() async {
+        guard !pendingAuditEvents.isEmpty else { return }
+        let events = pendingAuditEvents.values.sorted {
+            if $0.timestamp != $1.timestamp { return $0.timestamp < $1.timestamp }
+            return $0.id < $1.id
+        }
+        for event in events {
+            guard pendingAuditEvents[event.id] != nil else { continue }
+            let result = await appendAuditEvent(event, queueOnFailure: false)
+            if result.appended {
+                pendingAuditEvents.removeValue(forKey: event.id)
+                if pendingAuditEvents.isEmpty, result.published {
+                    auditError = nil
+                }
+            }
+        }
     }
 
     /// The intent is a durable prerequisite for any sampling or signal
@@ -1117,11 +1171,14 @@ final class ProcessActionController: ObservableObject {
             let loadedEvents = try await auditStore.load()
             guard generation == auditPublicationGeneration else { return }
             recentEvents = loadedEvents
-            auditError = nil
+            if pendingAuditEvents.isEmpty {
+                auditError = nil
+            }
         } catch {
             guard generation == auditPublicationGeneration else { return }
             auditError = error.localizedDescription
         }
+        await retryPendingAudits()
     }
 
     private func isCurrent(_ token: UUID) -> Bool {
