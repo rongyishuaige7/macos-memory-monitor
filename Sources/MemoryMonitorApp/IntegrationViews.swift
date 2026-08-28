@@ -263,10 +263,14 @@ private struct AuditEventRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 9) {
-            Image(systemName: event.outcome == .completed
+            Image(systemName: event.phase == .terminal && event.outcome == .completed
                 ? "checkmark.circle"
-                : "exclamationmark.triangle")
-                .foregroundStyle(auditOutcomeColor(event.outcome))
+                : event.phase == .intent
+                    ? "checkmark.seal"
+                    : event.phase == .signalSent
+                        ? "paperplane.circle"
+                        : "exclamationmark.triangle")
+                .foregroundStyle(auditEventColor(event))
                 .frame(width: 17)
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
@@ -276,9 +280,9 @@ private struct AuditEventRow: View {
                         .font(.caption)
                         .lineLimit(1)
                     Spacer(minLength: 4)
-                    Text(event.outcome.displayName)
+                    Text(event.statusDisplayName)
                         .font(.caption2.weight(.medium))
-                        .foregroundStyle(auditOutcomeColor(event.outcome))
+                        .foregroundStyle(auditEventColor(event))
                 }
                 Text(event.detail)
                     .font(.caption2)
@@ -307,6 +311,17 @@ private func auditOutcomeColor(_ outcome: ProcessActionOutcome) -> Color {
     case .timedOut: return .orange
     case .denied, .failed: return .red
     case .cancelled: return .secondary
+    }
+}
+
+private func auditEventColor(_ event: ProcessActionAuditEvent) -> Color {
+    switch event.phase {
+    case .intent:
+        return .secondary
+    case .signalSent:
+        return .orange
+    case .terminal:
+        return auditOutcomeColor(event.outcome)
     }
 }
 

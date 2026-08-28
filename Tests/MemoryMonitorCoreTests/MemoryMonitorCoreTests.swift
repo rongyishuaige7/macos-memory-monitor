@@ -1316,6 +1316,8 @@ final class MemoryMonitorCoreTests: XCTestCase {
         """.utf8)
         let decodedLegacy = try decoder.decode(ProcessActionAuditEvent.self, from: legacyAuditEvent)
         XCTAssertNil(decodedLegacy.applicationName)
+        XCTAssertEqual(decodedLegacy.operationID, decodedLegacy.id)
+        XCTAssertEqual(decodedLegacy.phase, .terminal)
 
         let recommendationDecoder = JSONDecoder()
         recommendationDecoder.dateDecodingStrategy = .secondsSince1970

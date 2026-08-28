@@ -1106,6 +1106,22 @@ public enum ProcessActionOutcome: String, Codable, Sendable, Equatable {
     }
 }
 
+/// Lifecycle stage of a process-action audit record. Older JSONL records did
+/// not carry a stage and are decoded as terminal results.
+public enum ProcessActionAuditPhase: String, Codable, Sendable, Equatable {
+    case intent
+    case signalSent
+    case terminal
+
+    public var displayName: String {
+        switch self {
+        case .intent: return "已确认"
+        case .signalSent: return "已发送"
+        case .terminal: return "最终结果"
+        }
+    }
+}
+
 public enum ProcessActionBlockReason: String, Codable, Sendable, Equatable {
     case missingSnapshot
     case invalidIdentity
@@ -1278,28 +1294,40 @@ public struct ProcessActionPolicy: Sendable, Equatable {
 }
 
 /// A privacy-preserving record of a user-confirmed action attempt. Process
-/// IDs, start times, command lines and paths are deliberately absent.
+/// IDs, start times, command lines and paths are deliberately absent. The
+/// operation ID links the intent, signal-sent, and terminal records without
+/// exposing process identity.
 public struct ProcessActionAuditEvent: Codable, Sendable, Equatable, Identifiable {
     public let id: String
+    public let operationID: String
     public let timestamp: Date
     public let action: ProcessActionKind
+    public let phase: ProcessActionAuditPhase
     public let outcome: ProcessActionOutcome
     public let processLabel: String
     public let applicationName: String?
     public let detail: String
 
+    public var statusDisplayName: String {
+        phase == .terminal ? outcome.displayName : phase.displayName
+    }
+
     public init(
         id: String = UUID().uuidString,
+        operationID: String? = nil,
         timestamp: Date = Date(),
         action: ProcessActionKind,
+        phase: ProcessActionAuditPhase = .terminal,
         outcome: ProcessActionOutcome,
         processLabel: String,
         applicationName: String? = nil,
         detail: String
     ) {
         self.id = String(id.prefix(80))
+        self.operationID = String((operationID ?? id).prefix(80))
         self.timestamp = timestamp
         self.action = action
+        self.phase = phase
         self.outcome = outcome
         self.processLabel = WorkingDirectoryLabelSanitizer.label(fromComponent: processLabel) ?? "未知进程"
         self.applicationName = applicationName.flatMap(WorkingDirectoryLabelSanitizer.label(fromComponent:))
@@ -1308,8 +1336,10 @@ public struct ProcessActionAuditEvent: Codable, Sendable, Equatable, Identifiabl
 
     private enum CodingKeys: String, CodingKey {
         case id
+        case operationID
         case timestamp
         case action
+        case phase
         case outcome
         case processLabel
         case applicationName
@@ -1319,14 +1349,17 @@ public struct ProcessActionAuditEvent: Codable, Sendable, Equatable, Identifiabl
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let id = try container.decode(String.self, forKey: .id)
+        let operationID = try container.decodeIfPresent(String.self, forKey: .operationID) ?? id
         let timestamp = try container.decode(Date.self, forKey: .timestamp)
         let processLabel = try container.decode(String.self, forKey: .processLabel)
         let applicationName = try container.decodeIfPresent(String.self, forKey: .applicationName)
         let detail = try container.decode(String.self, forKey: .detail)
         let decoded = Self(
             id: id,
+            operationID: operationID,
             timestamp: timestamp,
             action: try container.decode(ProcessActionKind.self, forKey: .action),
+            phase: try container.decodeIfPresent(ProcessActionAuditPhase.self, forKey: .phase) ?? .terminal,
             outcome: try container.decode(ProcessActionOutcome.self, forKey: .outcome),
             processLabel: processLabel,
             applicationName: applicationName,
@@ -1345,7 +1378,9 @@ public struct ProcessActionAuditEvent: Codable, Sendable, Equatable, Identifiabl
     fileprivate var hasValidPersistedFields: Bool {
         Self.hasValidPersistedFields(
             id: id,
+            operationID: operationID,
             timestamp: timestamp,
+            phase: phase,
             processLabel: processLabel,
             applicationName: applicationName,
             detail: detail
@@ -1354,7 +1389,9 @@ public struct ProcessActionAuditEvent: Codable, Sendable, Equatable, Identifiabl
 
     private static func hasValidPersistedFields(
         id: String,
+        operationID: String,
         timestamp: Date,
+        phase: ProcessActionAuditPhase,
         processLabel: String,
         applicationName: String?,
         detail: String
@@ -1362,6 +1399,9 @@ public struct ProcessActionAuditEvent: Codable, Sendable, Equatable, Identifiabl
         let idIsValid = !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && id.count <= 80
             && Self.hasNoControlCharacters(id)
+        let operationIDIsValid = !operationID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && operationID.count <= 80
+            && Self.hasNoControlCharacters(operationID)
         let processLabelIsValid = !processLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && Self.hasNoControlCharacters(processLabel)
         let applicationNameIsValid = applicationName.map {
@@ -1371,6 +1411,7 @@ public struct ProcessActionAuditEvent: Codable, Sendable, Equatable, Identifiabl
         let detailIsValid = !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && Self.hasNoControlCharacters(detail)
         return idIsValid
+            && operationIDIsValid
             && isPersistableDate(timestamp)
             && processLabelIsValid
             && applicationNameIsValid

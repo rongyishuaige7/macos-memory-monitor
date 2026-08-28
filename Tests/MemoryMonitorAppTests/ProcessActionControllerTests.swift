@@ -38,6 +38,15 @@ final class ProcessActionControllerTests: XCTestCase {
             }
         }
         XCTAssertNil(controller.auditError)
+
+        let events = try await store.load(now: runtime.wallClockNow())
+        let operationIDs = Set(events.map(\.operationID))
+        XCTAssertEqual(operationIDs.count, 1)
+        XCTAssertEqual(events.filter { $0.phase == .intent }.count, 1)
+        XCTAssertEqual(events.filter { $0.phase == .signalSent }.count, 1)
+        XCTAssertEqual(events.filter { $0.phase == .terminal }.count, 1)
+        XCTAssertEqual(events.first(where: { $0.phase == .intent })?.statusDisplayName, "已确认")
+        XCTAssertEqual(events.first(where: { $0.phase == .signalSent })?.statusDisplayName, "已发送")
     }
 
     func testGracefulTimeoutEnablesForceOnlyForOriginalIdentity() async throws {
@@ -428,7 +437,7 @@ final class ProcessActionControllerTests: XCTestCase {
         }
     }
 
-    func testAuditFailureDoesNotLeaveActionBusy() async throws {
+    func testIntentAuditFailureStopsActionBeforeSignal() async throws {
         let process = makeProcess(pid: 4106, name: "worker")
         let paths = makeActionPaths()
         try FileManager.default.createDirectory(at: paths.file, withIntermediateDirectories: true)
@@ -444,13 +453,15 @@ final class ProcessActionControllerTests: XCTestCase {
         )
 
         controller.requestGracefulExit(for: process)
-        await waitUntil {
-            if case .completed = controller.state { return true }
-            return false
+        await waitUntil { !controller.isBusy }
+        guard case .failed(let identity, let message) = controller.state else {
+            return XCTFail("expected intent audit failure, got \(controller.state)")
         }
+        XCTAssertEqual(identity, process.identity)
+        XCTAssertTrue(message.contains("未发送优雅退出请求"))
         XCTAssertFalse(controller.isBusy)
         await waitUntil { controller.auditError != nil }
-        XCTAssertTrue(runtime.sentActions.contains(.gracefulExit))
+        XCTAssertTrue(runtime.sentActions.isEmpty)
     }
 
     func testGracefulTimeoutDisplayClampsExtremeFiniteInput() {

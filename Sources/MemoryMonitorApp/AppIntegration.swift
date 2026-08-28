@@ -756,9 +756,9 @@ enum AuditEventFilter: String, CaseIterable, Identifiable, Sendable {
         case .all:
             return true
         case .completed:
-            return event.outcome == .completed
+            return event.phase == .terminal && event.outcome == .completed
         case .attention:
-            return event.outcome != .completed
+            return event.phase != .terminal || event.outcome != .completed
         }
     }
 }

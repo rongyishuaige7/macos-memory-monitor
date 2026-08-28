@@ -288,6 +288,9 @@ final class ProcessActionController: ObservableObject {
     private let timeoutReconciliationInterval: Duration = .seconds(1)
 
     private var targetProcess: ProcessSnapshot?
+    /// Stable identifier shared by the intent, signal-sent, and terminal
+    /// records for the currently tracked user operation.
+    private var activeOperationID: String?
     private var actionTask: Task<Void, Never>?
     private var timeoutReconciliationTask: Task<Void, Never>?
     private var timeoutReconciliationToken: UUID?
@@ -445,11 +448,17 @@ final class ProcessActionController: ObservableObject {
         }
 
         targetProcess = process
+        let operationID = UUID().uuidString
+        activeOperationID = operationID
         let token = UUID()
         operationToken = token
         state = .requestingGraceful(process.identity)
         actionTask = Task { [weak self] in
-            await self?.performGracefulExit(expected: process, token: token)
+            await self?.performGracefulExit(
+                expected: process,
+                operationID: operationID,
+                token: token
+            )
         }
     }
 
@@ -493,11 +502,17 @@ final class ProcessActionController: ObservableObject {
 
         cancelCurrentTask()
         let token = UUID()
+        let operationID = UUID().uuidString
         operationToken = token
+        activeOperationID = operationID
         targetProcess = expected
         state = .forceTerminating(process.identity)
         actionTask = Task { [weak self] in
-            await self?.performForceTerminate(expected: expected, token: token)
+            await self?.performForceTerminate(
+                expected: expected,
+                operationID: operationID,
+                token: token
+            )
         }
     }
 
@@ -506,6 +521,7 @@ final class ProcessActionController: ObservableObject {
         guard stateIdentity == identity,
               let action = cancellableAction else { return }
         let previousTarget = targetProcess
+        let previousOperationID = activeOperationID
         let cancellationMessage = cancellationMessage(for: state)
         cancelCurrentTask()
         state = .cancelled(identity, cancellationMessage)
@@ -514,7 +530,8 @@ final class ProcessActionController: ObservableObject {
                 action: action,
                 outcome: .cancelled,
                 process: previousTarget,
-                detail: cancellationMessage
+                detail: cancellationMessage,
+                operationID: previousOperationID
             )
         }
     }
@@ -548,9 +565,23 @@ final class ProcessActionController: ObservableObject {
 
     private func performGracefulExit(
         expected: ProcessSnapshot,
+        operationID: String,
         token: UUID
     ) async {
         guard isCurrent(token) else { return }
+
+        guard await appendAuditIntent(
+            action: .gracefulExit,
+            process: expected,
+            operationID: operationID
+        ) else {
+            guard isCurrent(token), !Task.isCancelled else { return }
+            state = .failed(
+                expected.identity,
+                "无法记录用户确认意图，未发送优雅退出请求。"
+            )
+            return
+        }
 
         guard let current = await runtime.sample(pid: expected.identity.pid) else {
             if !(await runtime.processExists(pid: expected.identity.pid)) {
@@ -560,6 +591,7 @@ final class ProcessActionController: ObservableObject {
                     outcome: .completed,
                     process: expected,
                     detail: "进程在请求前已经退出",
+                    operationID: operationID,
                     token: token
                 )
             } else {
@@ -567,6 +599,7 @@ final class ProcessActionController: ObservableObject {
                     expected: expected,
                     action: .gracefulExit,
                     reason: .missingSnapshot,
+                    operationID: operationID,
                     token: token
                 )
             }
@@ -579,6 +612,7 @@ final class ProcessActionController: ObservableObject {
                 expected: expected,
                 action: .gracefulExit,
                 message: validation.message,
+                operationID: operationID,
                 token: token
             )
             return
@@ -596,6 +630,7 @@ final class ProcessActionController: ObservableObject {
                 outcome: .completed,
                 process: expected,
                 detail: "进程在请求发送前已经退出",
+                operationID: operationID,
                 token: token
             )
         case .denied(let reason):
@@ -603,6 +638,7 @@ final class ProcessActionController: ObservableObject {
                 expected: expected,
                 action: .gracefulExit,
                 reason: reason,
+                operationID: operationID,
                 token: token
             )
         case .failed(let code):
@@ -612,12 +648,22 @@ final class ProcessActionController: ObservableObject {
                 outcome: .failed,
                 process: expected,
                 detail: "系统拒绝了优雅退出请求，错误码 \(code)",
+                operationID: operationID,
                 token: token
             )
         case .sent:
             let deadline = runtime.wallClockNow().addingTimeInterval(gracefulTimeout)
             let deadlineNanoseconds = timeoutDeadline(after: gracefulTimeout)
             state = .waitingForGraceful(expected.identity, deadline)
+            _ = await appendAudit(
+                action: .gracefulExit,
+                outcome: .completed,
+                process: expected,
+                detail: "已发送优雅退出请求，正在等待进程结束。",
+                operationID: operationID,
+                phase: .signalSent
+            )
+            guard isCurrent(token), !Task.isCancelled else { return }
             switch await waitForOriginalExit(
                 expected: expected,
                 deadlineNanoseconds: deadlineNanoseconds,
@@ -630,6 +676,7 @@ final class ProcessActionController: ObservableObject {
                     outcome: .completed,
                     process: expected,
                     detail: "优雅退出完成",
+                    operationID: operationID,
                     token: token
                 )
             case .stillRunning:
@@ -639,13 +686,18 @@ final class ProcessActionController: ObservableObject {
                     outcome: .timedOut,
                     process: expected,
                     detail: "优雅退出等待超时；未自动强制结束",
+                    operationID: operationID,
                     token: token
                 )
                 // The audit append above is asynchronous. A second
                 // confirmation may start while it is suspended, so only
                 // launch reconciliation if this operation is still current.
                 if isCurrent(token), state == .timedOut(expected.identity) {
-                    startTimeoutReconciliation(expected: expected, token: token)
+                    startTimeoutReconciliation(
+                        expected: expected,
+                        operationID: operationID,
+                        token: token
+                    )
                 }
             case .cancelled:
                 return
@@ -656,6 +708,7 @@ final class ProcessActionController: ObservableObject {
                     outcome: .failed,
                     process: expected,
                     detail: "等待优雅退出状态失败：" + message,
+                    operationID: operationID,
                     token: token
                 )
             }
@@ -664,9 +717,23 @@ final class ProcessActionController: ObservableObject {
 
     private func performForceTerminate(
         expected: ProcessSnapshot,
+        operationID: String,
         token: UUID
     ) async {
         guard isCurrent(token), state == .forceTerminating(expected.identity) else {
+            return
+        }
+
+        guard await appendAuditIntent(
+            action: .forceTerminate,
+            process: expected,
+            operationID: operationID
+        ) else {
+            guard isCurrent(token), !Task.isCancelled else { return }
+            state = .failed(
+                expected.identity,
+                "无法记录用户确认意图，未发送强制结束请求。"
+            )
             return
         }
 
@@ -678,6 +745,7 @@ final class ProcessActionController: ObservableObject {
                     outcome: .completed,
                     process: expected,
                     detail: "进程在强制结束前已经退出",
+                    operationID: operationID,
                     token: token
                 )
             } else {
@@ -685,6 +753,7 @@ final class ProcessActionController: ObservableObject {
                     expected: expected,
                     action: .forceTerminate,
                     reason: .missingSnapshot,
+                    operationID: operationID,
                     token: token
                 )
             }
@@ -697,6 +766,7 @@ final class ProcessActionController: ObservableObject {
                 expected: expected,
                 action: .forceTerminate,
                 message: validation.message,
+                operationID: operationID,
                 token: token
             )
             return
@@ -714,6 +784,7 @@ final class ProcessActionController: ObservableObject {
                 outcome: .completed,
                 process: expected,
                 detail: "进程在强制结束请求前已经退出",
+                operationID: operationID,
                 token: token
             )
         case .denied(let reason):
@@ -721,6 +792,7 @@ final class ProcessActionController: ObservableObject {
                 expected: expected,
                 action: .forceTerminate,
                 reason: reason,
+                operationID: operationID,
                 token: token
             )
         case .failed(let code):
@@ -730,10 +802,20 @@ final class ProcessActionController: ObservableObject {
                 outcome: .failed,
                 process: expected,
                 detail: "系统拒绝了强制结束请求，错误码 \(code)",
+                operationID: operationID,
                 token: token
             )
         case .sent:
             state = .verifyingForce(expected.identity)
+            _ = await appendAudit(
+                action: .forceTerminate,
+                outcome: .completed,
+                process: expected,
+                detail: "已发送强制结束请求，正在确认进程是否结束。",
+                operationID: operationID,
+                phase: .signalSent
+            )
+            guard isCurrent(token), !Task.isCancelled else { return }
             let deadlineNanoseconds = timeoutDeadline(after: forceVerificationTimeout)
             switch await waitForOriginalExit(
                 expected: expected,
@@ -747,6 +829,7 @@ final class ProcessActionController: ObservableObject {
                     outcome: .completed,
                     process: expected,
                     detail: "强制结束完成",
+                    operationID: operationID,
                     token: token
                 )
             case .stillRunning:
@@ -756,6 +839,7 @@ final class ProcessActionController: ObservableObject {
                     outcome: .failed,
                     process: expected,
                     detail: "强制结束请求已发送，但进程仍存在",
+                    operationID: operationID,
                     token: token
                 )
             case .cancelled:
@@ -767,6 +851,7 @@ final class ProcessActionController: ObservableObject {
                     outcome: .failed,
                     process: expected,
                     detail: "等待强制结束状态失败：" + message,
+                    operationID: operationID,
                     token: token
                 )
             }
@@ -845,6 +930,7 @@ final class ProcessActionController: ObservableObject {
         action: ProcessActionKind,
         reason: ProcessActionBlockReason? = nil,
         message: String? = nil,
+        operationID: String,
         token: UUID
     ) async {
         let detail = message ?? reason?.displayMessage ?? "进程操作被拒绝。"
@@ -854,6 +940,7 @@ final class ProcessActionController: ObservableObject {
             outcome: .denied,
             process: expected,
             detail: detail,
+            operationID: operationID,
             token: token
         )
     }
@@ -864,17 +951,19 @@ final class ProcessActionController: ObservableObject {
         outcome: ProcessActionOutcome,
         process: ProcessSnapshot,
         detail: String,
+        operationID: String,
         token: UUID
     ) async {
         guard isCurrent(token) else { return }
         // Publish the terminal state before disk I/O so a slow or unavailable
         // audit store cannot leave the UI looking busy after the action ended.
         state = newState
-        await appendAudit(
+        _ = await appendAudit(
             action: action,
             outcome: outcome,
             process: process,
-            detail: detail
+            detail: detail,
+            operationID: operationID
         )
     }
 
@@ -888,6 +977,7 @@ final class ProcessActionController: ObservableObject {
         isShuttingDown = true
         let interruptedAction = cancellableAction
         let interruptedProcess = targetProcess
+        let interruptedOperationID = activeOperationID
         let interruptedMessage = cancellationMessage(for: state)
         if let identity = stateIdentity, interruptedAction != nil {
             state = .cancelled(identity, interruptedMessage)
@@ -897,11 +987,12 @@ final class ProcessActionController: ObservableObject {
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             if let interruptedAction, let interruptedProcess {
-                await self.appendAudit(
+                _ = await self.appendAudit(
                     action: interruptedAction,
                     outcome: .cancelled,
                     process: interruptedProcess,
-                    detail: interruptedMessage
+                    detail: interruptedMessage,
+                    operationID: interruptedOperationID
                 )
             }
             if let initialAuditLoadTask = self.initialAuditLoadTask {
@@ -929,17 +1020,19 @@ final class ProcessActionController: ObservableObject {
         action: ProcessActionKind,
         outcome: ProcessActionOutcome,
         process: ProcessSnapshot,
-        detail: String
+        detail: String,
+        operationID: String? = nil
     ) {
         guard !isShuttingDown else { return }
         let id = UUID()
         backgroundAuditTasks[id] = Task { @MainActor [weak self] in
             guard let self else { return }
-            await self.appendAudit(
+            _ = await self.appendAudit(
                 action: action,
                 outcome: outcome,
                 process: process,
-                detail: detail
+                detail: detail,
+                operationID: operationID
             )
             self.backgroundAuditTasks[id] = nil
         }
@@ -958,31 +1051,63 @@ final class ProcessActionController: ObservableObject {
         action: ProcessActionKind,
         outcome: ProcessActionOutcome,
         process: ProcessSnapshot,
-        detail: String
-    ) async {
+        detail: String,
+        operationID: String? = nil,
+        phase: ProcessActionAuditPhase = .terminal
+    ) async -> Bool {
         auditPublicationGeneration &+= 1
         let generation = auditPublicationGeneration
         let event = ProcessActionAuditEvent(
+            operationID: operationID,
             action: action,
+            phase: phase,
             outcome: outcome,
             processLabel: process.applicationName ?? process.name,
             applicationName: process.applicationName,
             detail: detail
         )
         do {
+            // A durable append is the execution gate. A later UI reload may
+            // fail without invalidating the fact that the intent was stored.
+            _ = try await auditStore.append(event)
+        } catch {
+            guard generation == auditPublicationGeneration else { return false }
+            auditError = error.localizedDescription
+            return false
+        }
+
+        do {
             // Reload after the append so this publication includes any older
             // append that completed while this request was suspended. The
             // generation check below prevents a stale reload from replacing a
             // newer publication.
-            _ = try await auditStore.append(event)
             let latestEvents = try await auditStore.load()
-            guard generation == auditPublicationGeneration else { return }
+            guard generation == auditPublicationGeneration else { return true }
             recentEvents = latestEvents
             auditError = nil
         } catch {
-            guard generation == auditPublicationGeneration else { return }
+            guard generation == auditPublicationGeneration else { return true }
             auditError = error.localizedDescription
         }
+        return true
+    }
+
+    /// The intent is a durable prerequisite for any sampling or signal
+    /// delivery. A successful append is enough to proceed even if the
+    /// best-effort reload used for UI publication fails.
+    private func appendAuditIntent(
+        action: ProcessActionKind,
+        process: ProcessSnapshot,
+        operationID: String
+    ) async -> Bool {
+        await appendAudit(
+            action: action,
+            outcome: .completed,
+            process: process,
+            detail: "用户已确认操作；尚未采样或发送新的进程信号。",
+            operationID: operationID,
+            phase: .intent
+        )
     }
 
     private func loadAuditEvents() async {
@@ -1019,6 +1144,7 @@ final class ProcessActionController: ObservableObject {
     /// forever. The closure avoids retaining `self` while sleeping.
     private func startTimeoutReconciliation(
         expected: ProcessSnapshot,
+        operationID: String,
         token: UUID
     ) {
         timeoutReconciliationTask?.cancel()
@@ -1046,6 +1172,7 @@ final class ProcessActionController: ObservableObject {
                         outcome: .completed,
                         process: expected,
                         detail: "优雅退出超时后确认原进程已退出",
+                        operationID: operationID,
                         token: token
                     )
                     self.clearTimeoutReconciliation(for: token)

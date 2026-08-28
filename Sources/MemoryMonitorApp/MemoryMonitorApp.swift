@@ -2136,9 +2136,9 @@ private struct ProcessDetailView: View {
                             .font(.caption2)
                             .lineLimit(1)
                         Spacer(minLength: 4)
-                        Text(event.outcome.displayName)
+                        Text(event.statusDisplayName)
                             .font(.caption2)
-                            .foregroundStyle(actionOutcomeColor(event.outcome))
+                            .foregroundStyle(actionAuditColor(event))
                         Text(event.timestamp, style: .time)
                             .font(.caption2.monospacedDigit())
                             .foregroundStyle(.secondary)
@@ -3009,6 +3009,17 @@ private func actionOutcomeColor(_ outcome: ProcessActionOutcome) -> Color {
     case .timedOut: return .orange
     case .denied, .failed: return .red
     case .cancelled: return .secondary
+    }
+}
+
+private func actionAuditColor(_ event: ProcessActionAuditEvent) -> Color {
+    switch event.phase {
+    case .intent:
+        return .secondary
+    case .signalSent:
+        return .orange
+    case .terminal:
+        return actionOutcomeColor(event.outcome)
     }
 }
 
