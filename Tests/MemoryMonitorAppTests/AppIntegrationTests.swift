@@ -709,6 +709,14 @@ final class AppIntegrationTests: XCTestCase {
         XCTAssertEqual(source.requestedModes, [.backgroundProcess, .backgroundProcess])
         XCTAssertTrue(model.history.contains { $0.workloadsSampledAt == firstSampleAt })
         XCTAssertTrue(model.history.contains { $0.workloadsSampledAt == secondSampleAt })
+        XCTAssertTrue(model.history.contains {
+            $0.workloadsSampledAt == firstSampleAt
+                && $0.workloadInventoryIsComplete == true
+        })
+        XCTAssertTrue(model.history.contains {
+            $0.workloadsSampledAt == secondSampleAt
+                && $0.workloadInventoryIsComplete == true
+        })
     }
 
     func testMonitorViewModelPersistsSampleAfterEightHourClockJump() async throws {
@@ -1246,6 +1254,203 @@ final class AppIntegrationTests: XCTestCase {
         XCTAssertTrue(model.recommendation?.evidence.contains {
             $0.label == "Swap 增量"
         } == true)
+    }
+
+    func testMonitorViewModelRefreshesRecommendationConfirmationWithoutRepublishing() async throws {
+        let base = Date(timeIntervalSince1970: 1_700_510_000)
+        let publishedAt = base.addingTimeInterval(60)
+        let confirmedAt = base.addingTimeInterval(120)
+        let process = makeProcess(
+            pid: 9061,
+            name: "critical-worker",
+            footprint: 4 * 1024 * 1024 * 1024
+        )
+        let group = makeGroup(
+            id: "critical-worker",
+            title: "Critical Worker",
+            process: process,
+            footprint: process.physicalFootprintBytes
+        )
+        let source = FakeMonitorSamplingSource(snapshots: [
+            makeMonitorSnapshot(
+                timestamp: base,
+                processes: [process],
+                groups: [group],
+                status: .available(at: base),
+                listedCount: 1,
+                systemOverride: makePressureSystemSnapshot(
+                    timestamp: base,
+                    availableFraction: 0.05,
+                    swapUsedBytes: 0
+                )
+            ),
+            makeMonitorSnapshot(
+                timestamp: publishedAt,
+                processes: [process],
+                groups: [group],
+                status: .available(at: publishedAt),
+                listedCount: 1,
+                systemOverride: makePressureSystemSnapshot(
+                    timestamp: publishedAt,
+                    availableFraction: 0.05,
+                    swapUsedBytes: 0
+                )
+            ),
+            makeMonitorSnapshot(
+                timestamp: confirmedAt,
+                processes: [process],
+                groups: [group],
+                status: .available(at: confirmedAt),
+                listedCount: 1,
+                systemOverride: makePressureSystemSnapshot(
+                    timestamp: confirmedAt,
+                    availableFraction: 0.05,
+                    swapUsedBytes: 0
+                )
+            )
+        ])
+        let paths = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: paths.url),
+            startRefreshTask: false
+        )
+        model.setPanelPresented(true)
+
+        await model.refreshOnce(at: base)
+        await model.refreshOnce(at: publishedAt)
+        let first = try XCTUnwrap(model.recommendation)
+        await model.refreshOnce(at: confirmedAt)
+        let refreshed = try XCTUnwrap(model.recommendation)
+
+        XCTAssertEqual(first.requiredSources, [.system, .processes])
+        XCTAssertEqual(refreshed.generatedAt, first.generatedAt)
+        XCTAssertEqual(refreshed.lastConfirmedAt, confirmedAt)
+    }
+
+    func testMonitorViewModelExpiresRecommendationWhenRequiredSourcesStayUnavailable() async throws {
+        let base = Date(timeIntervalSince1970: 1_700_520_000)
+        let withinTTL = base.addingTimeInterval(20)
+        let expired = base.addingTimeInterval(31)
+        let process = makeProcess(
+            pid: 9062,
+            name: "critical-worker",
+            footprint: 4 * 1024 * 1024 * 1024
+        )
+        let group = makeGroup(
+            id: "critical-worker",
+            title: "Critical Worker",
+            process: process,
+            footprint: process.physicalFootprintBytes
+        )
+        func unavailableSnapshot(at timestamp: Date) -> MonitorSnapshot {
+            MonitorSnapshot(
+                timestamp: timestamp,
+                system: nil,
+                systemStatus: .error("system unavailable"),
+                cpuTime: nil,
+                cpuStatus: .unavailable(),
+                gpuUsageFraction: nil,
+                gpuStatus: .unavailable(),
+                processes: [],
+                processStatus: .error("processes unavailable"),
+                listedProcessCount: 0,
+                sampledProcessCount: 0,
+                groups: [],
+                samplingMode: .panel
+            )
+        }
+        let source = FakeMonitorSamplingSource(snapshots: [
+            makeMonitorSnapshot(
+                timestamp: base,
+                processes: [process],
+                groups: [group],
+                status: .available(at: base),
+                listedCount: 1,
+                systemOverride: makePressureSystemSnapshot(
+                    timestamp: base,
+                    availableFraction: 0.05,
+                    swapUsedBytes: 0
+                )
+            ),
+            unavailableSnapshot(at: withinTTL),
+            unavailableSnapshot(at: expired)
+        ])
+        let paths = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: paths.url),
+            recommendationTTL: 30,
+            startRefreshTask: false
+        )
+        model.setPanelPresented(true)
+
+        await model.refreshOnce(at: base)
+        XCTAssertNotNil(model.recommendation)
+        await model.refreshOnce(at: withinTTL)
+        XCTAssertNotNil(model.recommendation)
+        await model.refreshOnce(at: expired)
+        XCTAssertNil(model.recommendation)
+    }
+
+    func testMonitorViewModelDoesNotConfirmRecommendationFromRolledBackProcessSource() async throws {
+        let base = Date(timeIntervalSince1970: 1_700_530_000)
+        let rolledBackPass = base.addingTimeInterval(60)
+        let process = makeProcess(
+            pid: 9063,
+            name: "critical-worker",
+            footprint: 4 * 1024 * 1024 * 1024
+        )
+        let group = makeGroup(
+            id: "critical-worker",
+            title: "Critical Worker",
+            process: process,
+            footprint: process.physicalFootprintBytes
+        )
+        let source = FakeMonitorSamplingSource(snapshots: [
+            makeMonitorSnapshot(
+                timestamp: base,
+                processes: [process],
+                groups: [group],
+                status: .available(at: base),
+                listedCount: 1,
+                systemOverride: makePressureSystemSnapshot(
+                    timestamp: base,
+                    availableFraction: 0.05,
+                    swapUsedBytes: 0
+                )
+            ),
+            makeMonitorSnapshot(
+                timestamp: rolledBackPass,
+                processes: [process],
+                groups: [group],
+                status: .available(at: base.addingTimeInterval(-1)),
+                listedCount: 1,
+                systemOverride: makePressureSystemSnapshot(
+                    timestamp: rolledBackPass,
+                    availableFraction: 0.05,
+                    swapUsedBytes: 0
+                )
+            )
+        ])
+        let paths = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: paths.url),
+            startRefreshTask: false
+        )
+        model.setPanelPresented(true)
+
+        await model.refreshOnce(at: base)
+        let first = try XCTUnwrap(model.recommendation)
+        await model.refreshOnce(at: rolledBackPass)
+        let retained = try XCTUnwrap(model.recommendation)
+
+        XCTAssertEqual(retained.generatedAt, first.generatedAt)
+        XCTAssertEqual(retained.lastConfirmedAt, first.lastConfirmedAt)
     }
 
     func testMonitorViewModelAdvancesProcessBaselineWhenSystemSampleFails() async throws {

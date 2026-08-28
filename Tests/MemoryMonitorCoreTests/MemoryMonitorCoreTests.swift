@@ -1328,6 +1328,8 @@ final class MemoryMonitorCoreTests: XCTestCase {
         )
         XCTAssertEqual(decodedRecommendation.confidence, 1)
         XCTAssertEqual(decodedRecommendation.confidencePercent, 100)
+        XCTAssertEqual(decodedRecommendation.lastConfirmedAt, decodedRecommendation.generatedAt)
+        XCTAssertTrue(decodedRecommendation.requiredSources.isEmpty)
 
         let malformedDiagnostics = Data("""
         {"mode":"panel","totalDurationMilliseconds":-4,"processDurationMilliseconds":-2,"processSamplingPerformed":true,"processCount":-1,"listedProcessCount":-3}
@@ -3401,18 +3403,26 @@ final class MemoryMonitorCoreTests: XCTestCase {
         let largerAPI = makePersistedWorkload(id: api.id, title: api.title, footprint: 800 * 1024 * 1024)
 
         let records = [
-            makeHistoryRecord(timestamp: base, availableFraction: 0.40, swapUsedBytes: 0, workloads: [api]),
+            makeHistoryRecord(
+                timestamp: base,
+                availableFraction: 0.40,
+                swapUsedBytes: 0,
+                workloads: [api],
+                workloadInventoryIsComplete: true
+            ),
             makeHistoryRecord(
                 timestamp: base.addingTimeInterval(60),
                 availableFraction: 0.40,
                 swapUsedBytes: 0,
-                workloads: [largerAPI, worker]
+                workloads: [largerAPI, worker],
+                workloadInventoryIsComplete: true
             ),
             makeHistoryRecord(
                 timestamp: base.addingTimeInterval(120),
                 availableFraction: 0.40,
                 swapUsedBytes: 0,
-                workloads: [worker]
+                workloads: [worker],
+                workloadInventoryIsComplete: true
             )
         ]
 
@@ -3430,6 +3440,158 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertFalse(analysis.events.contains { $0.targetID == "other-processes" })
     }
 
+    func testMemoryHistoryAnalyzerLinksCompleteWorkloadsAcrossPartialAndSystemOnlyRecords() {
+        let base = Date(timeIntervalSince1970: 1_700_001_000)
+        let api = makePersistedWorkload(
+            id: "runtime-node-api",
+            title: "Node · api",
+            footprint: 200 * 1024 * 1024
+        )
+        let worker = makePersistedWorkload(
+            id: "runtime-python-worker",
+            title: "Python · worker",
+            footprint: 128 * 1024 * 1024
+        )
+        let records = [
+            makeHistoryRecord(
+                timestamp: base,
+                availableFraction: 0.4,
+                swapUsedBytes: 0,
+                workloads: [api],
+                workloadInventoryIsComplete: true
+            ),
+            makeHistoryRecord(
+                timestamp: base.addingTimeInterval(60),
+                availableFraction: 0.4,
+                swapUsedBytes: 0,
+                workloads: [api],
+                workloadInventoryIsComplete: false
+            ),
+            makeHistoryRecord(
+                timestamp: base.addingTimeInterval(120),
+                availableFraction: 0.4,
+                swapUsedBytes: 0
+            ),
+            makeHistoryRecord(
+                timestamp: base.addingTimeInterval(180),
+                availableFraction: 0.4,
+                swapUsedBytes: 0,
+                workloads: [api, worker],
+                workloadInventoryIsComplete: true
+            )
+        ]
+
+        let events = MemoryHistoryAnalyzer().analyze(records).events
+
+        XCTAssertTrue(events.contains {
+            $0.kind == .workloadAppeared && $0.targetID == worker.id
+        })
+        XCTAssertFalse(events.contains {
+            $0.kind == .workloadDisappeared && $0.targetID == api.id
+        })
+    }
+
+    func testMemoryHistoryAnalyzerRejectsDuplicateAndTimedOutWorkloadMarkers() {
+        let base = Date(timeIntervalSince1970: 1_700_002_000)
+        let api = makePersistedWorkload(
+            id: "runtime-node-api",
+            title: "Node · api",
+            footprint: 200 * 1024 * 1024
+        )
+        let worker = makePersistedWorkload(
+            id: "runtime-python-worker",
+            title: "Python · worker",
+            footprint: 128 * 1024 * 1024
+        )
+        func record(timestamp: Date, marker: Date, workloads: [PersistedWorkloadRecord])
+            -> MemoryHistoryRecord {
+            MemoryHistoryRecord(
+                timestamp: timestamp,
+                availableFraction: 0.4,
+                compressedBytes: 0,
+                swapUsedBytes: 0,
+                workloads: workloads,
+                workloadsSampledAt: marker,
+                workloadInventoryIsComplete: true,
+                sourceSampledAt: timestamp
+            )
+        }
+
+        let duplicateMarkerEvents = MemoryHistoryAnalyzer().analyze([
+            record(timestamp: base, marker: base, workloads: [api]),
+            record(
+                timestamp: base.addingTimeInterval(60),
+                marker: base,
+                workloads: [api, worker]
+            )
+        ]).events
+        XCTAssertFalse(duplicateMarkerEvents.contains { event in
+            event.kind == .workloadAppeared
+                || event.kind == .workloadDisappeared
+                || event.kind == .workloadGrowth
+        })
+
+        let timedOutMarkerEvents = MemoryHistoryAnalyzer().analyze([
+            record(timestamp: base, marker: base, workloads: [api]),
+            record(
+                timestamp: base.addingTimeInterval(60),
+                marker: base.addingTimeInterval(301),
+                workloads: [api, worker]
+            )
+        ]).events
+        XCTAssertFalse(timedOutMarkerEvents.contains { event in
+            event.kind == .workloadAppeared
+                || event.kind == .workloadDisappeared
+                || event.kind == .workloadGrowth
+        })
+    }
+
+    func testMemoryHistoryAnalyzerTreatsLegacyWorkloadCompletenessAsUnknown() throws {
+        let base = Date(timeIntervalSince1970: 1_700_003_000)
+        let api = makePersistedWorkload(
+            id: "runtime-node-api",
+            title: "Node · api",
+            footprint: 200 * 1024 * 1024
+        )
+        let worker = makePersistedWorkload(
+            id: "runtime-python-worker",
+            title: "Python · worker",
+            footprint: 128 * 1024 * 1024
+        )
+        let legacyRecords = [
+            MemoryHistoryRecord(
+                timestamp: base,
+                availableFraction: 0.4,
+                compressedBytes: 0,
+                swapUsedBytes: 0,
+                workloads: [api],
+                workloadsSampledAt: base
+            ),
+            MemoryHistoryRecord(
+                timestamp: base.addingTimeInterval(60),
+                availableFraction: 0.4,
+                compressedBytes: 0,
+                swapUsedBytes: 0,
+                workloads: [api, worker],
+                workloadsSampledAt: base.addingTimeInterval(60)
+            )
+        ]
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(MemoryHistoryFile(records: legacyRecords))
+        XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("workloadInventoryIsComplete"))
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(MemoryHistoryFile.self, from: data).records
+
+        XCTAssertTrue(decoded.allSatisfy { $0.workloadInventoryIsComplete == nil })
+        XCTAssertFalse(MemoryHistoryAnalyzer().analyze(decoded).events.contains { event in
+            event.kind == .workloadAppeared
+                || event.kind == .workloadDisappeared
+                || event.kind == .workloadGrowth
+        })
+    }
+
     func testMemoryHistoryAnalyzerHandlesDuplicateWorkloadIDs() {
         let base = Date(timeIntervalSince1970: 1_700_000_000)
         let first = makePersistedWorkload(
@@ -3443,12 +3605,19 @@ final class MemoryMonitorCoreTests: XCTestCase {
             footprint: 300 * 1024 * 1024
         )
         let records = [
-            makeHistoryRecord(timestamp: base, availableFraction: 0.40, swapUsedBytes: 0, workloads: [first]),
+            makeHistoryRecord(
+                timestamp: base,
+                availableFraction: 0.40,
+                swapUsedBytes: 0,
+                workloads: [first],
+                workloadInventoryIsComplete: true
+            ),
             makeHistoryRecord(
                 timestamp: base.addingTimeInterval(60),
                 availableFraction: 0.40,
                 swapUsedBytes: 0,
-                workloads: [first, replacement]
+                workloads: [first, replacement],
+                workloadInventoryIsComplete: true
             )
         ]
 
@@ -3471,7 +3640,8 @@ final class MemoryMonitorCoreTests: XCTestCase {
                 timestamp: base.addingTimeInterval(60),
                 availableFraction: 0.40,
                 swapUsedBytes: 0,
-                workloads: [replacement, first]
+                workloads: [replacement, first],
+                workloadInventoryIsComplete: true
             )
         ]
         let reversedGrowth = sensitiveAnalyzer.analyze(reversedRecords).events.first {
@@ -3526,7 +3696,8 @@ final class MemoryMonitorCoreTests: XCTestCase {
                 compressedBytes: 0,
                 swapUsedBytes: 0,
                 workloads: [previous],
-                workloadsSampledAt: base
+                workloadsSampledAt: base,
+                workloadInventoryIsComplete: true
             ),
             MemoryHistoryRecord(
                 timestamp: base.addingTimeInterval(60),
@@ -3534,7 +3705,8 @@ final class MemoryMonitorCoreTests: XCTestCase {
                 compressedBytes: 0,
                 swapUsedBytes: 0,
                 workloads: [stale],
-                workloadsSampledAt: base.addingTimeInterval(60)
+                workloadsSampledAt: base.addingTimeInterval(60),
+                workloadInventoryIsComplete: true
             ),
             MemoryHistoryRecord(
                 timestamp: base.addingTimeInterval(60),
@@ -3542,7 +3714,8 @@ final class MemoryMonitorCoreTests: XCTestCase {
                 compressedBytes: 0,
                 swapUsedBytes: 0,
                 workloads: [fresh],
-                workloadsSampledAt: base.addingTimeInterval(61)
+                workloadsSampledAt: base.addingTimeInterval(61),
+                workloadInventoryIsComplete: true
             )
         ]
 
@@ -3638,7 +3811,8 @@ final class MemoryMonitorCoreTests: XCTestCase {
             compressedBytes: 0,
             swapUsedBytes: 0,
             workloads: [baseline],
-            workloadsSampledAt: base
+            workloadsSampledAt: base,
+            workloadInventoryIsComplete: true
         )
         func duplicate(_ workload: PersistedWorkloadRecord) -> MemoryHistoryRecord {
             MemoryHistoryRecord(
@@ -3647,7 +3821,8 @@ final class MemoryMonitorCoreTests: XCTestCase {
                 compressedBytes: 0,
                 swapUsedBytes: 0,
                 workloads: [workload],
-                workloadsSampledAt: base.addingTimeInterval(60)
+                workloadsSampledAt: base.addingTimeInterval(60),
+                workloadInventoryIsComplete: true
             )
         }
 
@@ -4546,14 +4721,18 @@ final class MemoryMonitorCoreTests: XCTestCase {
         timestamp: Date,
         availableFraction: Double,
         swapUsedBytes: UInt64,
-        workloads: [PersistedWorkloadRecord] = []
+        workloads: [PersistedWorkloadRecord] = [],
+        workloadInventoryIsComplete: Bool? = nil
     ) -> MemoryHistoryRecord {
         MemoryHistoryRecord(
             timestamp: timestamp,
             availableFraction: availableFraction,
             compressedBytes: 0,
             swapUsedBytes: swapUsedBytes,
-            workloads: workloads
+            workloads: workloads,
+            workloadsSampledAt: workloads.isEmpty ? nil : timestamp,
+            workloadInventoryIsComplete: workloadInventoryIsComplete,
+            sourceSampledAt: timestamp
         )
     }
 

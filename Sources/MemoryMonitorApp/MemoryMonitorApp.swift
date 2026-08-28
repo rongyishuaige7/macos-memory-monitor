@@ -242,6 +242,7 @@ final class MonitorViewModel: ObservableObject {
     private var lastRecommendationKey: String?
     private var lastRecommendationAt: Date?
     private let recommendationCooldown: TimeInterval = 30 * 60
+    private let recommendationTTL: TimeInterval
     private let monitorProcessID = Int32(ProcessInfo.processInfo.processIdentifier)
 
     init(
@@ -249,6 +250,7 @@ final class MonitorViewModel: ObservableObject {
         sampler: any MonitorSamplingSource = MonitorSampler(),
         historyStore: HistoryStore = HistoryStore(),
         processActions: ProcessActionController? = nil,
+        recommendationTTL: TimeInterval = 5 * 60,
         dateProvider: @escaping @MainActor () -> Date = { Date() },
         startRefreshTask: Bool = true
     ) {
@@ -256,6 +258,9 @@ final class MonitorViewModel: ObservableObject {
         loginLaunch = LoginLaunchCoordinator(runtime: loginLaunchRuntime)
         self.sampler = sampler
         self.historyStore = historyStore
+        self.recommendationTTL = recommendationTTL.isFinite && recommendationTTL >= 0
+            ? recommendationTTL
+            : 5 * 60
         self.dateProvider = dateProvider
         if startRefreshTask {
             refreshTask = Task { [weak self] in
@@ -751,6 +756,9 @@ final class MonitorViewModel: ObservableObject {
         let processSampleUsable = snapshot.processDataIsUsable
             && processSampledAt != nil
             && processSampleIsMonotonic
+        let workloadInventoryIsComplete = processSampleUsable
+            && snapshot.sampledProcessCount > 0
+            && snapshot.sampledProcessCount == snapshot.listedProcessCount
 
         samplingDiagnostics = snapshot.diagnostics
         systemStatus = snapshot.systemStatus
@@ -806,6 +814,9 @@ final class MonitorViewModel: ObservableObject {
                         workloadsSampledAt: processSampleUsable
                             ? processSampledAt
                             : nil,
+                        workloadInventoryIsComplete: processSampleUsable
+                            ? workloadInventoryIsComplete
+                            : nil,
                         now: persistenceNow
                     )
                     historyError = nil
@@ -822,6 +833,9 @@ final class MonitorViewModel: ObservableObject {
                         workloadsSampledAt: processSampleUsable
                             ? processSampledAt
                             : nil,
+                        workloadInventoryIsComplete: processSampleUsable
+                            ? workloadInventoryIsComplete
+                            : nil,
                         now: persistenceNow
                     )
                     historyDiagnostics = await historyStore.diagnostics()
@@ -832,6 +846,9 @@ final class MonitorViewModel: ObservableObject {
                     groups: historyGroups,
                     workloadsSampledAt: processSampleUsable
                         ? processSampledAt
+                        : nil,
+                    workloadInventoryIsComplete: processSampleUsable
+                        ? workloadInventoryIsComplete
                         : nil,
                     now: persistenceNow
                 )
@@ -868,10 +885,17 @@ final class MonitorViewModel: ObservableObject {
             ? snapshot.gpuUsageFraction
             : nil
 
+        var availableRecommendationSources = Set<RecommendationSource>()
+        if snapshot.systemDataIsUsable {
+            availableRecommendationSources.insert(.system)
+        }
+        if processSampleUsable {
+            availableRecommendationSources.insert(.processes)
+        }
         updateRecommendation(
             recommendationEngine.evaluate(recommendationContext).first,
             at: snapshot.timestamp,
-            allowClearing: processSampleUsable && snapshot.systemDataIsUsable
+            availableSources: availableRecommendationSources
         )
 
         if processSampleUsable {
@@ -1039,6 +1063,7 @@ final class MonitorViewModel: ObservableObject {
         snapshot: SystemMemorySnapshot,
         groups: [WorkloadGroupSnapshot],
         workloadsSampledAt: Date?,
+        workloadInventoryIsComplete: Bool?,
         now: Date
     ) {
         guard let minute = persistableMinuteBucket(snapshot.timestamp),
@@ -1062,6 +1087,7 @@ final class MonitorViewModel: ObservableObject {
                 limit: HistoryStore.defaultMaxPersistedWorkloads
             ),
             workloadsSampledAt: workloadsSampledAt,
+            workloadInventoryIsComplete: workloadInventoryIsComplete,
             sourceSampledAt: snapshot.timestamp
         )
 
@@ -1143,16 +1169,20 @@ final class MonitorViewModel: ObservableObject {
     private func updateRecommendation(
         _ candidate: MemoryRecommendation?,
         at timestamp: Date,
-        allowClearing: Bool
+        availableSources: Set<RecommendationSource>
     ) {
-        guard let candidate else {
-            // A system-only pass has no fresh process evidence. Keep the last
-            // actionable explanation visible until a process sample confirms
-            // that it is no longer relevant.
-            guard allowClearing else { return }
-            recommendation = nil
-            lastRecommendationKey = nil
-            lastRecommendationAt = nil
+        guard let candidate,
+              candidate.requiredSources.isSubset(of: availableSources) else {
+            guard let recommendation else { return }
+            if recommendation.requiredSources.isSubset(of: availableSources) {
+                clearRecommendation()
+                return
+            }
+            let age = timestamp.timeIntervalSince(recommendation.lastConfirmedAt)
+            guard age.isFinite, age >= 0, age <= recommendationTTL else {
+                clearRecommendation()
+                return
+            }
             return
         }
 
@@ -1162,12 +1192,19 @@ final class MonitorViewModel: ObservableObject {
            let lastRecommendationAt,
            timestamp.timeIntervalSince(lastRecommendationAt) >= 0,
            timestamp.timeIntervalSince(lastRecommendationAt) < recommendationCooldown {
+            self.recommendation = recommendation.confirmed(at: timestamp)
             return
         }
 
-        recommendation = candidate
+        recommendation = candidate.confirmed(at: timestamp)
         lastRecommendationKey = candidate.deduplicationKey
         lastRecommendationAt = timestamp
+    }
+
+    private func clearRecommendation() {
+        recommendation = nil
+        lastRecommendationKey = nil
+        lastRecommendationAt = nil
     }
 
     private func recommendationsHaveSameDisplayContent(
@@ -1181,6 +1218,7 @@ final class MonitorViewModel: ObservableObject {
             && lhs.evidence == rhs.evidence
             && lhs.confidence == rhs.confidence
             && lhs.targetGroupID == rhs.targetGroupID
+            && lhs.requiredSources == rhs.requiredSources
     }
 
     private static func waitForNextSample(
@@ -1539,9 +1577,14 @@ private struct MonitorPopover: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                 }
-                Text("置信度 \(recommendation.confidencePercent)% · 只读建议")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 4) {
+                    Text("置信度 \(recommendation.confidencePercent)% · 只读建议")
+                    Spacer(minLength: 6)
+                    Text(recommendation.lastConfirmedAt, style: .relative)
+                    Text("前确认")
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
             }
             .padding(9)
             .background(

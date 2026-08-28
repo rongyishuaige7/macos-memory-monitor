@@ -2714,6 +2714,11 @@ public struct RecommendationEvidence: Codable, Sendable, Equatable {
     }
 }
 
+public enum RecommendationSource: String, Codable, Sendable, Hashable {
+    case system
+    case processes
+}
+
 /// A read-only explanation generated from a pair of immutable observations.
 /// `id` is stable for a rule/target pair so the UI can de-duplicate repeated
 /// samples without persisting process identities or command lines.
@@ -2726,6 +2731,11 @@ public struct MemoryRecommendation: Codable, Sendable, Equatable, Identifiable {
     public let confidence: Double
     public let targetGroupID: String?
     public let generatedAt: Date
+    /// Sources that must produce a fresh usable observation before the app
+    /// can confirm that this recommendation still applies or clear it.
+    public let requiredSources: Set<RecommendationSource>
+    /// Updated even when display de-duplication keeps `generatedAt` stable.
+    public let lastConfirmedAt: Date
 
     public init(
         id: String,
@@ -2735,7 +2745,9 @@ public struct MemoryRecommendation: Codable, Sendable, Equatable, Identifiable {
         evidence: [RecommendationEvidence],
         confidence: Double,
         targetGroupID: String? = nil,
-        generatedAt: Date
+        generatedAt: Date,
+        requiredSources: Set<RecommendationSource> = [],
+        lastConfirmedAt: Date? = nil
     ) {
         self.id = id
         self.severity = severity
@@ -2745,6 +2757,12 @@ public struct MemoryRecommendation: Codable, Sendable, Equatable, Identifiable {
         self.confidence = min(max(confidence.isFinite ? confidence : 0, 0), 1)
         self.targetGroupID = targetGroupID
         self.generatedAt = generatedAt
+        self.requiredSources = requiredSources
+        if let lastConfirmedAt, isPersistableDate(lastConfirmedAt) {
+            self.lastConfirmedAt = lastConfirmedAt
+        } else {
+            self.lastConfirmedAt = generatedAt
+        }
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -2756,12 +2774,19 @@ public struct MemoryRecommendation: Codable, Sendable, Equatable, Identifiable {
         case confidence
         case targetGroupID
         case generatedAt
+        case requiredSources
+        case lastConfirmedAt
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let generatedAt = try container.decode(Date.self, forKey: .generatedAt)
-        guard isPersistableDate(generatedAt) else {
+        let lastConfirmedAt = try container.decodeIfPresent(
+            Date.self,
+            forKey: .lastConfirmedAt
+        ) ?? generatedAt
+        guard isPersistableDate(generatedAt),
+              isPersistableDate(lastConfirmedAt) else {
             throw DecodingError.dataCorruptedError(
                 forKey: .generatedAt,
                 in: container,
@@ -2776,7 +2801,27 @@ public struct MemoryRecommendation: Codable, Sendable, Equatable, Identifiable {
             evidence: try container.decode([RecommendationEvidence].self, forKey: .evidence),
             confidence: try container.decode(Double.self, forKey: .confidence),
             targetGroupID: try container.decodeIfPresent(String.self, forKey: .targetGroupID),
-            generatedAt: generatedAt
+            generatedAt: generatedAt,
+            requiredSources: try container.decodeIfPresent(
+                Set<RecommendationSource>.self,
+                forKey: .requiredSources
+            ) ?? [],
+            lastConfirmedAt: lastConfirmedAt
+        )
+    }
+
+    public func confirmed(at timestamp: Date) -> MemoryRecommendation {
+        MemoryRecommendation(
+            id: id,
+            severity: severity,
+            title: title,
+            detail: detail,
+            evidence: evidence,
+            confidence: confidence,
+            targetGroupID: targetGroupID,
+            generatedAt: generatedAt,
+            requiredSources: requiredSources,
+            lastConfirmedAt: timestamp
         )
     }
 
@@ -2957,7 +3002,8 @@ public struct RecommendationEngine: Sendable {
                     ],
                     confidence: baseConfidence,
                     targetGroupID: group.id,
-                    generatedAt: context.current.timestamp
+                    generatedAt: context.current.timestamp,
+                    requiredSources: [.system, .processes]
                 )
             )
         }
@@ -3043,7 +3089,8 @@ public struct RecommendationEngine: Sendable {
                             usesEstimatedFootprint ? 0.50 : 0.90
                         ),
                         targetGroupID: growing.id,
-                        generatedAt: context.current.timestamp
+                        generatedAt: context.current.timestamp,
+                        requiredSources: [.processes]
                     )
                 )
             }
@@ -3072,7 +3119,8 @@ public struct RecommendationEngine: Sendable {
                             RecommendationEvidence(label: "Swap 已用", value: MemoryFormatter.bytes(system.swapUsedBytes))
                         ],
                         confidence: baseConfidence,
-                        generatedAt: context.current.timestamp
+                        generatedAt: context.current.timestamp,
+                        requiredSources: [.system]
                     )
                 )
             }
@@ -3104,7 +3152,8 @@ public struct RecommendationEngine: Sendable {
                     detail: detail,
                     evidence: evidence,
                     confidence: 0.60,
-                    generatedAt: context.current.timestamp
+                    generatedAt: context.current.timestamp,
+                    requiredSources: [.processes]
                 )
             )
         }
@@ -3798,6 +3847,10 @@ public struct MemoryHistoryRecord: Codable, Sendable, Identifiable, Equatable {
     /// `nil` means this system sample had no fresh workload attribution.
     /// This is optional for backwards compatibility with v1.0 history files.
     public let workloadsSampledAt: Date?
+    /// `true` means every enumerated process contributed to this workload
+    /// payload, `false` means the payload is partial, and `nil` means an older
+    /// file/caller did not provide enough information to decide.
+    public let workloadInventoryIsComplete: Bool?
     // Public initializers intentionally remain non-throwing for source
     // compatibility, but remember invalid non-nil markers so a later store
     // append/merge can fail closed instead of silently turning them into nil.
@@ -3820,6 +3873,7 @@ public struct MemoryHistoryRecord: Codable, Sendable, Identifiable, Equatable {
         case swapUsedBytes
         case workloads
         case workloadsSampledAt
+        case workloadInventoryIsComplete
     }
 
     /// Backwards-compatible initializer for callers that provide workloads
@@ -3839,6 +3893,7 @@ public struct MemoryHistoryRecord: Codable, Sendable, Identifiable, Equatable {
             swapUsedBytes: swapUsedBytes,
             workloads: workloads,
             workloadsSampledAt: workloads.isEmpty ? nil : timestamp,
+            workloadInventoryIsComplete: nil,
             sourceSampledAt: timestamp
         )
     }
@@ -3853,6 +3908,7 @@ public struct MemoryHistoryRecord: Codable, Sendable, Identifiable, Equatable {
         swapUsedBytes: UInt64,
         workloads: [PersistedWorkloadRecord] = [],
         workloadsSampledAt: Date?,
+        workloadInventoryIsComplete: Bool? = nil,
         sourceSampledAt: Date? = nil
     ) {
         self.timestamp = timestamp
@@ -3875,6 +3931,9 @@ public struct MemoryHistoryRecord: Codable, Sendable, Identifiable, Equatable {
         } else {
             self.workloadsSampledAt = nil
         }
+        self.workloadInventoryIsComplete = workloadsSampledAt == nil
+            ? nil
+            : workloadInventoryIsComplete
     }
 
     /// Backwards-compatible snapshot initializer. A non-empty group list is
@@ -3883,14 +3942,16 @@ public struct MemoryHistoryRecord: Codable, Sendable, Identifiable, Equatable {
         self.init(
             snapshot: snapshot,
             groups: groups,
-            workloadsSampledAt: groups.isEmpty ? nil : snapshot.timestamp
+            workloadsSampledAt: groups.isEmpty ? nil : snapshot.timestamp,
+            workloadInventoryIsComplete: nil
         )
     }
 
     public init(
         snapshot: SystemMemorySnapshot,
         groups: [WorkloadGroupSnapshot] = [],
-        workloadsSampledAt: Date?
+        workloadsSampledAt: Date?,
+        workloadInventoryIsComplete: Bool? = nil
     ) {
         self.init(
             timestamp: snapshot.timestamp,
@@ -3899,6 +3960,7 @@ public struct MemoryHistoryRecord: Codable, Sendable, Identifiable, Equatable {
             swapUsedBytes: snapshot.swapUsedBytes,
             workloads: groups.map(PersistedWorkloadRecord.init(group:)),
             workloadsSampledAt: workloadsSampledAt,
+            workloadInventoryIsComplete: workloadInventoryIsComplete,
             sourceSampledAt: snapshot.timestamp
         )
     }
@@ -3910,6 +3972,7 @@ public struct MemoryHistoryRecord: Codable, Sendable, Identifiable, Equatable {
             compressedBytes: entry.compressedBytes,
             swapUsedBytes: entry.swapUsedBytes,
             workloadsSampledAt: nil,
+            workloadInventoryIsComplete: nil,
             sourceSampledAt: entry.timestamp
         )
     }
@@ -3921,11 +3984,16 @@ public struct MemoryHistoryRecord: Codable, Sendable, Identifiable, Equatable {
         let availableFraction = try container.decode(Double.self, forKey: .availableFraction)
         let workloads = try container.decodeIfPresent([PersistedWorkloadRecord].self, forKey: .workloads) ?? []
         let workloadsSampledAt = try container.decodeIfPresent(Date.self, forKey: .workloadsSampledAt)
+        let workloadInventoryIsComplete = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .workloadInventoryIsComplete
+        )
         guard isPersistableDate(timestamp),
               sourceSampledAt.map(isPersistableDate) ?? true,
               availableFraction.isFinite,
               (0...1).contains(availableFraction),
-              workloadsSampledAt.map(isPersistableDate) ?? true else {
+              workloadsSampledAt.map(isPersistableDate) ?? true,
+              workloadsSampledAt != nil || workloadInventoryIsComplete == nil else {
             throw DecodingError.dataCorruptedError(
                 forKey: .timestamp,
                 in: container,
@@ -3939,6 +4007,7 @@ public struct MemoryHistoryRecord: Codable, Sendable, Identifiable, Equatable {
             swapUsedBytes: try container.decode(UInt64.self, forKey: .swapUsedBytes),
             workloads: workloads,
             workloadsSampledAt: workloadsSampledAt,
+            workloadInventoryIsComplete: workloadInventoryIsComplete,
             sourceSampledAt: sourceSampledAt
         )
     }
@@ -3949,6 +4018,7 @@ public struct MemoryHistoryRecord: Codable, Sendable, Identifiable, Equatable {
             && availableFraction.isFinite
             && (0...1).contains(availableFraction)
             && (workloadsSampledAt.map(isPersistableDate) ?? true)
+            && (workloadsSampledAt != nil || workloadInventoryIsComplete == nil)
             && workloads.allSatisfy(\.hasValidPersistedFields)
             && !hasInvalidFreshnessMarker
     }
@@ -4119,11 +4189,32 @@ public struct MemoryHistoryAnalyzer: Sendable {
                     events.append(swapEvent)
                 }
 
-                let gap = current.timestamp.timeIntervalSince(previous.timestamp)
-                if gap.isFinite, gap >= 0, gap <= workloadTransitionGapSeconds {
-                    events.append(contentsOf: workloadEvents(previous: previous, current: current))
-                }
             }
+        }
+
+        // Workload scans have an independent cadence from system samples.
+        // Skip system-only, partial, and legacy-unknown payloads while linking
+        // complete process inventories by their own strictly increasing
+        // source markers.
+        var previousWorkloadObservation: MemoryHistoryRecord?
+        for current in normalizedRecords {
+            guard current.workloadInventoryIsComplete == true,
+                  let currentSampleAt = current.workloadsSampledAt else {
+                continue
+            }
+            guard let previous = previousWorkloadObservation,
+                  let previousSampleAt = previous.workloadsSampledAt else {
+                previousWorkloadObservation = current
+                continue
+            }
+            // A duplicate or rolled-back marker is not a new observation and
+            // must not replace the valid baseline.
+            guard currentSampleAt > previousSampleAt else { continue }
+            let gap = currentSampleAt.timeIntervalSince(previousSampleAt)
+            if gap.isFinite, gap <= workloadTransitionGapSeconds {
+                events.append(contentsOf: workloadEvents(previous: previous, current: current))
+            }
+            previousWorkloadObservation = current
         }
 
         let sortedEvents = events
@@ -4245,9 +4336,11 @@ public struct MemoryHistoryAnalyzer: Sendable {
     ) -> [MemoryHistoryEvent] {
         // A system-only record has no fresh workload evidence. Do not turn a
         // missing attribution into a false appeared/disappeared/growth event.
-        guard let previousSampleAt = previous.workloadsSampledAt,
+        guard previous.workloadInventoryIsComplete == true,
+              current.workloadInventoryIsComplete == true,
+              let previousSampleAt = previous.workloadsSampledAt,
               let currentSampleAt = current.workloadsSampledAt,
-              currentSampleAt >= previousSampleAt else {
+              currentSampleAt > previousSampleAt else {
             return []
         }
         let previousByID = workloadDictionary(previous.workloads)
@@ -5437,6 +5530,7 @@ public actor HistoryStore {
         snapshot: SystemMemorySnapshot,
         groups: [WorkloadGroupSnapshot] = [],
         workloadsSampledAt: Date? = nil,
+        workloadInventoryIsComplete: Bool? = nil,
         now: Date = Date()
     ) throws -> [MemoryHistoryRecord] {
         try append(
@@ -5446,7 +5540,8 @@ public actor HistoryStore {
                 // Preserve the historical convenience behavior for this
                 // overload: callers that provide groups but no marker have
                 // traditionally meant "captured with this snapshot".
-                workloadsSampledAt: workloadsSampledAt ?? (groups.isEmpty ? nil : snapshot.timestamp)
+                workloadsSampledAt: workloadsSampledAt ?? (groups.isEmpty ? nil : snapshot.timestamp),
+                workloadInventoryIsComplete: workloadInventoryIsComplete
             ),
             now: now
         )
@@ -5984,6 +6079,7 @@ public actor HistoryStore {
             swapUsedBytes: record.swapUsedBytes,
             workloads: Self.compactedWorkloads(record.workloads, limit: maxPersistedWorkloads),
             workloadsSampledAt: record.workloadsSampledAt,
+            workloadInventoryIsComplete: record.workloadInventoryIsComplete,
             sourceSampledAt: record.sourceSampledAt
         )
     }
@@ -6019,6 +6115,7 @@ public actor HistoryStore {
             swapUsedBytes: preferredSystem.swapUsedBytes,
             workloads: workloadPayload.workloads,
             workloadsSampledAt: workloadPayload.sampledAt,
+            workloadInventoryIsComplete: workloadPayload.inventoryIsComplete,
             sourceSampledAt: preferredSystem.sourceSampledAt
         )
     }
@@ -6088,7 +6185,11 @@ public actor HistoryStore {
     public nonisolated static func preferredWorkloadPayload(
         existing: MemoryHistoryRecord,
         candidate: MemoryHistoryRecord
-    ) -> (workloads: [PersistedWorkloadRecord], sampledAt: Date?) {
+    ) -> (
+        workloads: [PersistedWorkloadRecord],
+        sampledAt: Date?,
+        inventoryIsComplete: Bool?
+    ) {
         let useCandidate: Bool
         switch (existing.workloadsSampledAt, candidate.workloadsSampledAt) {
         case (nil, nil):
@@ -6100,6 +6201,11 @@ public actor HistoryStore {
         case let (existingAt?, candidateAt?):
             if candidateAt != existingAt {
                 useCandidate = candidateAt > existingAt
+            } else if candidate.workloadInventoryIsComplete
+                        != existing.workloadInventoryIsComplete {
+                useCandidate = workloadCompletenessRank(
+                    candidate.workloadInventoryIsComplete
+                ) > workloadCompletenessRank(existing.workloadInventoryIsComplete)
             } else {
                 useCandidate = compareWorkloadArrays(candidate.workloads, existing.workloads) > 0
             }
@@ -6108,8 +6214,17 @@ public actor HistoryStore {
         let selected = useCandidate ? candidate : existing
         return (
             workloads: canonicalWorkloads(selected.workloads),
-            sampledAt: selected.workloadsSampledAt
+            sampledAt: selected.workloadsSampledAt,
+            inventoryIsComplete: selected.workloadInventoryIsComplete
         )
+    }
+
+    private nonisolated static func workloadCompletenessRank(_ value: Bool?) -> Int {
+        switch value {
+        case true: return 2
+        case false: return 1
+        case nil: return 0
+        }
     }
 
     private nonisolated static func canonicalWorkloads(
