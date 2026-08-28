@@ -141,6 +141,8 @@ final class LoginLaunchCoordinator: ObservableObject {
 
     private let runtime: any LoginLaunchRuntime
     private var operationTask: Task<Void, Never>?
+    private var operationToken = UUID()
+    private var cancellationRefreshToken: UUID?
 
     init(runtime: (any LoginLaunchRuntime)? = nil) {
         self.runtime = runtime ?? LiveLoginLaunchRuntime()
@@ -158,34 +160,87 @@ final class LoginLaunchCoordinator: ObservableObject {
     func refreshStatus() {
         guard !isUpdating else { return }
         status = runtime.status()
-        lastError = nil
+        // Keep an operation error visible until a subsequent enable/disable
+        // attempt succeeds. A passive status refresh must not make a failed
+        // registration look healthy while the underlying problem remains.
     }
 
     func setEnabled(_ enabled: Bool) {
         guard !isUpdating else { return }
         isUpdating = true
         lastError = nil
+        cancellationRefreshToken = nil
 
         operationTask?.cancel()
+        let token = UUID()
+        operationToken = token
+        let runtime = self.runtime
         operationTask = Task { [weak self] in
-            guard let self else { return }
+            defer {
+                if let self, self.operationToken == token {
+                    self.isUpdating = false
+                    self.operationTask = nil
+                }
+            }
+
             do {
                 if enabled {
                     try await runtime.register()
                 } else {
                     try await runtime.unregister()
                 }
-                guard !Task.isCancelled else { return }
-                status = runtime.status()
-                if enabled, !status.isRegistered {
-                    lastError = "系统没有确认登录启动已注册，请检查登录项设置。"
+                guard !Task.isCancelled,
+                      let self,
+                      self.operationToken == token else {
+                    return
+                }
+                self.status = runtime.status()
+                if enabled, !self.status.isRegistered {
+                    self.lastError = "系统没有确认登录启动已注册，请检查登录项设置。"
+                } else if !enabled, self.status.isRegistered {
+                    self.lastError = "系统没有确认登录启动已关闭，请检查登录项设置。"
+                } else {
+                    self.lastError = nil
                 }
             } catch {
-                guard !Task.isCancelled else { return }
-                status = runtime.status()
-                lastError = error.localizedDescription
+                guard !Task.isCancelled,
+                      let self,
+                      self.operationToken == token else {
+                    return
+                }
+                self.status = runtime.status()
+                self.lastError = error.localizedDescription
             }
-            isUpdating = false
+        }
+    }
+
+    /// Cancels an in-flight registration change without allowing its eventual
+    /// completion to overwrite newer UI state. Runtime implementations are
+    /// expected to observe task cancellation, but the coordinator also clears
+    /// its own state immediately so a slow system service cannot leave the
+    /// toggle stuck in an indeterminate state.
+    func cancelUpdate() {
+        guard isUpdating else { return }
+        let taskBeingCancelled = operationTask
+        let runtime = self.runtime
+        let refreshToken = UUID()
+        operationToken = UUID()
+        cancellationRefreshToken = refreshToken
+        taskBeingCancelled?.cancel()
+        operationTask = nil
+        isUpdating = false
+
+        // Some system services complete a registration request even after the
+        // Swift task has been cancelled. Wait for that old task and refresh
+        // the observed status, while keeping a newer enable/disable request
+        // authoritative through the token check.
+        Task { [weak self] in
+            await taskBeingCancelled?.value
+            guard let self,
+                  self.cancellationRefreshToken == refreshToken,
+                  !self.isUpdating else { return }
+            self.status = runtime.status()
+            self.cancellationRefreshToken = nil
         }
     }
 
@@ -249,6 +304,14 @@ struct MonitorHealthInput: Equatable, Sendable {
     let loginStatus: LoginLaunchStatus
     let loginError: String?
     let checkedAt: Date
+    /// Optional payload validation supplied by the live monitor. A nil value
+    /// skips only payload consistency validation; usable statuses still need a
+    /// finite sample timestamp so freshness can be established.
+    let systemDataIsUsable: Bool?
+    /// The instant against which sample freshness is evaluated. It is
+    /// separate from `checkedAt` so a caller can keep the displayed check
+    /// timestamp stable while still detecting samples that have gone stale.
+    let now: Date
 
     init(
         systemStatus: SampleStatus,
@@ -264,7 +327,9 @@ struct MonitorHealthInput: Equatable, Sendable {
         auditError: String?,
         loginStatus: LoginLaunchStatus,
         loginError: String?,
-        checkedAt: Date
+        checkedAt: Date,
+        systemDataIsUsable: Bool? = nil,
+        now: Date? = nil
     ) {
         self.systemStatus = systemStatus
         self.cpuStatus = cpuStatus
@@ -280,25 +345,39 @@ struct MonitorHealthInput: Equatable, Sendable {
         self.loginStatus = loginStatus
         self.loginError = loginError
         self.checkedAt = checkedAt
+        self.systemDataIsUsable = systemDataIsUsable
+        self.now = now ?? checkedAt
     }
 }
 
 enum MonitorHealthEvaluator {
+    private static let systemStaleAfter: TimeInterval = 90
+    private static let cpuStaleAfter: TimeInterval = 90
+    private static let processStaleAfter: TimeInterval = 120
+    private static let gpuStaleAfter: TimeInterval = 180
+
     static func evaluate(_ input: MonitorHealthInput) -> MonitorHealthSnapshot {
         var items: [MonitorHealthItem] = []
         items.append(metricItem(
             id: "system",
             title: "系统内存",
             status: input.systemStatus,
-            estimatedDetail: "内存使用率按可回收内存估算"
+            estimatedDetail: "内存使用率按可回收内存估算",
+            now: input.now,
+            staleAfter: systemStaleAfter,
+            staleLevel: .attention,
+            dataIsUsable: input.systemDataIsUsable
         ))
         items.append(metricItem(
             id: "cpu",
             title: "CPU 采样",
             status: input.cpuStatus,
-            estimatedDetail: "使用整机累计计数计算"
+            estimatedDetail: "使用整机累计计数计算",
+            now: input.now,
+            staleAfter: cpuStaleAfter,
+            staleLevel: .degraded
         ))
-        items.append(gpuItem(input.gpuStatus))
+        items.append(gpuItem(input.gpuStatus, now: input.now))
         items.append(processItem(input))
         items.append(samplingItem(input.samplingDiagnostics))
         items.append(historyItem(input))
@@ -317,25 +396,51 @@ enum MonitorHealthEvaluator {
         id: String,
         title: String,
         status: SampleStatus,
-        estimatedDetail: String
+        estimatedDetail: String,
+        now: Date,
+        staleAfter: TimeInterval,
+        staleLevel: MonitorHealthLevel,
+        dataIsUsable: Bool? = nil
     ) -> MonitorHealthItem {
         switch status.quality {
-        case .available:
-            return MonitorHealthItem(
-                id: id,
-                title: title,
-                status: "实时",
-                detail: status.message ?? estimatedDetail,
-                level: .healthy
-            )
-        case .estimated:
-            return MonitorHealthItem(
-                id: id,
-                title: title,
-                status: "部分可用",
-                detail: status.message ?? estimatedDetail,
-                level: .healthy
-            )
+        case .available, .estimated:
+            let baseStatus = status.quality == .available ? "实时" : "部分可用"
+            let baseDetail = status.message ?? estimatedDetail
+            if dataIsUsable == false {
+                return MonitorHealthItem(
+                    id: id,
+                    title: title,
+                    status: "数据异常",
+                    detail: baseDetail + "；采样值未通过一致性校验",
+                    level: staleLevel
+                )
+            }
+            switch freshness(of: status, now: now, staleAfter: staleAfter) {
+            case .fresh:
+                return MonitorHealthItem(
+                    id: id,
+                    title: title,
+                    status: baseStatus,
+                    detail: baseDetail,
+                    level: .healthy
+                )
+            case .stale(let age):
+                return MonitorHealthItem(
+                    id: id,
+                    title: title,
+                    status: "已过期",
+                    detail: baseDetail + "；距采样 " + formatAge(age),
+                    level: staleLevel
+                )
+            case .invalid:
+                return MonitorHealthItem(
+                    id: id,
+                    title: title,
+                    status: "时间异常",
+                    detail: baseDetail + "；采样时间无效或晚于诊断时间",
+                    level: staleLevel
+                )
+            }
         case .unavailable:
             return MonitorHealthItem(
                 id: id,
@@ -355,24 +460,39 @@ enum MonitorHealthEvaluator {
         }
     }
 
-    private static func gpuItem(_ status: SampleStatus) -> MonitorHealthItem {
+    private static func gpuItem(_ status: SampleStatus, now: Date) -> MonitorHealthItem {
         switch status.quality {
-        case .available:
-            return MonitorHealthItem(
-                id: "gpu",
-                title: "GPU 采样",
-                status: "实时",
-                detail: status.message ?? "IOAccelerator 利用率可用",
-                level: .healthy
-            )
-        case .estimated:
-            return MonitorHealthItem(
-                id: "gpu",
-                title: "GPU 采样",
-                status: "部分可用",
-                detail: status.message ?? "GPU 利用率为估算值",
-                level: .degraded
-            )
+        case .available, .estimated:
+            let baseStatus = status.quality == .available ? "实时" : "部分可用"
+            let baseDetail = status.message ?? (status.quality == .available
+                ? "IOAccelerator 利用率可用"
+                : "GPU 利用率为估算值")
+            switch freshness(of: status, now: now, staleAfter: gpuStaleAfter) {
+            case .fresh:
+                return MonitorHealthItem(
+                    id: "gpu",
+                    title: "GPU 采样",
+                    status: baseStatus,
+                    detail: baseDetail,
+                    level: status.quality == .available ? .healthy : .degraded
+                )
+            case .stale(let age):
+                return MonitorHealthItem(
+                    id: "gpu",
+                    title: "GPU 采样",
+                    status: "已过期",
+                    detail: baseDetail + "；距采样 " + formatAge(age) + "，不影响内存监视",
+                    level: .degraded
+                )
+            case .invalid:
+                return MonitorHealthItem(
+                    id: "gpu",
+                    title: "GPU 采样",
+                    status: "时间异常",
+                    detail: baseDetail + "；采样时间无效或晚于诊断时间，不影响内存监视",
+                    level: .degraded
+                )
+            }
         case .unavailable:
             return MonitorHealthItem(
                 id: "gpu",
@@ -399,22 +519,44 @@ enum MonitorHealthEvaluator {
             ? "已读取 " + String(observed) + "/" + String(listed) + " 个进程"
             : "尚未读取进程条目"
         switch input.processStatus.quality {
-        case .available:
-            return MonitorHealthItem(
-                id: "processes",
-                title: "进程读取",
-                status: "完整",
-                detail: coverage,
-                level: .healthy
-            )
-        case .estimated:
-            return MonitorHealthItem(
-                id: "processes",
-                title: "进程读取",
-                status: "部分可用",
-                detail: [coverage, input.processStatus.message ?? "部分条目受权限限制"].joined(separator: "；"),
-                level: .degraded
-            )
+        case .available, .estimated:
+            let baseStatus = input.processStatus.quality == .available ? "完整" : "部分可用"
+            let baseDetail = [
+                coverage,
+                input.processStatus.message ?? (input.processStatus.quality == .available
+                    ? ""
+                    : "部分条目受权限限制")
+            ].filter { !$0.isEmpty }.joined(separator: "；")
+            switch freshness(
+                of: input.processStatus,
+                now: input.now,
+                staleAfter: processStaleAfter
+            ) {
+            case .fresh:
+                return MonitorHealthItem(
+                    id: "processes",
+                    title: "进程读取",
+                    status: baseStatus,
+                    detail: baseDetail,
+                    level: input.processStatus.quality == .available ? .healthy : .degraded
+                )
+            case .stale(let age):
+                return MonitorHealthItem(
+                    id: "processes",
+                    title: "进程读取",
+                    status: "已过期",
+                    detail: baseDetail + "；距采样 " + formatAge(age) + "，显示内容仅供参考",
+                    level: .attention
+                )
+            case .invalid:
+                return MonitorHealthItem(
+                    id: "processes",
+                    title: "进程读取",
+                    status: "时间异常",
+                    detail: baseDetail + "；采样时间无效或晚于诊断时间",
+                    level: .attention
+                )
+            }
         case .unavailable:
             let detail = observed > 0
                 ? coverage + "；显示最近一次成功采样"
@@ -529,13 +671,21 @@ enum MonitorHealthEvaluator {
             return value
         }.joined(separator: "；")
         let level: MonitorHealthLevel
-        switch status {
-        case .enabled, .notRegistered:
-            level = .healthy
-        case .requiresApproval, .unavailable:
-            level = .degraded
-        case .notFound, .failed:
+        if let error, !error.isEmpty {
+            // A runtime status can remain `.notRegistered` after a failed
+            // register/unregister call. The explicit error is stronger
+            // evidence than that stale status and must be reflected in the
+            // overall health level.
             level = .attention
+        } else {
+            switch status {
+            case .enabled, .notRegistered:
+                level = .healthy
+            case .requiresApproval, .unavailable:
+                level = .degraded
+            case .notFound, .failed:
+                level = .attention
+            }
         }
         return MonitorHealthItem(
             id: "login",
@@ -544,6 +694,45 @@ enum MonitorHealthEvaluator {
             detail: detail,
             level: level
         )
+    }
+
+    private enum SampleFreshness {
+        case fresh
+        case stale(TimeInterval)
+        case invalid
+    }
+
+    private static func freshness(
+        of status: SampleStatus,
+        now: Date,
+        staleAfter: TimeInterval
+    ) -> SampleFreshness {
+        guard let sampledAt = status.sampledAt,
+              sampledAt.timeIntervalSince1970.isFinite,
+              now.timeIntervalSince1970.isFinite,
+              staleAfter.isFinite,
+              staleAfter >= 0 else {
+            return .invalid
+        }
+        let age = now.timeIntervalSince(sampledAt)
+        guard age.isFinite else { return .invalid }
+        // A small negative age is normal when independent providers finish a
+        // few milliseconds after the diagnostic timestamp. Larger future
+        // values indicate a broken clock or malformed input.
+        if age < -5 { return .invalid }
+        if age > staleAfter { return .stale(age) }
+        return .fresh
+    }
+
+    private static func formatAge(_ age: TimeInterval) -> String {
+        guard age.isFinite, age >= 0 else { return "时间未知" }
+        if age < 60 {
+            return String(format: "%.0f 秒", age)
+        }
+        if age < 3_600 {
+            return String(format: "%.0f 分钟", age / 60)
+        }
+        return String(format: "%.1f 小时", age / 3_600)
     }
 }
 

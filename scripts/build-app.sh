@@ -15,8 +15,8 @@ else
 	# the signature after the build completes.
 	output_root="$HOME/Library/Application Support/MemoryMonitor/dist"
 fi
-app_version="${APP_VERSION:-1.0.0}"
-build_number="${BUILD_NUMBER:-10}"
+app_version="${APP_VERSION:-1.0.1}"
+build_number="${BUILD_NUMBER:-11}"
 signing_identity="${CODE_SIGN_IDENTITY:--}"
 skip_signing="${SKIP_SIGNING:-0}"
 binary_name="memory-monitor-app"
@@ -46,13 +46,28 @@ for command_name in swift plutil file install codesign xattr ditto mktemp; do
 	fi
 done
 
+if [[ -z "$output_root" ]]; then
+	print -u2 "Refusing to use an empty OUTPUT_DIR"
+	exit 2
+fi
 if [[ "$output_root" != /* ]]; then
 	output_root="$project_root/$output_root"
 fi
-if [[ -z "$output_root" || "$output_root" == "/" || "$output_root" == "$project_root" ]]; then
+
+# `${path:A}` resolves dot segments and every existing symlink component while
+# preserving a useful path for directories that have not been created yet.
+# Always compare canonical paths: a textual prefix check would let `.`/`..`,
+# trailing slashes, or a symlink point the destructive replacement into the
+# source tree.
+canonical_project_root="${project_root:A}"
+canonical_output_root="${output_root:A}"
+if [[ -z "$canonical_output_root" || "$canonical_output_root" == "/" || \
+	"$canonical_output_root" == "$canonical_project_root" || \
+	"$canonical_output_root" == "$canonical_project_root"/* ]]; then
 	print -u2 "Refusing to use an unsafe OUTPUT_DIR: $output_root"
 	exit 2
 fi
+output_root="$canonical_output_root"
 
 # Walk every ancestor because OUTPUT_DIR itself may not exist yet. iCloud
 # Drive and other File Provider locations expose a domain attribute on one of
@@ -107,6 +122,16 @@ if [[ "$binary_description" != *arm64* ]]; then
 fi
 
 mkdir -p "$output_root"
+# `mkdir -p` can follow a symlink created between the initial check and this
+# point. Resolve once more and stop if the destination changed underneath us.
+canonical_output_after_mkdir="${output_root:A}"
+if [[ -z "$canonical_output_after_mkdir" || \
+	"$canonical_output_after_mkdir" != "$output_root" || \
+	"$canonical_output_after_mkdir" == "$canonical_project_root" || \
+	"$canonical_output_after_mkdir" == "$canonical_project_root"/* ]]; then
+	print -u2 "OUTPUT_DIR changed or resolves into the project: $output_root"
+	exit 2
+fi
 app_path="$output_root/$app_name"
 staging_root="$(mktemp -d "${TMPDIR:-/tmp}/memory-monitor-app.XXXXXX")"
 trap 'if [[ -n "${staging_root:-}" && -d "$staging_root" ]]; then rm -rf -- "$staging_root"; fi' EXIT
@@ -138,8 +163,14 @@ if [[ "$skip_signing" != "1" ]]; then
 fi
 
 # Replace only the generated app path. The parent directory is user-selected,
-# while the bundle itself is the artifact owned by this script.
-if [[ -e "$app_path" || -L "$app_path" ]]; then
+# while the bundle itself is the artifact owned by this script. Never remove a
+# symlink here: even though `rm` normally unlinks the link itself, rejecting it
+# avoids a race or a surprising replacement of a user-managed alias.
+if [[ -L "$app_path" ]]; then
+	print -u2 "Refusing to replace a symlink at $app_path"
+	exit 2
+fi
+if [[ -e "$app_path" ]]; then
 	rm -rf -- "$app_path"
 fi
 ditto --norsrc "$staged_app_path" "$app_path"

@@ -4,7 +4,7 @@ import MemoryMonitorCore
 let snapshot = MonitorSampler().sample()
 
 do {
-    guard let system = snapshot.system else {
+    guard let system = snapshot.validatedSystemSample else {
         throw MemoryMonitorError.invalidData(
             description: "系统指标不可用：\(snapshot.systemStatus.shortDescription)"
         )
@@ -42,7 +42,9 @@ do {
     for process in processes.prefix(20) {
         let name = String(process.name.prefix(27))
         let pathName = process.executablePath.map { URL(fileURLWithPath: $0).lastPathComponent }
-        let displayName = pathName.flatMap { $0.isEmpty ? nil : $0 } ?? name
+        let displayName = pathName
+            .flatMap { WorkingDirectoryLabelSanitizer.label(fromComponent: $0) }
+            ?? name
         let footprint = process.physicalFootprintIsEstimated
             ? "~" + MemoryFormatter.bytes(process.physicalFootprintBytes)
             : MemoryFormatter.bytes(process.physicalFootprintBytes)

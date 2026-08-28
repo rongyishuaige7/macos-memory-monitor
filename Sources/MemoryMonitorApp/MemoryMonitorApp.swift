@@ -6,6 +6,21 @@ import Foundation
 import MemoryMonitorCore
 import SwiftUI
 
+@MainActor
+protocol MonitorSamplingSource {
+    func sample(mode: SamplingMode, at timestamp: Date) async -> MonitorSnapshot
+}
+
+@MainActor
+extension MonitorSampler: MonitorSamplingSource {
+    func sample(mode: SamplingMode, at timestamp: Date) async -> MonitorSnapshot {
+        let sampler = self
+        return await Task.detached(priority: .utility) {
+            sampler.sample(mode: mode, at: timestamp)
+        }.value
+    }
+}
+
 @main
 struct MemoryMonitorApp: App {
     @StateObject private var model = MonitorViewModel()
@@ -16,7 +31,7 @@ struct MemoryMonitorApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            MonitorPopover(model: model)
+            MonitorPopover(model: model, processActions: model.processActions)
                 .onAppear { model.setPanelPresented(true) }
                 .onDisappear { model.setPanelPresented(false) }
         } label: {
@@ -30,6 +45,11 @@ struct MemoryMonitorApp: App {
 final class MonitorViewModel: ObservableObject {
     @Published private(set) var system: SystemMemorySnapshot?
     @Published private(set) var systemStatus = SampleStatus.unavailable(message: "等待首次采样")
+    /// Indicates that the current `system` value belongs to a validated,
+    /// finite sampling pass. `system` itself is retained across provider
+    /// failures so the UI can avoid destructive resets, but must not be
+    /// presented as current data when this flag is false.
+    @Published private(set) var systemDataIsUsable = false
     @Published private(set) var cpuUsageFraction: Double?
     @Published private(set) var cpuStatus = SampleStatus.unavailable(message: "等待首次采样")
     @Published private(set) var gpuUsageFraction: Double?
@@ -60,31 +80,101 @@ final class MonitorViewModel: ObservableObject {
     let processActions: ProcessActionController
     let loginLaunch: LoginLaunchCoordinator
     private var refreshTask: Task<Void, Never>?
-    private let sampler = MonitorSampler()
+    private let sampler: any MonitorSamplingSource
     private let samplingPolicy = AdaptiveSamplingPolicy()
     private let recommendationEngine = RecommendationEngine()
     private let historyAnalyzer = MemoryHistoryAnalyzer()
     private var pressureEvaluator = MemoryPressureEvaluator()
     private let refreshWakeup = RefreshWakeup()
-    private let historyStore = HistoryStore()
-    private var historyBuffer = MemoryHistoryBuffer(capacity: 60)
+    private let historyStore: HistoryStore
     private var historyStoreAvailable = true
+    private var historyLoaded = false
+    /// Samples kept in memory while the durable history store is unavailable.
+    /// They are merged into the actor before the store is marked recovered.
+    private var fallbackHistory: [MemoryHistoryRecord] = []
+    private let historyRetentionInterval = HistoryStore.defaultRetentionInterval
+    /// Retention must not widen when the wall clock moves backwards. Keep the
+    /// latest finite persistence instant observed by this model and use it as
+    /// the lower bound for subsequent pruning/recovery attempts.
+    private var latestHistoryNow: Date?
+    private var historyRetryAfter: Date?
+    private var historyRetryAttempt = 0
+    private let historyRetryBaseInterval: TimeInterval = 30
+    private let historyRetryMaxInterval: TimeInterval = 5 * 60
+    private var refreshInFlight = false
+    private let refreshClock = ContinuousClock()
+    private let clockRollbackTolerance: TimeInterval = 1
+    private var refreshEpoch: UInt64 = 0
+    private var lastObservedRefreshRequest: (
+        timestamp: Date,
+        instant: ContinuousClock.Instant
+    )?
+    /// Calls arriving while a sample is in progress are coalesced to the
+    /// latest request. Each caller still waits until that coalesced pass has
+    /// completed, so a health refresh cannot report success prematurely.
+    private struct QueuedRefresh {
+        let timestamp: Date
+        let epoch: UInt64
+        let requestSequence: UInt64
+        let token: UUID
+        let continuation: CheckedContinuation<Void, Never>
+    }
+    private var queuedRefreshes: [QueuedRefresh] = []
+    private var nextRefreshSequence: UInt64 = 0
+    /// The last pass accepted by the UI. A provider can return a delayed
+    /// snapshot after a newer request was already applied; accepting it would
+    /// move timestamps and every cross-sample baseline backwards.
+    private var lastAcceptedPass: (
+        timestamp: Date,
+        epoch: UInt64,
+        requestSequence: UInt64
+    )?
     private var previousCPUTime: CPUTimeSnapshot?
-    private var lastProcessSampleAt: Date?
+    private var lastUsableProcessSampleAt: Date?
     private var previousRecommendationSystem: SystemMemorySnapshot?
     private var previousRecommendationProcessSystem: SystemMemorySnapshot?
     private var previousRecommendationGroups: [WorkloadGroupSnapshot] = []
     private var previousRecommendationProcessStatus: SampleStatus?
+    private var previousRecommendationProcessInventoryIsComplete = false
     private var previousRecommendationPressureLevel: MemoryPressureLevel?
     private var lastRecommendationKey: String?
     private var lastRecommendationAt: Date?
     private let recommendationCooldown: TimeInterval = 30 * 60
+    private let monitorProcessID = Int32(ProcessInfo.processInfo.processIdentifier)
 
-    init(loginLaunchRuntime: (any LoginLaunchRuntime)? = nil) {
+    init(
+        loginLaunchRuntime: (any LoginLaunchRuntime)? = nil,
+        sampler: any MonitorSamplingSource = MonitorSampler(),
+        historyStore: HistoryStore = HistoryStore(),
+        startRefreshTask: Bool = true
+    ) {
         processActions = ProcessActionController()
         loginLaunch = LoginLaunchCoordinator(runtime: loginLaunchRuntime)
-        refreshTask = Task { [weak self] in
-            await self?.refreshLoop()
+        self.sampler = sampler
+        self.historyStore = historyStore
+        if startRefreshTask {
+            refreshTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    // Keep the model alive only while a single refresh pass
+                    // is running. The cadence wait below must not call an
+                    // instance method, otherwise the task would retain the
+                    // model through the entire wait and form a cycle with
+                    // `refreshTask`.
+                    guard let waitConfiguration = await self?.refreshPass() else {
+                        return
+                    }
+                    guard await Self.waitForNextSample(
+                        interval: waitConfiguration.interval,
+                        wakeup: waitConfiguration.wakeup
+                    ) else {
+                        break
+                    }
+                }
+
+                // A normal cancellation (for example during deinit) still
+                // gets a best-effort flush while the model is available.
+                await self?.finishRefreshLoop()
+            }
         }
     }
 
@@ -93,7 +183,7 @@ final class MonitorViewModel: ObservableObject {
     }
 
     var pressure: PressureState {
-        guard systemStatus.quality.isUsable, let pressureLevel else { return .unknown }
+        guard systemDataIsUsable, let pressureLevel else { return .unknown }
         return PressureState(level: pressureLevel)
     }
 
@@ -102,7 +192,15 @@ final class MonitorViewModel: ObservableObject {
         case .available:
             return "已采集 \(observedProcessCount) 个进程"
         case .estimated:
-            return "已采集 \(observedProcessCount)/\(listedProcessCount) 个进程"
+            let observed = observedProcessCount > 0
+                ? observedProcessCount
+                : samplingDiagnostics.processCount
+            let listed = listedProcessCount > 0
+                ? listedProcessCount
+                : samplingDiagnostics.listedProcessCount
+            return observed > 0
+                ? "已采集 \(observed)/\(listed) 个进程"
+                : "进程数据部分可用"
         case .unavailable, .error:
             return observedProcessCount > 0
                 ? "上次采样 \(observedProcessCount) 个进程"
@@ -111,6 +209,9 @@ final class MonitorViewModel: ObservableObject {
     }
 
     var samplingIssueDescription: String? {
+        if !systemDataIsUsable, systemStatus.quality.isUsable {
+            return "系统采样时间无效或与当前采样不一致"
+        }
         let statuses = [systemStatus, cpuStatus, gpuStatus, processStatus]
         let issues = statuses.compactMap { status -> String? in
             guard status.quality == .error else { return nil }
@@ -162,7 +263,9 @@ final class MonitorViewModel: ObservableObject {
                 auditError: processActions.auditError,
                 loginStatus: loginLaunch.status,
                 loginError: loginLaunch.lastError,
-                checkedAt: healthCheckedAt
+                checkedAt: healthCheckedAt,
+                systemDataIsUsable: systemDataIsUsable,
+                now: Date()
             )
         )
     }
@@ -226,122 +329,643 @@ final class MonitorViewModel: ObservableObject {
     }
 
     func refreshHealth() {
-        healthCheckedAt = Date()
         loginLaunch.refreshStatus()
+        // The health panel's action is an actual state refresh, not only a
+        // timestamp update. refreshOnce serializes with the regular loop so
+        // a manually requested pass cannot race a background sample.
+        Task { [weak self] in
+            guard let self else { return }
+            await self.refreshOnce(at: Date())
+            // Publish the check marker only after the requested sampling pass
+            // (including any queued/latest-request coalescing) has finished.
+            self.healthCheckedAt = Date()
+        }
     }
 
-    private func refreshLoop() async {
+    private struct RefreshWaitConfiguration {
+        let interval: TimeInterval
+        let wakeup: RefreshWakeup
+    }
+
+    /// Runs one pass and returns only the values needed by the cadence wait.
+    /// Keeping this finite is important: the task can release its temporary
+    /// strong reference to `self` before entering the next wait.
+    private func refreshPass() async -> RefreshWaitConfiguration {
+        await refreshOnce(at: Date())
+        return RefreshWaitConfiguration(
+            interval: samplingPolicy.intervalSeconds(
+                panelPresented: isPanelPresented,
+                pressureActive: pressureEvaluator.pressureActiveForSampling
+            ),
+            wakeup: refreshWakeup
+        )
+    }
+
+    private func finishRefreshLoop() async {
+        let now = effectiveHistoryNow(Date())
         do {
-            history = try await historyStore.load()
+            // Retry the complete recovery path during shutdown. A transient
+            // write failure may have left samples in `fallbackHistory`; a
+            // simple flush would be a no-op when the actor had not loaded
+            // successfully and would lose those samples on process exit.
+            _ = try await historyStore.load(now: now)
+            if !fallbackHistory.isEmpty {
+                _ = try await historyStore.merge(records: fallbackHistory, now: now)
+            }
+            try await historyStore.flush(now: now)
+            history = try await historyStore.currentRecords(now: now)
+            fallbackHistory.removeAll(keepingCapacity: false)
+            historyStoreAvailable = true
+            historyLoaded = true
             historyError = nil
+            historyRetryAfter = nil
+            historyRetryAttempt = 0
         } catch {
             historyStoreAvailable = false
             historyError = error.localizedDescription
+            scheduleHistoryRetry(after: now)
         }
         historyDiagnostics = await historyStore.diagnostics()
+    }
 
-        while !Task.isCancelled {
-            let mode = samplingPolicy.samplingMode(
-                panelPresented: isPanelPresented,
-                pressureActive: pressureEvaluator.pressureActiveForSampling,
-                now: Date(),
-                lastProcessSampleAt: lastProcessSampleAt
+    func refreshOnce(at timestamp: Date = Date()) async {
+        guard timestamp.timeIntervalSince1970.isFinite else {
+            lastError = "采样时间无效"
+            return
+        }
+
+        let requestSequence = nextRefreshSequence
+        nextRefreshSequence &+= 1
+        let epoch = refreshEpochForRequest(
+            at: timestamp,
+            observedAt: refreshClock.now
+        )
+
+        if refreshInFlight {
+            await enqueueRefresh(
+                at: timestamp,
+                epoch: epoch,
+                requestSequence: requestSequence
             )
-            let snapshot = await Task.detached(priority: .utility) { [sampler] in
-                sampler.sample(mode: mode)
-            }.value
+            return
+        }
 
-            samplingDiagnostics = snapshot.diagnostics
-            systemStatus = snapshot.systemStatus
-            cpuStatus = snapshot.cpuStatus
-            gpuStatus = snapshot.gpuStatus
+        refreshInFlight = true
+        await performRefresh(
+            at: timestamp,
+            epoch: epoch,
+            requestSequence: requestSequence
+        )
 
-            if snapshot.didSampleProcesses {
-                lastProcessSampleAt = snapshot.timestamp
-                processStatus = snapshot.processStatus
-                if snapshot.processStatus.quality.isUsable {
-                    processes = snapshot.processes
-                    groups = snapshot.groups
-                    observedProcessCount = snapshot.sampledProcessCount
-                    listedProcessCount = snapshot.listedProcessCount
-                }
+        // Drain the one-slot queue synchronously. New callers can re-enter
+        // while `performRefresh` awaits the sampler; taking and clearing the
+        // array happens in one actor-isolated segment, so no request can be
+        // lost between passes.
+        while !queuedRefreshes.isEmpty {
+            let queued = queuedRefreshes
+            queuedRefreshes.removeAll(keepingCapacity: true)
+            if let latest = queued.max(by: Self.refreshRequestPrecedes) {
+                await performRefresh(
+                    at: latest.timestamp,
+                    epoch: latest.epoch,
+                    requestSequence: latest.requestSequence
+                )
             }
-
-            if let systemSnapshot = snapshot.system {
-                pressureLevel = pressureEvaluator.update(snapshot: systemSnapshot)
-                historyBuffer.append(snapshot: systemSnapshot)
-                if historyStoreAvailable {
-                    do {
-                        history = try await historyStore.append(
-                            snapshot: systemSnapshot,
-                            groups: groups,
-                            now: snapshot.timestamp
-                        )
-                        historyError = nil
-                        historyDiagnostics = await historyStore.diagnostics()
-                    } catch {
-                        historyStoreAvailable = false
-                        historyError = error.localizedDescription
-                        history = historyBuffer.entries.map { MemoryHistoryRecord(entry: $0) }
-                        historyDiagnostics = await historyStore.diagnostics()
-                    }
-                } else {
-                    history = historyBuffer.entries.map { MemoryHistoryRecord(entry: $0) }
-                }
-                system = systemSnapshot
+            for waiter in queued {
+                waiter.continuation.resume()
             }
+        }
+        refreshInFlight = false
+    }
 
-            let recommendationContext = RecommendationContext(
-                current: snapshot,
-                previousSystem: previousRecommendationSystem,
-                previousProcessSystem: previousRecommendationProcessSystem,
-                previousGroups: previousRecommendationGroups,
-                previousProcessStatus: previousRecommendationProcessStatus,
-                pressureLevel: pressureLevel,
-                previousPressureLevel: previousRecommendationPressureLevel
-            )
+    private func performRefresh(
+        at timestamp: Date,
+        epoch: UInt64,
+        requestSequence: UInt64
+    ) async {
+        // A queued request can carry an older wall-clock instant than the pass
+        // already shown (for example after a delayed health refresh). Skip the
+        // expensive provider/history work rather than allowing it to alter
+        // retention anchors or diagnostics.
+        guard canStartPass(
+            timestamp: timestamp,
+            epoch: epoch,
+            requestSequence: requestSequence
+        ) else {
+            return
+        }
+        let persistenceNow = effectiveHistoryNow(timestamp)
+        await loadHistoryIfNeeded(at: persistenceNow)
+        let mode = samplingPolicy.samplingMode(
+            panelPresented: isPanelPresented,
+            pressureActive: pressureEvaluator.pressureActiveForSampling,
+            now: timestamp,
+            lastProcessSampleAt: lastUsableProcessSampleAt
+        )
+        let snapshot = await sampler.sample(mode: mode, at: timestamp)
+        guard snapshot.timestamp.timeIntervalSince1970.isFinite else {
+            lastError = "采样源返回了无效时间"
+            return
+        }
+        await apply(
+            snapshot: snapshot,
+            persistenceNow: effectiveHistoryNow(snapshot.timestamp),
+            epoch: epoch,
+            requestSequence: requestSequence
+        )
+    }
 
-            if let cpuTime = snapshot.cpuTime, snapshot.cpuStatus.quality.isUsable {
-                cpuUsageFraction = previousCPUTime.flatMap {
-                    CPUUsageCalculator.usedFraction(current: cpuTime, previous: $0)
+    private func enqueueRefresh(
+        at timestamp: Date,
+        epoch: UInt64,
+        requestSequence: UInt64
+    ) async {
+        let token = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                if Task.isCancelled {
+                    continuation.resume()
+                    return
                 }
-                previousCPUTime = cpuTime
+                queuedRefreshes.append(
+                    QueuedRefresh(
+                        timestamp: timestamp,
+                        epoch: epoch,
+                        requestSequence: requestSequence,
+                        token: token,
+                        continuation: continuation
+                    )
+                )
+            }
+        } onCancel: { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.cancelQueuedRefresh(token: token)
+            }
+        }
+    }
+
+    private func cancelQueuedRefresh(token: UUID) {
+        guard !queuedRefreshes.isEmpty else { return }
+        var retained: [QueuedRefresh] = []
+        retained.reserveCapacity(queuedRefreshes.count)
+        for waiter in queuedRefreshes {
+            if waiter.token == token {
+                waiter.continuation.resume()
             } else {
-                cpuUsageFraction = nil
-                previousCPUTime = nil
+                retained.append(waiter)
             }
+        }
+        queuedRefreshes = retained
+    }
 
-            gpuUsageFraction = snapshot.gpuStatus.quality.isUsable
-                ? snapshot.gpuUsageFraction
-                : nil
+    private func loadHistoryIfNeeded(at timestamp: Date) async {
+        if historyLoaded {
+            guard !historyStoreAvailable,
+                  let retryAfter = historyRetryAfter,
+                  timestamp >= retryAfter else {
+                return
+            }
+        }
+        do {
+            let loadedRecords = try await historyStore.load(now: timestamp)
+            var recoveredRecords = loadedRecords
+            if !fallbackHistory.isEmpty {
+                recoveredRecords = try await historyStore.merge(
+                    records: fallbackHistory,
+                    now: timestamp
+                )
+            }
+            // A previous write failure may have left pending records in the
+            // actor. Retry the durable write before declaring the store
+            // recovered.
+            try await historyStore.flush(now: timestamp)
+            recoveredRecords = try await historyStore.currentRecords(now: timestamp)
+            history = recoveredRecords
+            fallbackHistory.removeAll(keepingCapacity: false)
+            historyError = nil
+            historyStoreAvailable = true
+            historyRetryAfter = nil
+            historyRetryAttempt = 0
+        } catch {
+            historyStoreAvailable = false
+            historyError = error.localizedDescription
+            scheduleHistoryRetry(after: timestamp)
+        }
+        historyDiagnostics = await historyStore.diagnostics()
+        historyLoaded = true
+    }
 
-            updateRecommendation(
-                recommendationEngine.evaluate(recommendationContext).first,
-                at: snapshot.timestamp,
-                allowClearing: snapshot.didSampleProcesses
+    private func apply(
+        snapshot: MonitorSnapshot,
+        persistenceNow: Date,
+        epoch: UInt64,
+        requestSequence: UInt64
+    ) async {
+        guard acceptsPass(
+            timestamp: snapshot.timestamp,
+            epoch: epoch,
+            requestSequence: requestSequence
+        ) else {
+            return
+        }
+
+        let processSampleAttempted = snapshot.didSampleProcesses
+        // Keep the exact provider timestamp for freshness and history. The
+        // snapshot timestamp describes the enclosing pass and may differ from
+        // the process scan's completion instant.
+        let processSampledAt = snapshot.validatedProcessSampleAt
+        let processSampleIsMonotonic = processSampledAt.map { sampledAt in
+            guard let previous = lastUsableProcessSampleAt else { return true }
+            return sampledAt >= previous
+        } ?? false
+        let processSampleUsable = snapshot.processDataIsUsable
+            && processSampledAt != nil
+            && processSampleIsMonotonic
+
+        samplingDiagnostics = snapshot.diagnostics
+        systemStatus = snapshot.systemStatus
+        systemDataIsUsable = snapshot.systemDataIsUsable
+        cpuStatus = snapshot.cpuStatus
+        gpuStatus = snapshot.gpuStatus
+
+        if processSampleAttempted {
+            processStatus = snapshot.processStatus
+        }
+
+        // A low-coverage scan, including 0/N, is still useful diagnostic
+        // evidence. Publish its counts without replacing the retained rows;
+        // otherwise the health panel would report the previous full scan as
+        // if it were the current coverage. A thrown 0/0 attempt carries no
+        // inventory evidence and therefore leaves the previous counts intact.
+        if snapshot.processSamplingSucceeded
+            || (snapshot.didSampleProcesses && snapshot.listedProcessCount > 0) {
+            observedProcessCount = snapshot.sampledProcessCount
+            listedProcessCount = snapshot.listedProcessCount
+        }
+
+        if processSampleUsable {
+            lastUsableProcessSampleAt = processSampledAt
+            processes = snapshot.processes
+            groups = snapshot.groups
+        }
+
+        if let systemSnapshot = snapshot.validatedSystemSample {
+            pressureLevel = pressureEvaluator.update(snapshot: systemSnapshot)
+            let historyGroups = processSampleUsable ? snapshot.groups : []
+            if historyStoreAvailable {
+                do {
+                    history = try await historyStore.append(
+                        snapshot: systemSnapshot,
+                        groups: historyGroups,
+                        workloadsSampledAt: processSampleUsable
+                            ? processSampledAt
+                            : nil,
+                        now: persistenceNow
+                    )
+                    historyError = nil
+                    historyRetryAfter = nil
+                    historyRetryAttempt = 0
+                    historyDiagnostics = await historyStore.diagnostics()
+                } catch {
+                    historyStoreAvailable = false
+                    historyError = error.localizedDescription
+                    scheduleHistoryRetry(after: persistenceNow)
+                    appendFallbackHistory(
+                        snapshot: systemSnapshot,
+                        groups: historyGroups,
+                        workloadsSampledAt: processSampleUsable
+                            ? processSampledAt
+                            : nil,
+                        now: persistenceNow
+                    )
+                    historyDiagnostics = await historyStore.diagnostics()
+                }
+            } else {
+                appendFallbackHistory(
+                    snapshot: systemSnapshot,
+                    groups: historyGroups,
+                    workloadsSampledAt: processSampleUsable
+                        ? processSampledAt
+                        : nil,
+                    now: persistenceNow
+                )
+            }
+            system = systemSnapshot
+        }
+
+        let recommendationContext = RecommendationContext(
+            current: snapshot,
+            previousSystem: previousRecommendationSystem,
+            previousProcessSystem: previousRecommendationProcessSystem,
+            previousGroups: previousRecommendationGroups,
+            previousProcessStatus: previousRecommendationProcessStatus,
+            previousProcessInventoryIsComplete: previousRecommendationProcessInventoryIsComplete,
+            excludedProcessIDs: [monitorProcessID],
+            pressureLevel: pressureLevel,
+            previousPressureLevel: previousRecommendationPressureLevel
+        )
+
+        if let cpuTime = snapshot.cpuTime, snapshot.cpuStatus.quality.isUsable {
+            cpuUsageFraction = previousCPUTime.flatMap {
+                CPUUsageCalculator.usedFraction(current: cpuTime, previous: $0)
+            }
+            previousCPUTime = cpuTime
+        } else {
+            cpuUsageFraction = nil
+            previousCPUTime = nil
+        }
+
+        gpuUsageFraction = snapshot.gpuStatus.quality.isUsable
+            ? snapshot.gpuUsageFraction
+            : nil
+
+        updateRecommendation(
+            recommendationEngine.evaluate(recommendationContext).first,
+            at: snapshot.timestamp,
+            allowClearing: processSampleUsable && snapshot.systemDataIsUsable
+        )
+
+        if processSampleUsable {
+            // Process trends advance independently from the system source.
+            // The optional system snapshot remains paired with this exact
+            // process pass and contributes Swap evidence only when both ends
+            // of the next comparison have such a pair.
+            previousRecommendationProcessSystem = snapshot.validatedSystemSample
+            previousRecommendationGroups = snapshot.groups
+            previousRecommendationProcessStatus = snapshot.processStatus
+            previousRecommendationProcessInventoryIsComplete =
+                snapshot.sampledProcessCount > 0
+                && snapshot.sampledProcessCount == snapshot.listedProcessCount
+        }
+        if let systemSnapshot = snapshot.validatedSystemSample,
+           let pressureLevel,
+           MemoryPressureEvaluator.observedLevel(for: systemSnapshot) == pressureLevel {
+            // Do not relabel a pending recovery sample with the old stable
+            // pressure level. The pair must remain at the last observation
+            // that actually agreed with that stable level until transition.
+            previousRecommendationSystem = systemSnapshot
+            previousRecommendationPressureLevel = pressureLevel
+        }
+
+        updatedAt = snapshot.timestamp
+        lastError = samplingIssueDescription
+    }
+
+    /// Orders queued refreshes by clock generation, wall-clock sample time,
+    /// and request sequence. A request from the new clock generation must win
+    /// even though its wall time is earlier than every pre-rollback request.
+    private static func refreshRequestPrecedes(
+        _ lhs: QueuedRefresh,
+        _ rhs: QueuedRefresh
+    ) -> Bool {
+        if lhs.epoch != rhs.epoch {
+            return lhs.epoch < rhs.epoch
+        }
+        if lhs.timestamp != rhs.timestamp {
+            return lhs.timestamp < rhs.timestamp
+        }
+        return lhs.requestSequence < rhs.requestSequence
+    }
+
+    private func refreshEpochForRequest(
+        at timestamp: Date,
+        observedAt instant: ContinuousClock.Instant
+    ) -> UInt64 {
+        defer {
+            lastObservedRefreshRequest = (timestamp: timestamp, instant: instant)
+        }
+        guard let previousRequest = lastObservedRefreshRequest,
+              instant >= previousRequest.instant,
+              let lastAcceptedPass,
+              lastAcceptedPass.epoch == refreshEpoch else {
+            return refreshEpoch
+        }
+
+        let wallDelta = timestamp.timeIntervalSince(previousRequest.timestamp)
+        guard wallDelta.isFinite,
+              wallDelta < -clockRollbackTolerance else {
+            return refreshEpoch
+        }
+
+        refreshEpoch &+= 1
+        resetCrossClockBaselines()
+        return refreshEpoch
+    }
+
+    private func resetCrossClockBaselines() {
+        lastAcceptedPass = nil
+        previousCPUTime = nil
+        cpuUsageFraction = nil
+        lastUsableProcessSampleAt = nil
+        previousRecommendationSystem = nil
+        previousRecommendationProcessSystem = nil
+        previousRecommendationGroups = []
+        previousRecommendationProcessStatus = nil
+        previousRecommendationProcessInventoryIsComplete = false
+        previousRecommendationPressureLevel = nil
+        pressureEvaluator = MemoryPressureEvaluator(
+            transitionIntervalSeconds: pressureEvaluator.transitionIntervalSeconds
+        )
+        pressureLevel = nil
+        systemDataIsUsable = false
+        recommendation = nil
+        lastRecommendationKey = nil
+        lastRecommendationAt = nil
+        // A Date-based retry deadline belongs to the previous wall-clock
+        // generation. Permit one immediate recovery attempt in the new one.
+        historyRetryAfter = nil
+    }
+
+    /// Checks a request before doing provider/history work. The actual
+    /// snapshot is checked again after the provider returns because its own
+    /// timestamp is the authoritative ordering key.
+    private func canStartPass(
+        timestamp: Date,
+        epoch: UInt64,
+        requestSequence: UInt64
+    ) -> Bool {
+        let seconds = timestamp.timeIntervalSince1970
+        guard seconds.isFinite, epoch == refreshEpoch else { return false }
+        guard let lastAcceptedPass else { return true }
+        guard epoch == lastAcceptedPass.epoch else {
+            return epoch > lastAcceptedPass.epoch
+        }
+        if timestamp < lastAcceptedPass.timestamp {
+            return false
+        }
+        return timestamp != lastAcceptedPass.timestamp
+            || requestSequence >= lastAcceptedPass.requestSequence
+    }
+
+    /// A pass is accepted only if it cannot move the displayed timeline or its
+    /// associated baselines backwards. Equal timestamps are accepted in newer
+    /// request order so a same-minute refresh can still replace its payload.
+    private func acceptsPass(
+        timestamp: Date,
+        epoch: UInt64,
+        requestSequence: UInt64
+    ) -> Bool {
+        let seconds = timestamp.timeIntervalSince1970
+        guard seconds.isFinite else { return false }
+        if !canStartPass(
+            timestamp: timestamp,
+            epoch: epoch,
+            requestSequence: requestSequence
+        ) {
+            return false
+        }
+        lastAcceptedPass = (
+            timestamp: timestamp,
+            epoch: epoch,
+            requestSequence: requestSequence
+        )
+        return true
+    }
+
+    private func scheduleHistoryRetry(after timestamp: Date) {
+        let attempt = min(historyRetryAttempt, 4)
+        let multiplier = pow(2, Double(attempt))
+        let delay = min(historyRetryBaseInterval * multiplier, historyRetryMaxInterval)
+        historyRetryAfter = timestamp.addingTimeInterval(delay)
+        historyRetryAttempt = min(historyRetryAttempt + 1, 5)
+    }
+
+    private func effectiveHistoryNow(_ candidate: Date) -> Date {
+        let seconds = candidate.timeIntervalSince1970
+        guard seconds.isFinite,
+              seconds >= -62_135_596_800,
+              seconds <= 253_402_300_799 else {
+            return candidate
+        }
+        guard let latestHistoryNow else {
+            self.latestHistoryNow = candidate
+            return candidate
+        }
+        if latestHistoryNow >= candidate {
+            return latestHistoryNow
+        }
+
+        // A wall-clock jump can otherwise move the pruning anchor years into
+        // the future. Advance at a bounded rate so a bad clock cannot cause a
+        // permanent destructive retention decision. Normal monitor samples
+        // are much closer than this bound; a real clock catch-up converges over
+        // subsequent passes.
+        let maximumForwardStep: TimeInterval = 15 * 60
+        let latestSeconds = latestHistoryNow.timeIntervalSince1970
+        let boundedSeconds = min(seconds, latestSeconds + maximumForwardStep)
+        guard boundedSeconds.isFinite else { return latestHistoryNow }
+        let bounded = Date(timeIntervalSince1970: boundedSeconds)
+        self.latestHistoryNow = bounded
+        return bounded
+    }
+
+    /// Keeps the already loaded 24-hour history visible when the disk store
+    /// is temporarily unavailable. The previous implementation replaced it
+    /// with a 60-entry ring, which made a transient write error look like data
+    /// loss. Records are coalesced to the same minute as `HistoryStore`.
+    private func appendFallbackHistory(
+        snapshot: SystemMemorySnapshot,
+        groups: [WorkloadGroupSnapshot],
+        workloadsSampledAt: Date?,
+        now: Date
+    ) {
+        guard let minute = persistableMinuteBucket(snapshot.timestamp),
+              isHistoryDateWithinFutureSkew(minute, now: now),
+              isHistoryDateWithinFutureSkew(snapshot.timestamp, now: now),
+              (workloadsSampledAt.map {
+                  isHistoryDateWithinFutureSkew($0, now: now)
+              } ?? true),
+              let cutoff = historyCutoff(now: now) else {
+            // The durable store applies the same validation. Do not let the
+            // in-memory fallback become a side channel for invalid dates.
+            return
+        }
+        let candidate = MemoryHistoryRecord(
+            timestamp: minute,
+            availableFraction: snapshot.availableFraction,
+            compressedBytes: snapshot.compressedBytes,
+            swapUsedBytes: snapshot.swapUsedBytes,
+            workloads: HistoryStore.compactedWorkloads(
+                groups.map(PersistedWorkloadRecord.init(group:)),
+                limit: HistoryStore.defaultMaxPersistedWorkloads
+            ),
+            workloadsSampledAt: workloadsSampledAt,
+            sourceSampledAt: snapshot.timestamp
+        )
+
+        mergeFallbackRecord(candidate, now: now)
+
+        if let index = history.firstIndex(where: { $0.timestamp == minute }) {
+            let previous = history[index]
+            history[index] = HistoryStore.preferredRecord(
+                existing: previous,
+                candidate: candidate
             )
-
-            if let systemSnapshot = snapshot.system {
-                previousRecommendationSystem = systemSnapshot
-            }
-            if snapshot.didSampleProcesses, snapshot.processStatus.quality.isUsable {
-                previousRecommendationProcessSystem = snapshot.system
-                previousRecommendationGroups = snapshot.groups
-                previousRecommendationProcessStatus = snapshot.processStatus
-            }
-            if let pressureLevel {
-                previousRecommendationPressureLevel = pressureLevel
-            }
-
-            updatedAt = snapshot.timestamp
-            lastError = samplingIssueDescription
-
-            guard await waitForNextSample() else { break }
+        } else {
+            history.append(candidate)
         }
 
-        if historyStoreAvailable {
-            try? await historyStore.flush()
+        history = history
+            .filter { $0.timestamp >= cutoff }
+            .sorted { $0.timestamp < $1.timestamp }
+    }
+
+    private func mergeFallbackRecord(_ candidate: MemoryHistoryRecord, now: Date) {
+        if let index = fallbackHistory.firstIndex(where: { $0.timestamp == candidate.timestamp }) {
+            let previous = fallbackHistory[index]
+            fallbackHistory[index] = HistoryStore.preferredRecord(
+                existing: previous,
+                candidate: candidate
+            )
+        } else {
+            fallbackHistory.append(candidate)
         }
+
+        guard let cutoff = historyCutoff(now: now) else { return }
+        fallbackHistory = fallbackHistory
+            .filter { $0.timestamp >= cutoff }
+            .sorted { $0.timestamp < $1.timestamp }
+    }
+
+    private func persistableMinuteBucket(_ date: Date) -> Date? {
+        let seconds = date.timeIntervalSince1970
+        guard seconds.isFinite,
+              seconds >= -62_135_596_800,
+              seconds <= 253_402_300_799 else {
+            return nil
+        }
+        let bucket = floor(seconds / 60)
+        let normalized = bucket * 60
+        guard bucket.isFinite,
+              normalized.isFinite,
+              normalized >= -62_135_596_800,
+              normalized <= 253_402_300_799 else {
+            return nil
+        }
+        return Date(timeIntervalSince1970: normalized)
+    }
+
+    private func isHistoryDateWithinFutureSkew(_ date: Date, now: Date) -> Bool {
+        let dateSeconds = date.timeIntervalSince1970
+        let nowSeconds = now.timeIntervalSince1970
+        guard dateSeconds.isFinite,
+              nowSeconds.isFinite,
+              nowSeconds <= 253_402_300_799 - HistoryStore.maximumFutureSkew else {
+            return false
+        }
+        return dateSeconds <= nowSeconds + HistoryStore.maximumFutureSkew
+    }
+
+    private func historyCutoff(now: Date) -> Date? {
+        let nowSeconds = now.timeIntervalSince1970
+        let cutoff = nowSeconds - historyRetentionInterval
+        guard nowSeconds.isFinite,
+              cutoff.isFinite,
+              cutoff >= -62_135_596_800,
+              cutoff <= 253_402_300_799 else {
+            return nil
+        }
+        return Date(timeIntervalSince1970: cutoff)
     }
 
     private func updateRecommendation(
@@ -361,7 +985,10 @@ final class MonitorViewModel: ObservableObject {
         }
 
         if candidate.deduplicationKey == lastRecommendationKey,
+           let recommendation,
+           recommendationsHaveSameDisplayContent(recommendation, candidate),
            let lastRecommendationAt,
+           timestamp.timeIntervalSince(lastRecommendationAt) >= 0,
            timestamp.timeIntervalSince(lastRecommendationAt) < recommendationCooldown {
             return
         }
@@ -371,13 +998,23 @@ final class MonitorViewModel: ObservableObject {
         lastRecommendationAt = timestamp
     }
 
-    private func waitForNextSample() async -> Bool {
-        let interval = samplingPolicy.intervalSeconds(
-            panelPresented: isPanelPresented,
-            pressureActive: pressureEvaluator.pressureActiveForSampling
-        )
-        let wakeup = refreshWakeup
+    private func recommendationsHaveSameDisplayContent(
+        _ lhs: MemoryRecommendation,
+        _ rhs: MemoryRecommendation
+    ) -> Bool {
+        lhs.id == rhs.id
+            && lhs.severity == rhs.severity
+            && lhs.title == rhs.title
+            && lhs.detail == rhs.detail
+            && lhs.evidence == rhs.evidence
+            && lhs.confidence == rhs.confidence
+            && lhs.targetGroupID == rhs.targetGroupID
+    }
 
+    private static func waitForNextSample(
+        interval: TimeInterval,
+        wakeup: RefreshWakeup
+    ) async -> Bool {
         return await withTaskGroup(of: RefreshWaitResult.self) { group in
             group.addTask {
                 do {
@@ -409,41 +1046,51 @@ private enum RefreshWaitResult: Sendable {
 /// popover opens or closes. A continuation keeps the wakeup path fully
 /// actor-isolated and cancellation-safe.
 private actor RefreshWakeup {
-    private var waiter: CheckedContinuation<Bool, Never>?
+    private struct Waiter {
+        let token: UUID
+        let continuation: CheckedContinuation<Bool, Never>
+    }
+
+    private var waiter: Waiter?
     private var pendingSignal = false
 
     func signal() {
         if let waiter {
             self.waiter = nil
-            waiter.resume(returning: true)
+            waiter.continuation.resume(returning: true)
         } else {
             pendingSignal = true
         }
     }
 
     func wait() async -> Bool {
+        guard !Task.isCancelled else { return false }
         if pendingSignal {
             pendingSignal = false
             return true
         }
 
+        let token = UUID()
         return await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
                 if Task.isCancelled {
                     continuation.resume(returning: false)
                 } else {
-                    waiter = continuation
+                    waiter = Waiter(token: token, continuation: continuation)
                 }
             }
         } onCancel: {
-            Task { await self.cancelWaiter() }
+            // Cancellation is delivered through a separate actor hop. Keep a
+            // token with the continuation so a delayed callback from an old
+            // wait cannot cancel a newer waiter installed in the meantime.
+            Task { await self.cancelWaiter(token: token) }
         }
     }
 
-    private func cancelWaiter() {
-        guard let waiter else { return }
+    private func cancelWaiter(token: UUID) {
+        guard let waiter, waiter.token == token else { return }
         self.waiter = nil
-        waiter.resume(returning: false)
+        waiter.continuation.resume(returning: false)
     }
 }
 
@@ -492,7 +1139,7 @@ private struct MenuBarStatus: View {
                 .fill(model.pressure.color)
                 .frame(width: 7, height: 7)
             Text(
-                model.systemStatus.quality.isUsable
+                model.systemDataIsUsable
                     ? (model.system.map { "内存 \(Int($0.usedFraction * 100))%" } ?? "内存 --")
                     : "内存 --"
             )
@@ -575,6 +1222,10 @@ private enum MonitorViewMode: String, CaseIterable, Identifiable {
 
 private struct MonitorPopover: View {
     @ObservedObject var model: MonitorViewModel
+    /// Process actions publish independently from monitor sampling. Observe
+    /// the controller here so audit failures immediately affect the health
+    /// indicator in the popover.
+    @ObservedObject var processActions: ProcessActionController
     @State private var listMode: MonitorListMode = .processes
     @State private var viewMode: MonitorViewMode = .live
     @State private var processScope: ProcessScope = .all
@@ -617,7 +1268,11 @@ private struct MonitorPopover: View {
             }
         }
         .sheet(isPresented: $showHealthPanel) {
-            MonitorHealthPanel(model: model, loginLaunch: model.loginLaunch)
+            MonitorHealthPanel(
+                model: model,
+                processActions: processActions,
+                loginLaunch: model.loginLaunch
+            )
         }
         .sheet(isPresented: $showAuditPanel) {
             OperationsAuditPanel(actions: model.processActions)
@@ -634,7 +1289,8 @@ private struct MonitorPopover: View {
     }
 
     private var header: some View {
-        HStack(alignment: .top) {
+        let overall = healthOverall
+        return HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Memory Monitor")
                     .font(.system(size: 18, weight: .semibold))
@@ -645,7 +1301,7 @@ private struct MonitorPopover: View {
                     Circle()
                         .fill(model.pressure.color)
                         .frame(width: 8, height: 8)
-                    Text(model.systemStatus.quality.isUsable ? model.pressure.title : "采集受限")
+                    Text(model.systemDataIsUsable ? model.pressure.title : "采集受限")
                         .font(.subheadline.weight(.medium))
                         .foregroundStyle(model.pressure.color)
                 }
@@ -655,8 +1311,8 @@ private struct MonitorPopover: View {
                 Button {
                     showHealthPanel = true
                 } label: {
-                    Image(systemName: model.healthSnapshot.overall.iconName)
-                        .foregroundStyle(healthLevelColor(model.healthSnapshot.overall))
+                    Image(systemName: overall.iconName)
+                        .foregroundStyle(healthLevelColor(overall))
                 }
                 .buttonStyle(.borderless)
                 .help("运行健康与权限诊断")
@@ -676,6 +1332,13 @@ private struct MonitorPopover: View {
                 }
             }
         }
+    }
+
+    private var healthOverall: MonitorHealthLevel {
+        // Touch the nested observable explicitly so SwiftUI subscribes to its
+        // objectWillChange stream while evaluating the computed health state.
+        _ = processActions.auditError
+        return model.healthSnapshot.overall
     }
 
     @ViewBuilder
@@ -725,7 +1388,7 @@ private struct MonitorPopover: View {
             )
             MetricTile(
                 title: "内存",
-                fraction: model.systemStatus.quality.isUsable ? model.system?.usedFraction : nil,
+                fraction: model.systemDataIsUsable ? model.system?.usedFraction : nil,
                 status: model.systemStatus
             )
             MetricTile(

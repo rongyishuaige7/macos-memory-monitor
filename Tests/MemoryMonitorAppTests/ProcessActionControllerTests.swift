@@ -66,11 +66,15 @@ final class ProcessActionControllerTests: XCTestCase {
             if case .timedOut = controller.state { return true }
             return false
         }
+        XCTAssertTrue(controller.isBusy)
+        XCTAssertTrue(controller.isBusy(for: process.identity))
         XCTAssertTrue(controller.canForceTerminate(for: process.identity))
 
         // A stale row for a PID-reused process must not erase the original
         // timeout or make the replacement eligible for force termination.
         controller.requestForceTerminate(for: replacement)
+        controller.requestGracefulExit(for: replacement)
+        XCTAssertEqual(controller.state, .timedOut(process.identity))
         XCTAssertTrue(controller.canForceTerminate(for: process.identity))
         XCTAssertFalse(runtime.sentActions.contains(.forceTerminate))
 
@@ -221,6 +225,60 @@ final class ProcessActionControllerTests: XCTestCase {
         XCTAssertEqual(runtime.sentActions, [.gracefulExit, .forceTerminate])
     }
 
+    func testCancelledGracefulSendDoesNotOverwriteFollowupRequest() async throws {
+        let first = makeProcess(pid: 4111, name: "worker-a")
+        let second = makeProcess(pid: 4112, name: "worker-b")
+        let runtime = FakeProcessActionRuntime()
+        runtime.holdGracefulSend(for: first.identity.pid)
+        runtime.setSamples([first], for: first.identity.pid)
+        runtime.setSamples([second, nil], for: second.identity.pid)
+        let paths = makeActionPaths()
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let controller = ProcessActionController(
+            currentUserID: first.userID,
+            monitorPID: 9999,
+            runtime: runtime,
+            auditStore: ProcessActionAuditStore(fileURL: paths.file),
+            gracefulTimeout: 1,
+            forceVerificationTimeout: 0.5
+        )
+
+        controller.requestGracefulExit(for: first)
+        await waitUntil {
+            runtime.isGracefulSendWaiting(for: first.identity.pid)
+        }
+        XCTAssertTrue(controller.canCancel(for: first.identity))
+
+        controller.cancel(for: first.identity)
+        guard case .cancelled(let identity, let message) = controller.state else {
+            return XCTFail("expected cancellation, got \(controller.state)")
+        }
+        XCTAssertEqual(identity, first.identity)
+        XCTAssertTrue(message.contains("尚未确认是否发送优雅退出请求"))
+
+        controller.requestGracefulExit(for: second)
+        await waitUntil {
+            if case .completed(let identity, let action, _) = controller.state,
+               identity == second.identity,
+               action == .gracefulExit {
+                return true
+            }
+            return false
+        }
+
+        runtime.releaseGracefulSend(for: first.identity.pid)
+        await waitUntil {
+            runtime.didFinishGracefulSend(for: first.identity.pid)
+        }
+
+        guard case .completed(let identity, let action, _) = controller.state else {
+            return XCTFail("expected follow-up completion, got \(controller.state)")
+        }
+        XCTAssertEqual(identity, second.identity)
+        XCTAssertEqual(action, .gracefulExit)
+        XCTAssertEqual(runtime.sentActions, [.gracefulExit, .gracefulExit])
+    }
+
     func testTimeoutUsesMonotonicClockWhenWallClockMovesBackwards() async throws {
         let process = makeProcess(pid: 4109, name: "worker")
         let runtime = FakeProcessActionRuntime()
@@ -333,6 +391,149 @@ final class ProcessActionControllerTests: XCTestCase {
         XCTAssertTrue(runtime.sentActions.contains(.gracefulExit))
     }
 
+    func testGracefulTimeoutDisplayClampsExtremeFiniteInput() {
+        let runtime = FakeProcessActionRuntime()
+        let controller = ProcessActionController(
+            currentUserID: 501,
+            monitorPID: 9999,
+            runtime: runtime,
+            auditStore: ProcessActionAuditStore(fileURL: makeActionPaths().file),
+            gracefulTimeout: Double.greatestFiniteMagnitude
+        )
+
+        XCTAssertLessThanOrEqual(controller.gracefulTimeoutForDisplay, 24 * 60 * 60)
+        let process = makeProcess(pid: 4112, name: "display")
+        let status = controller.status(for: process.identity)
+        XCTAssertNil(status)
+    }
+
+    func testTimeoutReconciliationClearsBusyWhenOriginalProcessExits() async throws {
+        let process = makeProcess(pid: 4113, name: "reconcile")
+        let runtime = FakeProcessActionRuntime()
+        runtime.advancePerSleep = 0.25
+        runtime.setSamples([process], for: process.identity.pid)
+        let paths = makeActionPaths()
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let controller = ProcessActionController(
+            currentUserID: process.userID,
+            monitorPID: 9999,
+            runtime: runtime,
+            auditStore: ProcessActionAuditStore(fileURL: paths.file),
+            gracefulTimeout: 1
+        )
+
+        controller.requestGracefulExit(for: process)
+        await waitUntil {
+            if case .timedOut = controller.state { return true }
+            return false
+        }
+        XCTAssertTrue(controller.isBusy)
+
+        // The target exits after the timeout's final identity check. The
+        // reconciliation poll must release the controller without a force
+        // signal.
+        runtime.setSamples([nil], for: process.identity.pid)
+        await waitUntil { !controller.isBusy }
+        guard case .completed(let identity, let action, _) = controller.state else {
+            return XCTFail("expected reconciliation completion, got \(controller.state)")
+        }
+        XCTAssertEqual(identity, process.identity)
+        XCTAssertEqual(action, .gracefulExit)
+        XCTAssertFalse(runtime.sentActions.contains(.forceTerminate))
+    }
+
+    func testTimedOutActionCanBeAbandonedBeforeStartingAnotherAction() async throws {
+        let first = makeProcess(pid: 4114, name: "timed-out")
+        let second = makeProcess(pid: 4115, name: "follow-up")
+        let runtime = FakeProcessActionRuntime()
+        runtime.advancePerSleep = 0.25
+        runtime.setSamples([first], for: first.identity.pid)
+        runtime.setSamples([second, nil], for: second.identity.pid)
+        let paths = makeActionPaths()
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let controller = ProcessActionController(
+            currentUserID: first.userID,
+            monitorPID: 9999,
+            runtime: runtime,
+            auditStore: ProcessActionAuditStore(fileURL: paths.file),
+            gracefulTimeout: 1
+        )
+
+        controller.requestGracefulExit(for: first)
+        await waitUntil {
+            if case .timedOut = controller.state { return true }
+            return false
+        }
+        XCTAssertTrue(controller.canCancel(for: first.identity))
+
+        controller.cancel(for: first.identity)
+        XCTAssertFalse(controller.isBusy)
+        XCTAssertFalse(controller.canForceTerminate(for: first.identity))
+        guard case .cancelled(let identity, let message) = controller.state else {
+            return XCTFail("expected abandoned timeout, got \(controller.state)")
+        }
+        XCTAssertEqual(identity, first.identity)
+        XCTAssertTrue(message.contains("已停止跟踪"))
+        XCTAssertTrue(message.contains("未发送强制结束"))
+
+        controller.requestGracefulExit(for: second)
+        await waitUntil {
+            if case .completed(let identity, let action, _) = controller.state {
+                return identity == second.identity && action == .gracefulExit
+            }
+            return false
+        }
+        XCTAssertEqual(runtime.sentActions, [.gracefulExit, .gracefulExit])
+    }
+
+    func testCancellingForceVerificationPreservesSentSignalFact() async throws {
+        let process = makeProcess(pid: 4116, name: "force-verification")
+        let runtime = FakeProcessActionRuntime()
+        runtime.advancePerSleep = 0.25
+        runtime.setSamples([process], for: process.identity.pid)
+        let paths = makeActionPaths()
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let controller = ProcessActionController(
+            currentUserID: process.userID,
+            monitorPID: 9999,
+            runtime: runtime,
+            auditStore: ProcessActionAuditStore(fileURL: paths.file),
+            gracefulTimeout: 1,
+            forceVerificationTimeout: 1
+        )
+
+        controller.requestGracefulExit(for: process)
+        await waitUntil {
+            if case .timedOut = controller.state { return true }
+            return false
+        }
+
+        runtime.advancePerSleep = 0
+        controller.requestForceTerminate(for: process)
+        await waitUntil {
+            if case .verifyingForce = controller.state { return true }
+            return false
+        }
+        XCTAssertEqual(runtime.sentActions, [.gracefulExit, .forceTerminate])
+        XCTAssertTrue(controller.canCancel(for: process.identity))
+        XCTAssertTrue(controller.status(for: process.identity)?.message.contains("已发送") == true)
+
+        controller.cancel(for: process.identity)
+        guard case .cancelled(let identity, let message) = controller.state else {
+            return XCTFail("expected verification cancellation, got \(controller.state)")
+        }
+        XCTAssertEqual(identity, process.identity)
+        XCTAssertTrue(message.contains("强制结束请求已发送"))
+        XCTAssertTrue(message.contains("停止等待"))
+        await waitUntil {
+            controller.recentEvents.contains {
+                $0.action == .forceTerminate
+                    && $0.outcome == .cancelled
+                    && $0.detail.contains("请求已发送")
+            }
+        }
+    }
+
     private func waitUntil(
         _ condition: @escaping @MainActor () -> Bool,
         file: StaticString = #filePath,
@@ -384,6 +585,10 @@ private final class FakeProcessActionRuntime: ProcessActionRuntime {
     private var sampleQueues: [Int32: [ProcessSnapshot?]] = [:]
     private var fallbackSnapshots: [Int32: ProcessSnapshot] = [:]
     private var existence: [Int32: Bool] = [:]
+    private var gracefulSendHoldPIDs = Set<Int32>()
+    private var gracefulSendWaiters: [Int32: CheckedContinuation<Void, Never>] = [:]
+    private var gracefulSendWaitingPIDs = Set<Int32>()
+    private var gracefulSendCompletedPIDs = Set<Int32>()
 
     var gracefulResult: ProcessActionSignalResult = .sent
     var forceResult: ProcessActionSignalResult = .sent
@@ -400,6 +605,23 @@ private final class FakeProcessActionRuntime: ProcessActionRuntime {
             fallbackSnapshots[pid] = first
             existence[pid] = true
         }
+    }
+
+    func holdGracefulSend(for pid: Int32) {
+        gracefulSendHoldPIDs.insert(pid)
+    }
+
+    func releaseGracefulSend(for pid: Int32) {
+        gracefulSendHoldPIDs.remove(pid)
+        gracefulSendWaiters.removeValue(forKey: pid)?.resume()
+    }
+
+    func isGracefulSendWaiting(for pid: Int32) -> Bool {
+        gracefulSendWaitingPIDs.contains(pid)
+    }
+
+    func didFinishGracefulSend(for pid: Int32) -> Bool {
+        gracefulSendCompletedPIDs.contains(pid)
     }
 
     func sample(pid: Int32) async -> ProcessSnapshot? {
@@ -426,6 +648,14 @@ private final class FakeProcessActionRuntime: ProcessActionRuntime {
 
     func sendGraceful(to process: ProcessSnapshot) async -> ProcessActionSignalResult {
         sentActions.append(.gracefulExit)
+        if gracefulSendHoldPIDs.contains(process.identity.pid) {
+            gracefulSendWaitingPIDs.insert(process.identity.pid)
+            await withCheckedContinuation { continuation in
+                gracefulSendWaiters[process.identity.pid] = continuation
+            }
+            gracefulSendWaitingPIDs.remove(process.identity.pid)
+        }
+        gracefulSendCompletedPIDs.insert(process.identity.pid)
         await Task.yield()
         return gracefulResult
     }

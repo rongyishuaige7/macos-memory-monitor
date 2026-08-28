@@ -2,6 +2,123 @@ import Darwin
 import Foundation
 import IOKit
 
+// JSONEncoder's ISO-8601 strategy is not a lossless representation for the
+// full range accepted by `Date`. Keep persisted timestamps inside the range
+// supported by the formatter and reject pathological values before they can
+// affect retention arithmetic or ordering.
+private let minimumPersistableUnixSeconds = -62_135_596_800.0 // 0001-01-01
+private let maximumPersistableUnixSeconds = 253_402_300_799.0 // 9999-12-31
+// Kernel process start times are Unix seconds. Keep the integer form beside
+// the persisted Date bounds so malformed UInt64 values cannot become a
+// finite-but-absurd Date after conversion through Double.
+private let maximumProcessStartTimeSeconds: UInt64 = 253_402_300_799
+
+private func isPersistableDate(_ date: Date) -> Bool {
+    let seconds = date.timeIntervalSince1970
+    return seconds.isFinite
+        && seconds >= minimumPersistableUnixSeconds
+        && seconds <= maximumPersistableUnixSeconds
+}
+
+private func isWithinFutureSkew(_ date: Date, now: Date, allowance: TimeInterval) -> Bool {
+    guard isPersistableDate(date), isPersistableDate(now), allowance.isFinite, allowance >= 0 else {
+        return false
+    }
+    let limit = now.timeIntervalSince1970 + allowance
+    guard limit.isFinite else { return false }
+    return date.timeIntervalSince1970 <= limit
+}
+
+/// A tiny sidecar anchor lets retention survive a wall-clock rollback across
+/// process restarts without treating an arbitrary maximum record timestamp as
+/// trustworthy. It is written only after the caller has validated `now`.
+private struct PersistedClockAnchor: Codable {
+    let observedAt: Date
+}
+
+private func clockAnchorData(for date: Date) throws -> Data {
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    return try encoder.encode(PersistedClockAnchor(observedAt: date))
+}
+
+private func readClockAnchor(at url: URL) -> Date? {
+    guard let data = try? Data(contentsOf: url), !data.isEmpty else { return nil }
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    guard let anchor = try? decoder.decode(PersistedClockAnchor.self, from: data),
+          isPersistableDate(anchor.observedAt) else {
+        return nil
+    }
+    return anchor.observedAt
+}
+
+private func boundedRetentionReference(
+    now: Date,
+    anchor: Date?,
+    rollbackLimit: TimeInterval
+) -> Date {
+    guard isPersistableDate(now),
+          rollbackLimit.isFinite,
+          rollbackLimit >= 0 else {
+        return now
+    }
+    guard let anchor, isPersistableDate(anchor) else { return now }
+    let delta = anchor.timeIntervalSince(now)
+    guard delta.isFinite, delta > 0, delta <= rollbackLimit else { return now }
+    return anchor
+}
+
+private enum PersistedFileLockError: Error {
+    case openFailed
+    case lockFailed
+}
+
+/// Serializes read-modify-write transactions for stores that may be opened by
+/// multiple actors or processes. Actor isolation alone only protects one
+/// instance, so every durable operation must also hold this path-level lock.
+private func withExclusivePersistedFileLock<T>(
+    at url: URL,
+    _ body: () throws -> T
+) throws -> T {
+    let fileManager = FileManager.default
+    let directory = url.deletingLastPathComponent()
+    do {
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+    } catch {
+        throw PersistedFileLockError.openFailed
+    }
+
+    let descriptor = url.path.withCString { path in
+        open(path, O_RDWR | O_CREAT, mode_t(S_IRUSR | S_IWUSR))
+    }
+    guard descriptor >= 0 else {
+        throw PersistedFileLockError.openFailed
+    }
+    defer { close(descriptor) }
+
+    var lockResult: Int32
+    repeat {
+        lockResult = flock(descriptor, LOCK_EX)
+    } while lockResult != 0 && errno == EINTR
+    guard lockResult == 0 else {
+        throw PersistedFileLockError.lockFailed
+    }
+    defer { _ = flock(descriptor, LOCK_UN) }
+
+    // A custom path may already contain a lock file created with broad
+    // permissions. Tighten it while holding the lock before any data access.
+    do {
+        try fileManager.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: url.path
+        )
+    } catch {
+        throw PersistedFileLockError.lockFailed
+    }
+    return try body()
+}
+
 public enum MemoryMonitorError: Error, CustomStringConvertible, LocalizedError, Sendable {
     case systemCall(name: String, code: Int32)
     case invalidData(description: String)
@@ -81,6 +198,14 @@ public struct SampleStatus: Codable, Sendable, Equatable {
         return age.isFinite ? max(age, 0) : nil
     }
 
+    /// Whether this status describes a captured value with a representable
+    /// wall-clock timestamp. A usable quality without a timestamp is not
+    /// enough to establish freshness or to become a process baseline.
+    public var hasFiniteSampleTimestamp: Bool {
+        guard quality.isUsable, let sampledAt else { return false }
+        return sampledAt.timeIntervalSince1970.isFinite
+    }
+
     public var shortDescription: String {
         if let message, !message.isEmpty {
             return "\(quality.displayName) · \(message)"
@@ -106,12 +231,20 @@ public struct SystemMemorySnapshot: Codable, Sendable, Equatable {
     public let swapFreeBytes: UInt64
 
     public var availableEstimateBytes: UInt64 {
+        guard let available = rawAvailableEstimateBytes else { return 0 }
+        return min(totalBytes, available)
+    }
+
+    /// The arithmetic behind `availableEstimateBytes` is intentionally
+    /// checked. A malformed provider value must not turn an overflow into a
+    /// believable "all memory is available" result.
+    private var rawAvailableEstimateBytes: UInt64? {
         // Darwin's free_count already includes speculative pages. Counting it
         // again would overstate the amount that can be made available.
         let (freeAndInactive, firstOverflow) = freeBytes.addingReportingOverflow(inactiveBytes)
         let (available, secondOverflow) = freeAndInactive.addingReportingOverflow(purgeableBytes)
-        guard !firstOverflow, !secondOverflow else { return totalBytes }
-        return min(totalBytes, available)
+        guard !firstOverflow, !secondOverflow else { return nil }
+        return available
     }
 
     public var usedEstimateBytes: UInt64 {
@@ -131,7 +264,12 @@ public struct SystemMemorySnapshot: Codable, Sendable, Equatable {
     }
 
     public var isStructurallyValid: Bool {
-        totalBytes > 0 && pageSize > 0
+        totalBytes > 0
+            && pageSize > 0
+            && timestamp.timeIntervalSince1970.isFinite
+            && rawAvailableEstimateBytes != nil
+            && swapUsedBytes <= swapTotalBytes
+            && swapFreeBytes <= swapTotalBytes
     }
 
     public init(
@@ -170,6 +308,31 @@ public struct SystemMemorySnapshot: Codable, Sendable, Equatable {
 public struct SystemMemorySampler: Sendable {
     public init() {}
 
+    /// Mach reports the number of integer_t fields it actually populated.
+    /// Reading a partially filled struct would otherwise silently consume
+    /// zero-initialized fields as real measurements.
+    static func hasSufficientStatisticsCount(
+        actual: mach_msg_type_number_t,
+        expected: mach_msg_type_number_t
+    ) -> Bool {
+        actual >= expected
+    }
+
+    /// Multiplies a kernel page count without allowing malformed provider
+    /// data to trap the sampler with a Swift integer-overflow fatal error.
+    /// Kept internal so boundary tests can exercise the arithmetic directly.
+    static func checkedPageBytes(_ pages: UInt64, pageSize: UInt64) -> UInt64? {
+        let (bytes, overflow) = pages.multipliedReportingOverflow(by: pageSize)
+        return overflow ? nil : bytes
+    }
+
+    /// `sysctlbyname` reports the number of bytes actually copied through its
+    /// length argument. Accepting a short payload would make zero-initialized
+    /// tail fields look like real kernel values.
+    static func hasExpectedSysctlByteCount(actual: Int, expected: Int) -> Bool {
+        expected > 0 && actual == expected
+    }
+
     public func sample() throws -> SystemMemorySnapshot {
         var pageSize: vm_size_t = 0
         let pageStatus = host_page_size(mach_host_self(), &pageSize)
@@ -189,6 +352,12 @@ public struct SystemMemorySampler: Sendable {
         guard statisticsStatus == KERN_SUCCESS else {
             throw MemoryMonitorError.systemCall(name: "host_statistics64", code: statisticsStatus)
         }
+        let expectedCount = mach_msg_type_number_t(
+            MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size
+        )
+        guard Self.hasSufficientStatisticsCount(actual: count, expected: expectedCount) else {
+            throw MemoryMonitorError.invalidData(description: "host_statistics64 返回的字段数量不足")
+        }
 
         var swap = xsw_usage()
         var swapSize = MemoryLayout<xsw_usage>.size
@@ -197,8 +366,17 @@ public struct SystemMemorySampler: Sendable {
                 sysctlbyname(name, pointer, &swapSize, nil, 0)
             }
         }
+        let swapError = Int32(Darwin.errno)
         guard swapStatus == 0 else {
-            throw MemoryMonitorError.systemCall(name: "sysctl(vm.swapusage)", code: swapStatus)
+            throw MemoryMonitorError.systemCall(name: "sysctl(vm.swapusage)", code: swapError)
+        }
+        guard Self.hasExpectedSysctlByteCount(
+            actual: swapSize,
+            expected: MemoryLayout<xsw_usage>.size
+        ) else {
+            throw MemoryMonitorError.invalidData(
+                description: "sysctl(vm.swapusage) 返回的数据大小异常"
+            )
         }
 
         let pageBytes = UInt64(pageSize)
@@ -206,16 +384,22 @@ public struct SystemMemorySampler: Sendable {
         guard pageBytes > 0, totalBytes > 0 else {
             throw MemoryMonitorError.invalidData(description: "系统内存采样返回了无效的总量或页大小")
         }
+        func bytes(for pages: UInt64, field: String) throws -> UInt64 {
+            guard let value = Self.checkedPageBytes(pages, pageSize: pageBytes) else {
+                throw MemoryMonitorError.invalidData(description: "系统内存采样的 \(field) 数值溢出")
+            }
+            return value
+        }
         return SystemMemorySnapshot(
             totalBytes: totalBytes,
             pageSize: pageBytes,
-            freeBytes: UInt64(statistics.free_count) * pageBytes,
-            activeBytes: UInt64(statistics.active_count) * pageBytes,
-            inactiveBytes: UInt64(statistics.inactive_count) * pageBytes,
-            speculativeBytes: UInt64(statistics.speculative_count) * pageBytes,
-            wiredBytes: UInt64(statistics.wire_count) * pageBytes,
-            purgeableBytes: UInt64(statistics.purgeable_count) * pageBytes,
-            compressedBytes: UInt64(statistics.compressor_page_count) * pageBytes,
+            freeBytes: try bytes(for: UInt64(statistics.free_count), field: "free_count"),
+            activeBytes: try bytes(for: UInt64(statistics.active_count), field: "active_count"),
+            inactiveBytes: try bytes(for: UInt64(statistics.inactive_count), field: "inactive_count"),
+            speculativeBytes: try bytes(for: UInt64(statistics.speculative_count), field: "speculative_count"),
+            wiredBytes: try bytes(for: UInt64(statistics.wire_count), field: "wire_count"),
+            purgeableBytes: try bytes(for: UInt64(statistics.purgeable_count), field: "purgeable_count"),
+            compressedBytes: try bytes(for: UInt64(statistics.compressor_page_count), field: "compressor_page_count"),
             throttledPages: UInt64(statistics.throttled_count),
             swapTotalBytes: swap.xsu_total,
             swapUsedBytes: swap.xsu_used,
@@ -261,6 +445,13 @@ public struct CPUTimeSnapshot: Sendable, Equatable {
 public struct CPUTimeSampler: Sendable {
     public init() {}
 
+    static func hasSufficientStatisticsCount(
+        actual: mach_msg_type_number_t,
+        expected: mach_msg_type_number_t
+    ) -> Bool {
+        actual >= expected
+    }
+
     public func sample() throws -> CPUTimeSnapshot {
         var load = host_cpu_load_info()
         var count = mach_msg_type_number_t(
@@ -273,6 +464,12 @@ public struct CPUTimeSampler: Sendable {
         }
         guard status == KERN_SUCCESS else {
             throw MemoryMonitorError.systemCall(name: "host_statistics(HOST_CPU_LOAD_INFO)", code: status)
+        }
+        let expectedCount = mach_msg_type_number_t(
+            MemoryLayout<host_cpu_load_info_data_t>.size / MemoryLayout<integer_t>.size
+        )
+        guard Self.hasSufficientStatisticsCount(actual: count, expected: expectedCount) else {
+            throw MemoryMonitorError.invalidData(description: "host_statistics 返回的字段数量不足")
         }
 
         return CPUTimeSnapshot(
@@ -311,7 +508,37 @@ public struct GPUUsageSample: Sendable, Equatable {
     public let status: SampleStatus
 
     public init(fraction: Double?, status: SampleStatus) {
-        self.fraction = fraction
+        let normalizedFraction: Double?
+        if let fraction {
+            guard fraction.isFinite, (0...1).contains(fraction) else {
+                self.fraction = nil
+                self.status = .error("GPU 利用率数据无效")
+                return
+            }
+            normalizedFraction = fraction
+        } else {
+            normalizedFraction = nil
+        }
+
+        guard status.quality.isUsable else {
+            // A value without a usable status must never be consumed as a
+            // current metric. Keep the status as the diagnostic source of
+            // truth and discard a caller-supplied stale fraction.
+            self.fraction = nil
+            self.status = status
+            return
+        }
+        guard status.hasFiniteSampleTimestamp else {
+            self.fraction = nil
+            self.status = .error("GPU 采样时间无效")
+            return
+        }
+        guard normalizedFraction != nil else {
+            self.fraction = nil
+            self.status = .unavailable(message: status.message ?? "GPU 利用率不可用")
+            return
+        }
+        self.fraction = normalizedFraction
         self.status = status
     }
 }
@@ -404,6 +631,16 @@ public struct ProcessIdentity: Hashable, Codable, Sendable {
         self.pid = pid
         self.startTimeSeconds = startTimeSeconds
         self.startTimeMicroseconds = startTimeMicroseconds
+    }
+
+    /// Whether the identity can have come from the kernel's process table.
+    /// This is deliberately structural rather than wall-clock based so a
+    /// captured snapshot remains usable after a clock adjustment.
+    public var isStructurallyValid: Bool {
+        pid > 0
+            && startTimeSeconds > 0
+            && startTimeSeconds <= maximumProcessStartTimeSeconds
+            && startTimeMicroseconds < 1_000_000
     }
 }
 
@@ -554,9 +791,11 @@ public struct ProcessSnapshot: Codable, Sendable, Identifiable, Equatable {
     /// The process start instant reconstructed from the stable identity.
     /// A nil value means the kernel supplied an invalid timestamp.
     public var startDate: Date? {
+        guard identity.isStructurallyValid else { return nil }
         let seconds = Double(identity.startTimeSeconds)
             + Double(identity.startTimeMicroseconds) / 1_000_000
-        guard seconds.isFinite else { return nil }
+        guard seconds.isFinite,
+              seconds <= maximumPersistableUnixSeconds else { return nil }
         return Date(timeIntervalSince1970: seconds)
     }
 
@@ -579,7 +818,22 @@ public struct ProcessSnapshot: Codable, Sendable, Identifiable, Equatable {
         if lhs.residentBytes != rhs.residentBytes {
             return lhs.residentBytes > rhs.residentBytes
         }
-        return lhs.identity.pid < rhs.identity.pid
+        if lhs.identity.pid != rhs.identity.pid {
+            return lhs.identity.pid < rhs.identity.pid
+        }
+        // PID is only unique while a process is alive. Include the captured
+        // start instant (and sanitized labels as a final fallback) so hand-
+        // crafted or rapidly changing snapshots still sort deterministically.
+        if lhs.identity.startTimeSeconds != rhs.identity.startTimeSeconds {
+            return lhs.identity.startTimeSeconds < rhs.identity.startTimeSeconds
+        }
+        if lhs.identity.startTimeMicroseconds != rhs.identity.startTimeMicroseconds {
+            return lhs.identity.startTimeMicroseconds < rhs.identity.startTimeMicroseconds
+        }
+        if lhs.name != rhs.name {
+            return lhs.name < rhs.name
+        }
+        return (lhs.executablePath ?? "") < (rhs.executablePath ?? "")
     }
 
     public init(
@@ -604,7 +858,7 @@ public struct ProcessSnapshot: Codable, Sendable, Identifiable, Equatable {
         self.parentPID = parentPID
         self.userID = userID
         self.isSystem = isSystem
-        self.name = name
+        self.name = WorkingDirectoryLabelSanitizer.label(fromComponent: name) ?? "(unknown)"
         self.executablePath = executablePath
         self.applicationName = applicationName.flatMap(WorkingDirectoryLabelSanitizer.label(fromComponent:))
         self.bundleIdentifier = bundleIdentifier.flatMap(WorkingDirectoryLabelSanitizer.label(fromComponent:))
@@ -832,9 +1086,7 @@ public struct ProcessActionPolicy: Sendable, Equatable {
     }
 
     private static func isValidIdentity(_ identity: ProcessIdentity) -> Bool {
-        identity.pid > 0
-            && identity.startTimeSeconds > 0
-            && identity.startTimeMicroseconds < 1_000_000
+        identity.isStructurallyValid
     }
 
     private static func isProtected(process: ProcessSnapshot) -> Bool {
@@ -906,15 +1158,70 @@ public struct ProcessActionAuditEvent: Codable, Sendable, Equatable, Identifiabl
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.init(
-            id: try container.decode(String.self, forKey: .id),
-            timestamp: try container.decode(Date.self, forKey: .timestamp),
+        let id = try container.decode(String.self, forKey: .id)
+        let timestamp = try container.decode(Date.self, forKey: .timestamp)
+        let processLabel = try container.decode(String.self, forKey: .processLabel)
+        let applicationName = try container.decodeIfPresent(String.self, forKey: .applicationName)
+        let detail = try container.decode(String.self, forKey: .detail)
+        let decoded = Self(
+            id: id,
+            timestamp: timestamp,
             action: try container.decode(ProcessActionKind.self, forKey: .action),
             outcome: try container.decode(ProcessActionOutcome.self, forKey: .outcome),
-            processLabel: try container.decode(String.self, forKey: .processLabel),
-            applicationName: try container.decodeIfPresent(String.self, forKey: .applicationName),
-            detail: try container.decode(String.self, forKey: .detail)
+            processLabel: processLabel,
+            applicationName: applicationName,
+            detail: detail
         )
+        guard decoded.hasValidPersistedFields else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .timestamp,
+                in: container,
+                debugDescription: "Audit event contains invalid persisted fields"
+            )
+        }
+        self = decoded
+    }
+
+    fileprivate var hasValidPersistedFields: Bool {
+        Self.hasValidPersistedFields(
+            id: id,
+            timestamp: timestamp,
+            processLabel: processLabel,
+            applicationName: applicationName,
+            detail: detail
+        )
+    }
+
+    private static func hasValidPersistedFields(
+        id: String,
+        timestamp: Date,
+        processLabel: String,
+        applicationName: String?,
+        detail: String
+    ) -> Bool {
+        let idIsValid = !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && id.count <= 80
+            && Self.hasNoControlCharacters(id)
+        let processLabelIsValid = !processLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && Self.hasNoControlCharacters(processLabel)
+        let applicationNameIsValid = applicationName.map {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && Self.hasNoControlCharacters($0)
+        } ?? true
+        let detailIsValid = !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && Self.hasNoControlCharacters(detail)
+        return idIsValid
+            && isPersistableDate(timestamp)
+            && processLabelIsValid
+            && applicationNameIsValid
+            && detailIsValid
+    }
+
+    private static func hasNoControlCharacters(_ value: String) -> Bool {
+        !value.unicodeScalars.contains { scalar in
+            let code = scalar.value
+            return code < 0x20 || (0x7F...0x9F).contains(code)
+        }
     }
 
     private static func sanitizedDetail(_ value: String) -> String {
@@ -942,6 +1249,8 @@ public struct ProcessActionAuditEvent: Codable, Sendable, Equatable, Identifiabl
 }
 
 public struct ProcessSamplingResult: Sendable, Equatable {
+    public static let minimumUsableCoverage = 0.5
+
     public let processes: [ProcessSnapshot]
     public let listedProcessCount: Int
     public let sampledProcessCount: Int
@@ -966,10 +1275,90 @@ public struct ProcessSamplingResult: Sendable, Equatable {
         )
         self.status = status
     }
+
+    /// A scan may return a technically valid but nearly empty list when most
+    /// processes disappear or are denied during enumeration. Such a result is
+    /// diagnostic evidence, not a safe replacement for the last good snapshot.
+    public var isUsable: Bool {
+        guard status.quality.isUsable,
+              status.hasFiniteSampleTimestamp,
+              !processes.isEmpty,
+              listedProcessCount > 0 else {
+            return false
+        }
+        let coverage = Double(sampledProcessCount) / Double(listedProcessCount)
+        return coverage.isFinite && coverage >= Self.minimumUsableCoverage
+    }
 }
 
 public struct ProcessSampler: Sendable {
     public init() {}
+
+    /// `proc_listpids` accepts a signed 32-bit byte count. Keep all capacity
+    /// arithmetic checked before allocating or converting to that C type.
+    static func checkedPIDBufferByteCount(capacity: Int) -> Int? {
+        guard capacity > 0 else { return nil }
+        let stride = MemoryLayout<pid_t>.stride
+        guard stride > 0 else { return nil }
+        let (bytes, overflow) = capacity.multipliedReportingOverflow(by: stride)
+        guard !overflow, bytes <= Int(Int32.max) else { return nil }
+        return bytes
+    }
+
+    static func isPIDByteCountAligned(_ byteCount: Int) -> Bool {
+        let stride = MemoryLayout<pid_t>.stride
+        return stride > 0 && byteCount >= 0 && byteCount % stride == 0
+    }
+
+    /// A PID may be recycled while the sampler is reading rusage, paths, and
+    /// working-directory metadata. Accept the assembled snapshot only when a
+    /// final kernel identity read still describes the process that started it.
+    static func hasStableIdentity(
+        requestedPID: Int32,
+        initial: ProcessIdentity,
+        final: ProcessIdentity
+    ) -> Bool {
+        requestedPID > 0
+            && initial.pid == requestedPID
+            && initial.isStructurallyValid
+            && final.isStructurallyValid
+            && initial == final
+    }
+
+    /// A usable quality requires at least one complete process snapshot. An
+    /// attempted scan that reads zero rows is still useful diagnostic evidence,
+    /// but it must not look like a fresh estimated payload.
+    static func sampleStatus(
+        at timestamp: Date,
+        listedProcessCount: Int,
+        sampledProcessCount: Int,
+        hasEstimatedFootprint: Bool
+    ) -> SampleStatus {
+        guard timestamp.timeIntervalSince1970.isFinite else {
+            return .error("进程采样时间无效")
+        }
+        let sampled = max(sampledProcessCount, 0)
+        let listed = max(max(listedProcessCount, 0), sampled)
+        guard sampled > 0 else {
+            let message = listed > 0
+                ? "已枚举 \(listed) 个进程，但没有获得可用快照"
+                : "进程列表未返回可读取条目"
+            return .unavailable(message: message)
+        }
+        if sampled == listed, !hasEstimatedFootprint {
+            return .available(at: timestamp)
+        }
+
+        var reasons = [String]()
+        let skipped = listed - sampled
+        if skipped > 0 {
+            reasons.append("\(skipped) 个进程在扫描期间退出、身份变化或受权限限制")
+        }
+        if hasEstimatedFootprint {
+            reasons.append("部分 footprint 使用 RSS 估算")
+        }
+        return .estimated(at: timestamp, message: reasons.joined(separator: "；"))
+    }
 
     public func sample() throws -> [ProcessSnapshot] {
         try sampleDetailed().processes
@@ -988,32 +1377,62 @@ public struct ProcessSampler: Sendable {
     /// or become inaccessible during the scan instead of silently hiding the
     /// partial result.
     public func sampleDetailed(at timestamp: Date = Date()) throws -> ProcessSamplingResult {
+        guard timestamp.timeIntervalSince1970.isFinite else {
+            throw MemoryMonitorError.invalidData(description: "进程采样时间无效")
+        }
         let requestedBytes = proc_listpids(UInt32(PROC_ALL_PIDS), 0, nil, 0)
         guard requestedBytes > 0 else {
             throw MemoryMonitorError.systemCall(name: "proc_listpids(size)", code: requestedBytes)
         }
 
-        var capacity = Int(requestedBytes) / MemoryLayout<pid_t>.stride + 1
+        let pidStride = MemoryLayout<pid_t>.stride
+        guard pidStride > 0 else {
+            throw MemoryMonitorError.invalidData(description: "进程列表元素大小无效")
+        }
+        let requested = Int(requestedBytes)
+        guard Self.isPIDByteCountAligned(requested) else {
+            throw MemoryMonitorError.invalidData(description: "进程列表大小未按 PID 元素对齐")
+        }
+        guard requested <= Int.max - pidStride else {
+            throw MemoryMonitorError.invalidData(description: "进程列表大小溢出")
+        }
+        var capacity = requested / pidStride + 1
         var pids = [pid_t]()
         var returnedBytes: Int32 = 0
         for _ in 0..<3 {
+            guard let bufferByteCount = Self.checkedPIDBufferByteCount(capacity: capacity) else {
+                throw MemoryMonitorError.invalidData(description: "进程列表缓冲区大小无效")
+            }
             pids = [pid_t](repeating: 0, count: capacity)
             returnedBytes = pids.withUnsafeMutableBytes { rawBuffer in
-                proc_listpids(UInt32(PROC_ALL_PIDS), 0, rawBuffer.baseAddress, Int32(rawBuffer.count))
+                proc_listpids(UInt32(PROC_ALL_PIDS), 0, rawBuffer.baseAddress, Int32(bufferByteCount))
             }
             guard returnedBytes > 0 else {
                 throw MemoryMonitorError.systemCall(name: "proc_listpids", code: returnedBytes)
             }
-            if Int(returnedBytes) < pids.count * MemoryLayout<pid_t>.stride {
+            guard Self.isPIDByteCountAligned(Int(returnedBytes)) else {
+                throw MemoryMonitorError.invalidData(description: "proc_listpids 返回大小未按 PID 元素对齐")
+            }
+            if Int(returnedBytes) < bufferByteCount {
                 break
             }
-            capacity = max(capacity * 2, Int(returnedBytes) / MemoryLayout<pid_t>.stride + 1)
+            let returned = Int(returnedBytes)
+            guard returned <= Int.max - pidStride else {
+                throw MemoryMonitorError.invalidData(description: "进程列表返回大小溢出")
+            }
+            let requiredCapacity = returned / pidStride + 1
+            let (doubledCapacity, doubledOverflow) = capacity.multipliedReportingOverflow(by: 2)
+            guard !doubledOverflow else {
+                throw MemoryMonitorError.invalidData(description: "进程列表容量增长溢出")
+            }
+            capacity = max(doubledCapacity, requiredCapacity)
         }
-        guard Int(returnedBytes) < pids.count * MemoryLayout<pid_t>.stride else {
+        guard let finalBufferByteCount = Self.checkedPIDBufferByteCount(capacity: pids.count),
+              Int(returnedBytes) < finalBufferByteCount else {
             throw MemoryMonitorError.invalidData(description: "proc_listpids returned a truncated process list")
         }
 
-        let returnedCount = min(Int(returnedBytes) / MemoryLayout<pid_t>.stride, pids.count)
+        let returnedCount = min(Int(returnedBytes) / pidStride, pids.count)
         var seenPIDs = Set<pid_t>()
         let candidatePIDs = pids.prefix(returnedCount).filter { pid in
             pid > 0 && seenPIDs.insert(pid).inserted
@@ -1023,19 +1442,12 @@ public struct ProcessSampler: Sendable {
         }
         let skippedCount = candidatePIDs.count - processes.count
         let hasEstimatedFootprint = processes.contains { $0.physicalFootprintIsEstimated }
-        let status: SampleStatus
-        if skippedCount == 0, !hasEstimatedFootprint {
-            status = SampleStatus.available(at: timestamp)
-        } else {
-            var reasons = [String]()
-            if skippedCount > 0 {
-                reasons.append("\(skippedCount) 个进程在扫描期间退出或受权限限制")
-            }
-            if hasEstimatedFootprint {
-                reasons.append("部分 footprint 使用 RSS 估算")
-            }
-            status = SampleStatus.estimated(at: timestamp, message: reasons.joined(separator: "；"))
-        }
+        let status = Self.sampleStatus(
+            at: timestamp,
+            listedProcessCount: candidatePIDs.count,
+            sampledProcessCount: processes.count,
+            hasEstimatedFootprint: hasEstimatedFootprint
+        )
         return ProcessSamplingResult(
             processes: processes,
             listedProcessCount: candidatePIDs.count,
@@ -1074,17 +1486,39 @@ public struct ProcessSampler: Sendable {
             ? workingDirectoryLabel(for: pid)
             : nil
 
+        let identity = ProcessIdentity(
+            pid: Int32(bsd.pbi_pid),
+            startTimeSeconds: bsd.pbi_start_tvsec,
+            startTimeMicroseconds: bsd.pbi_start_tvusec
+        )
+        guard identity.isStructurallyValid else { return nil }
+
         let path = executablePath(for: pid)
         let application = ApplicationIdentityResolver.resolve(executablePath: path)
+
+        var finalBSD = proc_bsdinfo()
+        let finalBSDSize = Int32(MemoryLayout<proc_bsdinfo>.stride)
+        let finalBSDBytes = withUnsafeMutablePointer(to: &finalBSD) { pointer in
+            proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, pointer, finalBSDSize)
+        }
+        guard finalBSDBytes >= finalBSDSize else { return nil }
+        let finalIdentity = ProcessIdentity(
+            pid: Int32(finalBSD.pbi_pid),
+            startTimeSeconds: finalBSD.pbi_start_tvsec,
+            startTimeMicroseconds: finalBSD.pbi_start_tvusec
+        )
+        guard Self.hasStableIdentity(
+            requestedPID: Int32(pid),
+            initial: identity,
+            final: finalIdentity
+        ) else {
+            return nil
+        }
         return ProcessSnapshot(
-            identity: ProcessIdentity(
-                pid: Int32(bsd.pbi_pid),
-                startTimeSeconds: bsd.pbi_start_tvsec,
-                startTimeMicroseconds: bsd.pbi_start_tvusec
-            ),
-            parentPID: Int32(bsd.pbi_ppid),
-            userID: UInt32(bsd.pbi_uid),
-            isSystem: (bsd.pbi_flags & UInt32(PROC_FLAG_SYSTEM)) != 0,
+            identity: identity,
+            parentPID: Int32(finalBSD.pbi_ppid),
+            userID: UInt32(finalBSD.pbi_uid),
+            isSystem: (finalBSD.pbi_flags & UInt32(PROC_FLAG_SYSTEM)) != 0,
             name: processName,
             executablePath: path,
             applicationName: application?.name,
@@ -1146,6 +1580,27 @@ public enum WorkloadAttributionReason: String, Codable, Sendable, Equatable {
     case runtimeAncestorWorkingDirectory
     case runtimeFallback
     case processName
+
+    /// Higher values represent a more specific or better-evidenced attribution.
+    /// This order is also used when one stable group receives processes whose
+    /// classifications were produced by different rules.
+    fileprivate var confidencePriority: Int {
+        switch self {
+        case .systemProcess: return 100
+        case .codexSession: return 95
+        case .codexAncestor: return 90
+        case .chromeIdentity: return 85
+        case .maibotIdentity: return 84
+        case .virtualizationIdentity: return 83
+        case .safariAncestor: return 80
+        case .ghosttyAncestor: return 75
+        case .runtimeWorkingDirectory: return 70
+        case .runtimeAncestorWorkingDirectory: return 65
+        case .runtimeFallback: return 60
+        case .unattributedWebKit: return 40
+        case .processName: return 10
+        }
+    }
 
     public var displayName: String {
         switch self {
@@ -1291,6 +1746,11 @@ public struct WorkloadGrouper: Sendable {
                 reason: classification.reason
             )
             bucket.processes.append(process)
+            if classification.reason.confidencePriority > bucket.reason.confidencePriority
+                || (classification.reason.confidencePriority == bucket.reason.confidencePriority
+                    && classification.reason.rawValue < bucket.reason.rawValue) {
+                bucket.reason = classification.reason
+            }
             buckets[classification.id] = bucket
         }
 
@@ -1311,7 +1771,9 @@ public struct WorkloadGrouper: Sendable {
                 representativeProcess: largest?.name ?? "(unknown)",
                 attributionReason: bucket.reason,
                 parentChain: largest.map { parentChain(for: $0, byPID: byPID) } ?? [],
-                memberProcessIdentities: bucket.processes.map(\.identity)
+                memberProcessIdentities: bucket.processes
+                    .map(\.identity)
+                    .sorted(by: Self.identityAscending)
             )
         }
         .sorted {
@@ -1335,47 +1797,131 @@ public struct WorkloadGrouper: Sendable {
         byPID: [Int32: ProcessSnapshot]
     ) -> Classification {
         let names = ancestorNames(for: process, byPID: byPID)
-        let combined = names.joined(separator: " ").lowercased()
-        let own = process.name.lowercased()
-        let path = process.executablePath?.lowercased() ?? ""
-        let applicationText = "\(process.applicationName ?? "") \(process.bundleIdentifier ?? "")".lowercased()
-        let identityText = "\(own) \(path) \(applicationText)"
+        let ancestors = Array(names.dropFirst())
+        let own = process.name
 
-        if process.isSystem || process.userID == 0 || ["kernel_task", "windowserver", "controlcenter", "launchd"].contains(own) {
+        // Match process names and bundle components at explicit boundaries.
+        // A substring search would classify paths such as
+        // `/work/chrome-project/...` or `/archive/vmmigration/...` as real
+        // browser/virtualization workloads.
+        let codexNames: Set<String> = ["codex"]
+        let codexPrefixes = ["codex helper"]
+        let chromeNames: Set<String> = ["chrome", "google chrome", "chromium"]
+        let chromePrefixes = [
+            "google chrome helper",
+            "chrome helper",
+            "chrome_crashpad"
+        ]
+        let safariNames: Set<String> = ["safari"]
+        let safariPrefixes = [
+            "safari networking",
+            "safari history",
+            "safari web",
+            "safari helper",
+            "com.apple.safari"
+        ]
+        let webKitNames: Set<String> = ["webkit"]
+        let webKitPrefixes = ["webkit", "com.apple.webkit"]
+        let ghosttyNames: Set<String> = ["ghostty"]
+        let ghosttyPrefixes = ["ghostty"]
+        let maiBotNames: Set<String> = ["maibot"]
+        let maiBotPrefixes = ["maibot worker", "maibot server"]
+        let virtualizationNames: Set<String> = ["vmm", "virtualization", "virtual machine"]
+        let virtualizationPrefixes = ["virtualization", "virtual machine"]
+
+        let ownIsCodex = processNameMatches(own, exact: codexNames, prefixes: codexPrefixes)
+        let pathIsCodex = pathComponentMatches(
+            process.executablePath,
+            exact: codexNames,
+            prefixes: codexPrefixes
+        )
+        let applicationIsCodex = processNameMatches(
+            process.applicationName,
+            exact: codexNames,
+            prefixes: codexPrefixes
+        )
+        let bundleIsCodex = bundleContainsComponent(process.bundleIdentifier, anyOf: codexNames)
+
+        let isChrome = processNameMatches(own, exact: chromeNames, prefixes: chromePrefixes)
+            || pathComponentMatches(process.executablePath, exact: chromeNames, prefixes: chromePrefixes)
+            || processNameMatches(process.applicationName, exact: chromeNames, prefixes: chromePrefixes)
+            || bundleContainsComponent(process.bundleIdentifier, anyOf: chromeNames)
+        let isSafari = processNameMatches(own, exact: safariNames, prefixes: safariPrefixes)
+            || pathComponentMatches(process.executablePath, exact: safariNames, prefixes: safariPrefixes)
+            || processNameMatches(process.applicationName, exact: safariNames, prefixes: safariPrefixes)
+            || bundleContainsComponent(process.bundleIdentifier, anyOf: safariNames)
+        let isWebKit = processNameMatches(own, exact: webKitNames, prefixes: webKitPrefixes)
+            || pathComponentMatches(process.executablePath, exact: webKitNames, prefixes: webKitPrefixes)
+            || processNameMatches(process.applicationName, exact: webKitNames, prefixes: webKitPrefixes)
+            || bundleContainsComponent(process.bundleIdentifier, anyOf: webKitNames)
+        let isGhostty = processNameMatches(own, exact: ghosttyNames, prefixes: ghosttyPrefixes)
+            || pathComponentMatches(process.executablePath, exact: ghosttyNames, prefixes: ghosttyPrefixes)
+            || processNameMatches(process.applicationName, exact: ghosttyNames, prefixes: ghosttyPrefixes)
+            || bundleContainsComponent(process.bundleIdentifier, anyOf: ghosttyNames)
+        let isMaiBot = processNameMatches(own, exact: maiBotNames, prefixes: maiBotPrefixes)
+            || pathComponentMatches(process.executablePath, exact: maiBotNames, prefixes: maiBotPrefixes)
+            || processNameMatches(process.applicationName, exact: maiBotNames, prefixes: maiBotPrefixes)
+            || bundleContainsComponent(process.bundleIdentifier, anyOf: maiBotNames)
+        let isVirtualization = processNameMatches(
+            own,
+            exact: virtualizationNames,
+            prefixes: virtualizationPrefixes
+        )
+            || pathComponentMatches(
+                process.executablePath,
+                exact: virtualizationNames,
+                prefixes: virtualizationPrefixes
+            )
+            || processNameMatches(
+                process.applicationName,
+                exact: virtualizationNames,
+                prefixes: virtualizationPrefixes
+            )
+            || bundleContainsComponent(process.bundleIdentifier, anyOf: virtualizationNames)
+        let isNode = runtimeDescriptor(for: own.lowercased())?.id == "node"
+        let isPython = runtimeDescriptor(for: own.lowercased())?.id == "python"
+
+        let ancestorHasCodex = ancestors.contains {
+            processNameMatches($0, exact: codexNames, prefixes: codexPrefixes)
+        }
+        let ancestorHasSafari = ancestors.contains {
+            processNameMatches($0, exact: safariNames, prefixes: safariPrefixes)
+        }
+        let ancestorHasGhostty = ancestors.contains {
+            processNameMatches($0, exact: ghosttyNames, prefixes: ghosttyPrefixes)
+        }
+
+        if process.isSystem || process.userID == 0 || ["kernel_task", "windowserver", "controlcenter", "launchd"].contains(own.lowercased()) {
             return Classification(id: "system", title: "系统", isSystem: true, reason: .systemProcess)
         }
-        if own == "codex" || path.contains("/codex") || applicationText.contains("codex") {
-            let hasAutomationDescendant = identityText.contains("chrome")
-                || identityText.contains("chromium")
-                || identityText.contains("node")
-                || identityText.contains("webkit")
-                || identityText.contains("python")
+        if ownIsCodex || pathIsCodex || applicationIsCodex || bundleIsCodex {
+            let hasAutomationDescendant = isChrome || isNode || isWebKit || isPython
             return hasAutomationDescendant
                 ? Classification(id: "codex-automation", title: "Codex 自动化", isSystem: false, reason: .codexAncestor)
                 : Classification(id: "codex-session", title: "Codex 会话", isSystem: false, reason: .codexSession)
         }
-        if combined.contains("codex") && (identityText.contains("chrome") || identityText.contains("chromium") || identityText.contains("node")) {
+        if ancestorHasCodex && (isChrome || isNode || isWebKit || isPython) {
             return Classification(id: "codex-automation", title: "Codex 自动化", isSystem: false, reason: .codexAncestor)
         }
-        if own.contains("safari") || path.contains("safari") || combined.contains("safari") {
+        if isSafari || ancestorHasSafari {
             return Classification(id: "safari-webkit", title: "Safari/WebKit", isSystem: false, reason: .safariAncestor)
         }
-        if own.contains("webkit") || path.contains("webkit") {
+        if isWebKit {
             return Classification(id: "unattributed-webkit", title: "未归属 WebKit", isSystem: false, reason: .unattributedWebKit)
         }
-        if identityText.contains("chrome") || identityText.contains("chromium") {
+        if isChrome {
             return Classification(id: "chrome", title: "Chrome", isSystem: false, reason: .chromeIdentity)
         }
-        if combined.contains("ghostty") {
+        if isGhostty || ancestorHasGhostty {
             return Classification(id: "ghostty-services", title: "Ghostty/开发服务", isSystem: false, reason: .ghosttyAncestor)
         }
-        if identityText.contains("maibot") || path.contains("maibot") {
+        if isMaiBot {
             return Classification(id: "maibot", title: "MaiBot", isSystem: false, reason: .maibotIdentity)
         }
-        if identityText.contains("virtualization") || identityText.contains("virtual machine") || identityText.contains("vmm") {
+        if isVirtualization {
             return Classification(id: "virtual-machines", title: "虚拟机", isSystem: false, reason: .virtualizationIdentity)
         }
-        if let runtime = runtimeDescriptor(for: own) {
+        if let runtime = runtimeDescriptor(for: own.lowercased()) {
             if let resolution = workingDirectoryResolution(for: process, byPID: byPID) {
                 let label = resolution.label
                 let component = WorkingDirectoryLabelSanitizer.identifierComponent(for: label)
@@ -1393,7 +1939,53 @@ public struct WorkloadGrouper: Sendable {
                 reason: .runtimeFallback
             )
         }
-        return Classification(id: "process-\(own)", title: process.name, isSystem: false, reason: .processName)
+        return Classification(
+            id: "process-\(own.lowercased())",
+            title: process.name,
+            isSystem: false,
+            reason: .processName
+        )
+    }
+
+    private func processNameMatches(
+        _ value: String?,
+        exact: Set<String>,
+        prefixes: [String]
+    ) -> Bool {
+        guard let value else { return false }
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if exact.contains(normalized) { return true }
+        return prefixes.contains { prefix in
+            guard normalized.hasPrefix(prefix) else { return false }
+            let suffix = normalized.dropFirst(prefix.count)
+            guard let first = suffix.first else { return true }
+            // Hyphens are deliberately excluded: `safari-backup` and
+            // `chrome-project` are ordinary names, not browser identities.
+            return first == " " || first == "(" || first == "." || first == "_"
+        }
+    }
+
+    private func pathComponentMatches(
+        _ path: String?,
+        exact: Set<String>,
+        prefixes: [String]
+    ) -> Bool {
+        guard let path, path.hasPrefix("/") else { return false }
+        return path.split(separator: "/", omittingEmptySubsequences: true).contains { rawComponent in
+            var component = String(rawComponent).lowercased()
+            if component.hasSuffix(".app") {
+                component.removeLast(4)
+            }
+            return processNameMatches(component, exact: exact, prefixes: prefixes)
+        }
+    }
+
+    private func bundleContainsComponent(_ bundle: String?, anyOf components: Set<String>) -> Bool {
+        guard let bundle else { return false }
+        return bundle
+            .lowercased()
+            .split(separator: ".", omittingEmptySubsequences: true)
+            .contains { components.contains(String($0)) }
     }
 
     private func runtimeDescriptor(for name: String) -> (id: String, title: String)? {
@@ -1452,11 +2044,36 @@ public struct WorkloadGrouper: Sendable {
         let (value, overflow) = lhs.addingReportingOverflow(rhs)
         return overflow ? UInt64.max : value
     }
+
+    private static func identityAscending(_ lhs: ProcessIdentity, _ rhs: ProcessIdentity) -> Bool {
+        if lhs.pid != rhs.pid { return lhs.pid < rhs.pid }
+        if lhs.startTimeSeconds != rhs.startTimeSeconds {
+            return lhs.startTimeSeconds < rhs.startTimeSeconds
+        }
+        return lhs.startTimeMicroseconds < rhs.startTimeMicroseconds
+    }
 }
 
 /// A complete sampling pass. Every source has its own status so a failure in
 /// process enumeration cannot discard otherwise valid system metrics.
 public struct MonitorSnapshot: Sendable, Equatable {
+    /// System providers normally finish within the same sampling pass as the
+    /// enclosing snapshot. Reject a stale or future value before it can drive
+    /// pressure, history, or recommendations.
+    public static let systemSampleTimestampTolerance: TimeInterval = 5 * 60
+
+    /// Process providers normally timestamp their result within the same
+    /// sampling pass as the enclosing snapshot. Keep a deliberately generous
+    /// bound for a slow scan or a caller-supplied clock, while rejecting stale
+    /// or malformed timestamps that could make a retained process list look
+    /// fresh indefinitely.
+    public static let processSampleTimestampTolerance: TimeInterval = 5 * 60
+
+    /// GPU providers may query a separate IORegistry tree and therefore have
+    /// a small completion skew, but a value from a different wall-clock era
+    /// must not be presented as current utilization.
+    public static let gpuSampleTimestampTolerance: TimeInterval = 5 * 60
+
     public let timestamp: Date
     public let samplingMode: SamplingMode
     public let diagnostics: SamplingDiagnostics
@@ -1501,7 +2118,10 @@ public struct MonitorSnapshot: Sendable, Equatable {
         self.processes = processes
         self.processStatus = processStatus
         let normalizedListedCount = max(listedProcessCount, 0)
-        let normalizedSampledCount = max(sampledProcessCount, 0)
+        // The array is the authoritative set of rows exposed by this
+        // immutable snapshot. Accepting a larger caller-provided count would
+        // make coverage and UI diagnostics disagree with the actual data.
+        let normalizedSampledCount = processes.count
         self.listedProcessCount = max(normalizedListedCount, normalizedSampledCount)
         self.sampledProcessCount = normalizedSampledCount
         self.groups = groups
@@ -1517,6 +2137,96 @@ public struct MonitorSnapshot: Sendable, Equatable {
 
     public var didSampleProcesses: Bool {
         diagnostics.processSamplingPerformed
+    }
+
+    /// The system sample is trusted only when the value, its status marker,
+    /// and the enclosing pass all describe a finite, nearby instant.
+    public var validatedSystemSampleAt: Date? {
+        guard let system,
+              system.isStructurallyValid,
+              systemStatus.quality.isUsable,
+              let statusAt = systemStatus.sampledAt else {
+            return nil
+        }
+        let snapshotSeconds = timestamp.timeIntervalSince1970
+        let systemSeconds = system.timestamp.timeIntervalSince1970
+        let statusSeconds = statusAt.timeIntervalSince1970
+        let tolerance = Self.systemSampleTimestampTolerance
+        guard snapshotSeconds.isFinite,
+              systemSeconds.isFinite,
+              statusSeconds.isFinite,
+              tolerance.isFinite,
+              tolerance >= 0 else {
+            return nil
+        }
+        let systemSkew = systemSeconds - snapshotSeconds
+        let statusSkew = statusSeconds - systemSeconds
+        let statusToSnapshotSkew = statusSeconds - snapshotSeconds
+        guard systemSkew.isFinite,
+              statusSkew.isFinite,
+              statusToSnapshotSkew.isFinite,
+              abs(systemSkew) <= tolerance,
+              abs(statusSkew) <= tolerance,
+              abs(statusToSnapshotSkew) <= tolerance else {
+            return nil
+        }
+        return system.timestamp
+    }
+
+    public var validatedSystemSample: SystemMemorySnapshot? {
+        guard validatedSystemSampleAt != nil else { return nil }
+        return system
+    }
+
+    public var systemDataIsUsable: Bool {
+        validatedSystemSample != nil
+    }
+
+    /// True only when this pass produced enough trustworthy process rows to
+    /// replace the app's retained process/workload snapshot.
+    public var processDataIsUsable: Bool {
+        guard didSampleProcesses,
+              processStatus.quality.isUsable,
+              validatedProcessSampleAt != nil,
+              sampledProcessCount > 0,
+              listedProcessCount > 0 else {
+            return false
+        }
+        let coverage = Double(sampledProcessCount) / Double(listedProcessCount)
+        return coverage.isFinite && coverage >= ProcessSamplingResult.minimumUsableCoverage
+    }
+
+    /// A provider returned a captured result, even if its coverage is too low
+    /// to replace the retained snapshot. Failed/unavailable statuses have no
+    /// sample timestamp and therefore are not considered successful.
+    public var processSamplingSucceeded: Bool {
+        didSampleProcesses
+            && validatedProcessSampleAt != nil
+    }
+
+    /// The process sample instant is trusted only when both dates are finite
+    /// and close enough to describe the same sampling pass. This value is the
+    /// single source of truth for process freshness in the app and history.
+    public var validatedProcessSampleAt: Date? {
+        guard didSampleProcesses,
+              processStatus.quality.isUsable,
+              let sampledAt = processStatus.sampledAt else {
+            return nil
+        }
+        let sampledSeconds = sampledAt.timeIntervalSince1970
+        let snapshotSeconds = timestamp.timeIntervalSince1970
+        guard sampledSeconds.isFinite,
+              snapshotSeconds.isFinite,
+              Self.processSampleTimestampTolerance.isFinite,
+              Self.processSampleTimestampTolerance >= 0 else {
+            return nil
+        }
+        let skew = sampledSeconds - snapshotSeconds
+        guard skew.isFinite,
+              abs(skew) <= Self.processSampleTimestampTolerance else {
+            return nil
+        }
+        return sampledAt
     }
 }
 
@@ -1560,6 +2270,33 @@ public struct MonitorSampler: Sendable {
         mode: SamplingMode,
         at timestamp: Date = Date()
     ) -> MonitorSnapshot {
+        guard timestamp.timeIntervalSince1970.isFinite else {
+            let safeTimestamp = Date(timeIntervalSince1970: 0)
+            let diagnostics = SamplingDiagnostics(
+                mode: mode,
+                totalDurationMilliseconds: 0,
+                processDurationMilliseconds: nil,
+                processSamplingPerformed: false,
+                processCount: 0,
+                listedProcessCount: 0
+            )
+            return MonitorSnapshot(
+                timestamp: safeTimestamp,
+                system: nil,
+                systemStatus: .error("采样时间无效"),
+                cpuTime: nil,
+                cpuStatus: .error("采样时间无效"),
+                gpuUsageFraction: nil,
+                gpuStatus: .error("采样时间无效"),
+                processes: [],
+                processStatus: .error("采样时间无效"),
+                listedProcessCount: 0,
+                sampledProcessCount: 0,
+                groups: [],
+                samplingMode: mode,
+                diagnostics: diagnostics
+            )
+        }
         let startedAt = DispatchTime.now().uptimeNanoseconds
         var system: SystemMemorySnapshot?
         let systemStatus: SampleStatus
@@ -1586,7 +2323,10 @@ public struct MonitorSampler: Sendable {
             cpuStatus = Self.errorStatus(for: error)
         }
 
-        let gpuSample = gpuProvider()
+        let gpuSample = Self.validatedGPU(
+            gpuProvider(),
+            at: timestamp
+        )
 
         var processes: [ProcessSnapshot] = []
         let processSamplingPerformed = mode.samplesProcesses
@@ -1644,6 +2384,34 @@ public struct MonitorSampler: Sendable {
         SampleStatus.error(error.localizedDescription)
     }
 
+    private static func validatedGPU(
+        _ sample: GPUUsageSample,
+        at timestamp: Date
+    ) -> GPUUsageSample {
+        guard sample.status.quality.isUsable else { return sample }
+        guard let sampledAt = sample.status.sampledAt,
+              let fraction = sample.fraction,
+              fraction.isFinite,
+              (0...1).contains(fraction),
+              timestamp.timeIntervalSince1970.isFinite,
+              sampledAt.timeIntervalSince1970.isFinite,
+              Self.gpuTimestampSkew(sampledAt, timestamp: timestamp) else {
+            return GPUUsageSample(
+                fraction: nil,
+                status: .error("GPU 采样时间无效或与当前采样不一致")
+            )
+        }
+        return sample
+    }
+
+    private static func gpuTimestampSkew(_ sampledAt: Date, timestamp: Date) -> Bool {
+        let skew = sampledAt.timeIntervalSince(timestamp)
+        return skew.isFinite
+            && MonitorSnapshot.gpuSampleTimestampTolerance.isFinite
+            && MonitorSnapshot.gpuSampleTimestampTolerance >= 0
+            && abs(skew) <= MonitorSnapshot.gpuSampleTimestampTolerance
+    }
+
     private func elapsedMilliseconds(since start: UInt64) -> Double {
         let now = DispatchTime.now().uptimeNanoseconds
         guard now >= start else { return 0 }
@@ -1682,27 +2450,78 @@ public struct WorkloadTrendAnalyzer: Sendable {
         current: [WorkloadGroupSnapshot],
         intervalSeconds: TimeInterval
     ) -> [WorkloadGrowth] {
-        let previousByID = Dictionary(uniqueKeysWithValues: previous.map { ($0.id, $0) })
-        let interval = max(intervalSeconds, 0.001)
-        return current.compactMap { group in
+        guard intervalSeconds.isFinite, intervalSeconds > 0 else { return [] }
+
+        let previousByID = Dictionary(uniqueKeysWithValues: Self.canonicalGroups(previous).map { ($0.id, $0) })
+        return Self.canonicalGroups(current).compactMap { group in
             guard let old = previousByID[group.id], group.physicalFootprintBytes > old.physicalFootprintBytes else {
                 return nil
             }
             let delta = group.physicalFootprintBytes - old.physicalFootprintBytes
+            let rate = Double(delta) / intervalSeconds
+            guard rate.isFinite else { return nil }
             return WorkloadGrowth(
                 id: group.id,
                 title: group.title,
                 deltaBytes: delta,
                 currentFootprintBytes: group.physicalFootprintBytes,
-                rateBytesPerSecond: Double(delta) / interval
+                rateBytesPerSecond: rate
             )
         }
         .sorted {
             if $0.rateBytesPerSecond != $1.rateBytesPerSecond {
                 return $0.rateBytesPerSecond > $1.rateBytesPerSecond
             }
-            return $0.deltaBytes > $1.deltaBytes
+            if $0.deltaBytes != $1.deltaBytes {
+                return $0.deltaBytes > $1.deltaBytes
+            }
+            return $0.id < $1.id
         }
+    }
+
+    private static func canonicalGroups(_ groups: [WorkloadGroupSnapshot]) -> [WorkloadGroupSnapshot] {
+        var byID = [String: WorkloadGroupSnapshot]()
+        for group in groups {
+            if let existing = byID[group.id] {
+                byID[group.id] = preferred(group, over: existing)
+            } else {
+                byID[group.id] = group
+            }
+        }
+        return byID.values.sorted {
+            if $0.id != $1.id {
+                return $0.id < $1.id
+            }
+            return $0.title < $1.title
+        }
+    }
+
+    private static func preferred(
+        _ candidate: WorkloadGroupSnapshot,
+        over existing: WorkloadGroupSnapshot
+    ) -> WorkloadGroupSnapshot {
+        // A duplicate ID can be supplied by a malformed or hand-built
+        // snapshot. An RSS fallback must never mask an exact footprint just
+        // because its numeric value happens to be larger.
+        if candidate.containsEstimatedFootprint != existing.containsEstimatedFootprint {
+            return candidate.containsEstimatedFootprint ? existing : candidate
+        }
+        if candidate.physicalFootprintBytes != existing.physicalFootprintBytes {
+            return candidate.physicalFootprintBytes > existing.physicalFootprintBytes ? candidate : existing
+        }
+        if candidate.residentBytes != existing.residentBytes {
+            return candidate.residentBytes > existing.residentBytes ? candidate : existing
+        }
+        if candidate.processCount != existing.processCount {
+            return candidate.processCount > existing.processCount ? candidate : existing
+        }
+        if candidate.title != existing.title {
+            return candidate.title < existing.title ? candidate : existing
+        }
+        if candidate.representativeProcess != existing.representativeProcess {
+            return candidate.representativeProcess < existing.representativeProcess ? candidate : existing
+        }
+        return existing
     }
 }
 
@@ -1771,6 +2590,39 @@ public struct MemoryRecommendation: Codable, Sendable, Equatable, Identifiable {
         self.generatedAt = generatedAt
     }
 
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case severity
+        case title
+        case detail
+        case evidence
+        case confidence
+        case targetGroupID
+        case generatedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let generatedAt = try container.decode(Date.self, forKey: .generatedAt)
+        guard isPersistableDate(generatedAt) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .generatedAt,
+                in: container,
+                debugDescription: "Recommendation timestamp is invalid"
+            )
+        }
+        self.init(
+            id: try container.decode(String.self, forKey: .id),
+            severity: try container.decode(RecommendationSeverity.self, forKey: .severity),
+            title: try container.decode(String.self, forKey: .title),
+            detail: try container.decode(String.self, forKey: .detail),
+            evidence: try container.decode([RecommendationEvidence].self, forKey: .evidence),
+            confidence: try container.decode(Double.self, forKey: .confidence),
+            targetGroupID: try container.decodeIfPresent(String.self, forKey: .targetGroupID),
+            generatedAt: generatedAt
+        )
+    }
+
     public var confidencePercent: Int {
         Int((confidence * 100).rounded())
     }
@@ -1791,6 +2643,14 @@ public struct RecommendationContext: Sendable, Equatable {
     public let previousProcessSystem: SystemMemorySnapshot?
     public let previousGroups: [WorkloadGroupSnapshot]
     public let previousProcessStatus: SampleStatus?
+    /// Whether every enumerated process produced a row in the previous
+    /// process sample. Estimated footprint values are allowed as long as the
+    /// inventory itself is complete; their quality is checked per group.
+    public let previousProcessInventoryIsComplete: Bool
+    /// Process IDs that must never become actionable recommendation targets.
+    /// The app supplies its own PID to enforce the documented self-exclusion
+    /// rule without relying on executable names.
+    public let excludedProcessIDs: Set<Int32>
     /// Debounced pressure levels supplied by the monitor coordinator. When
     /// absent, the engine falls back to the raw level derived from the current
     /// and previous system snapshots for standalone callers and older clients.
@@ -1803,6 +2663,8 @@ public struct RecommendationContext: Sendable, Equatable {
         previousProcessSystem: SystemMemorySnapshot? = nil,
         previousGroups: [WorkloadGroupSnapshot] = [],
         previousProcessStatus: SampleStatus? = nil,
+        previousProcessInventoryIsComplete: Bool = false,
+        excludedProcessIDs: Set<Int32> = [],
         pressureLevel: MemoryPressureLevel? = nil,
         previousPressureLevel: MemoryPressureLevel? = nil
     ) {
@@ -1811,6 +2673,8 @@ public struct RecommendationContext: Sendable, Equatable {
         self.previousProcessSystem = previousProcessSystem
         self.previousGroups = previousGroups
         self.previousProcessStatus = previousProcessStatus
+        self.previousProcessInventoryIsComplete = previousProcessInventoryIsComplete
+        self.excludedProcessIDs = excludedProcessIDs
         self.pressureLevel = pressureLevel
         self.previousPressureLevel = previousPressureLevel
     }
@@ -1823,37 +2687,101 @@ public struct RecommendationEngine: Sendable {
     public let swapGrowthThresholdBytes: UInt64
     public let residualSwapThresholdBytes: UInt64
     public let criticalGroupFraction: Double
+    public let maximumGrowthIntervalSeconds: TimeInterval
 
     public init(
         minimumGrowthBytes: UInt64 = 16 * 1024 * 1024,
         swapGrowthThresholdBytes: UInt64 = 64 * 1024 * 1024,
         residualSwapThresholdBytes: UInt64 = 1 * 1024 * 1024 * 1024,
-        criticalGroupFraction: Double = 0.10
+        criticalGroupFraction: Double = 0.10,
+        maximumGrowthIntervalSeconds: TimeInterval = 5 * 60
     ) {
         self.minimumGrowthBytes = minimumGrowthBytes
         self.swapGrowthThresholdBytes = swapGrowthThresholdBytes
         self.residualSwapThresholdBytes = residualSwapThresholdBytes
         self.criticalGroupFraction = min(max(criticalGroupFraction.isFinite ? criticalGroupFraction : 0.10, 0), 1)
+        self.maximumGrowthIntervalSeconds = maximumGrowthIntervalSeconds.isFinite
+            ? max(maximumGrowthIntervalSeconds, 0)
+            : 5 * 60
     }
 
     public func evaluate(_ context: RecommendationContext) -> [MemoryRecommendation] {
-        guard let system = context.current.system,
-              context.current.systemStatus.quality.isUsable else {
+        guard context.current.timestamp.timeIntervalSince1970.isFinite else {
             return []
         }
 
-        let observedLevel = MemoryPressureEvaluator.observedLevel(for: system)
+        let system = context.current.validatedSystemSample
+        let observedLevel = system.map { MemoryPressureEvaluator.observedLevel(for: $0) }
         let currentPressureLevel = context.pressureLevel ?? observedLevel
+        // A baseline from the future can be produced by a wall-clock rollback
+        // or malformed persisted value. It must not drive recovery.
+        let previousSystem = system.flatMap { currentSystem in
+            validatedSystem(
+                context.previousSystem,
+                notAfter: currentSystem.timestamp
+            )
+        }
+        let previousProcessSystem = validatedSystem(
+            context.previousProcessSystem,
+            notAfter: system?.timestamp
+        )
+        let currentProcessSampleAt = context.current.validatedProcessSampleAt
+        let previousProcessSampleAt = context.previousProcessStatus.flatMap { status -> Date? in
+            guard status.quality.isUsable,
+                  let sampledAt = status.sampledAt,
+                  sampledAt.timeIntervalSince1970.isFinite else {
+                return nil
+            }
+            return sampledAt
+        }
+        let growthInterval: TimeInterval? = {
+            guard processInventoryHasCompleteRows(context.current),
+                  context.previousProcessInventoryIsComplete,
+                  let currentProcessSampleAt,
+                  let previousProcessSampleAt else {
+                return nil
+            }
+            let interval = currentProcessSampleAt.timeIntervalSince(previousProcessSampleAt)
+            guard interval.isFinite,
+                  interval > 0,
+                  interval <= maximumGrowthIntervalSeconds else {
+                return nil
+            }
+            return interval
+        }()
+        let pairedSwapSystems: (
+            current: SystemMemorySnapshot,
+            previous: SystemMemorySnapshot
+        )? = {
+            guard let system,
+                  let previousProcessSystem,
+                  let currentProcessSampleAt,
+                  let previousProcessSampleAt,
+                  systemIsPaired(system, with: currentProcessSampleAt),
+                  systemIsPaired(previousProcessSystem, with: previousProcessSampleAt) else {
+                return nil
+            }
+            return (system, previousProcessSystem)
+        }()
         let baseConfidence = confidence(
             systemStatus: context.current.systemStatus,
             processStatus: context.current.processStatus,
-            hasBaseline: context.previousProcessSystem != nil || context.previousSystem != nil
+            hasBaseline: growthInterval != nil || previousSystem != nil
         )
         var recommendations = [MemoryRecommendation]()
 
-        if currentPressureLevel == .critical,
-           context.current.didSampleProcesses,
-           let group = largestActionableGroup(in: context.current.groups),
+        // A critical recommendation is an actionable prioritization signal,
+        // so it must be based on a complete, exact process inventory. An
+        // `estimated` process result may still be useful for a best-effort
+        // ranking, but RSS fallback, skipped rows, or even a 50% boundary
+        // coverage cannot establish that this is the largest user group.
+        if let system,
+           currentPressureLevel == .critical,
+           processInventoryIsComplete(context.current),
+           let group = largestActionableGroup(
+               in: context.current.groups,
+               excluding: context.excludedProcessIDs
+           ),
            Double(group.physicalFootprintBytes) / Double(system.totalBytes) >= criticalGroupFraction {
             let fraction = Double(group.physicalFootprintBytes) / Double(system.totalBytes)
             recommendations.append(
@@ -1865,7 +2793,10 @@ public struct RecommendationEngine: Sendable {
                     evidence: [
                         RecommendationEvidence(label: "压力", value: "严重"),
                         RecommendationEvidence(label: "归因总量", value: MemoryFormatter.bytes(group.attributedFootprintBytes)),
-                        RecommendationEvidence(label: "占总内存", value: String(format: "%.0f%%", fraction * 100))
+                        RecommendationEvidence(
+                            label: "归因量/物理内存",
+                            value: String(format: "%.0f%%（含共享重复）", fraction * 100)
+                        )
                     ],
                     confidence: baseConfidence,
                     targetGroupID: group.id,
@@ -1874,33 +2805,63 @@ public struct RecommendationEngine: Sendable {
             )
         }
 
-        if context.current.didSampleProcesses,
-           context.current.processStatus.quality.isUsable,
-           context.previousProcessStatus?.quality.isUsable ?? true,
-           let previousSystem = context.previousProcessSystem ?? context.previousSystem {
-            let interval = max(
-                context.current.timestamp.timeIntervalSince(previousSystem.timestamp),
-                0.001
-            )
+        if let growthInterval {
             let growth = WorkloadTrendAnalyzer().growingGroups(
                 previous: context.previousGroups,
                 current: context.current.groups,
-                intervalSeconds: interval
+                intervalSeconds: growthInterval
             )
-            if let growing = growth.first(where: { !$0.title.isEmpty && !isSystemGroup(id: $0.id) }),
-               growing.deltaBytes >= minimumGrowthBytes {
-                let swapDelta = positiveDelta(
-                    current: system.swapUsedBytes,
-                    previous: previousSystem.swapUsedBytes
-                )
-                let pressureElevated = currentPressureLevel != .normal
+            if let growing = growth.first(where: { candidate in
+                guard !candidate.title.isEmpty,
+                      candidate.deltaBytes >= minimumGrowthBytes,
+                      let currentGroup = canonicalGroup(candidate.id, in: context.current.groups),
+                      let previousGroup = canonicalGroup(candidate.id, in: context.previousGroups),
+                      !currentGroup.isSystem,
+                      !previousGroup.isSystem,
+                      !containsExcludedProcess(
+                          currentGroup,
+                          excludedProcessIDs: context.excludedProcessIDs
+                      ),
+                      !containsExcludedProcess(
+                          previousGroup,
+                          excludedProcessIDs: context.excludedProcessIDs
+                      ) else {
+                    return false
+                }
+                // Comparing RSS fallback to a physical-footprint sample can
+                // manufacture a large delta without any real change. Keep
+                // 同一口径的估算值仍可用于观察趋势（并明确警告），
+                // but fail closed on a quality transition.
+                return currentGroup.containsEstimatedFootprint == previousGroup.containsEstimatedFootprint
+            }) {
+                let currentGroup = canonicalGroup(growing.id, in: context.current.groups)
+                let previousGroup = canonicalGroup(growing.id, in: context.previousGroups)
+                let usesEstimatedFootprint = currentGroup?.containsEstimatedFootprint == true
+                    || previousGroup?.containsEstimatedFootprint == true
+                let swapDelta = pairedSwapSystems.map {
+                    positiveDelta(
+                        current: $0.current.swapUsedBytes,
+                        previous: $0.previous.swapUsedBytes
+                    )
+                } ?? 0
+                let swapIsGrowing = swapDelta > 0 && swapDelta >= swapGrowthThresholdBytes
+                let pressureElevated = currentPressureLevel == .attention
+                    || currentPressureLevel == .critical
                 let severity: RecommendationSeverity =
-                    swapDelta >= swapGrowthThresholdBytes || pressureElevated ? .attention : .info
-                var evidence = [
+                    swapIsGrowing || pressureElevated ? .attention : .info
+                var evidence = [RecommendationEvidence]()
+                if usesEstimatedFootprint {
+                    // Put the caveat first because the compact UI/probe show
+                    // only the first three evidence items.
+                    evidence.append(
+                        RecommendationEvidence(label: "footprint 口径", value: "RSS 估算")
+                    )
+                }
+                evidence.append(contentsOf: [
                     RecommendationEvidence(label: "增长", value: MemoryFormatter.bytes(growing.deltaBytes)),
                     RecommendationEvidence(label: "速度", value: rateDescription(growing.rateBytesPerSecond)),
                     RecommendationEvidence(label: "当前归因总量", value: MemoryFormatter.bytes(growing.currentFootprintBytes))
-                ]
+                ])
                 if swapDelta > 0 {
                     evidence.append(
                         RecommendationEvidence(label: "Swap 增量", value: MemoryFormatter.bytes(swapDelta))
@@ -1910,12 +2871,20 @@ public struct RecommendationEngine: Sendable {
                     MemoryRecommendation(
                         id: "growth-\(growing.id)",
                         severity: severity,
-                        title: "\(growing.title) 正在增长",
-                        detail: swapDelta >= swapGrowthThresholdBytes
-                            ? "该工作组在最近采样间隔持续增加，并伴随 Swap 上升；建议检查任务是否仍有必要运行。"
-                            : "该工作组在最近采样间隔持续增加；建议继续观察下一轮趋势。",
+                        title: "\(growing.title) 较上一轮增加",
+                        detail: growthDetail(
+                            swapIsGrowing: swapIsGrowing,
+                            usesEstimatedFootprint: usesEstimatedFootprint
+                        ),
                         evidence: evidence,
-                        confidence: min(baseConfidence, context.current.processStatus.quality == .estimated ? 0.70 : 0.90),
+                        confidence: min(
+                            baseConfidence,
+                            context.current.processStatus.quality == .estimated
+                                || context.previousProcessStatus?.quality == .estimated
+                                ? 0.70
+                                : 0.90,
+                            usesEstimatedFootprint ? 0.50 : 0.90
+                        ),
                         targetGroupID: growing.id,
                         generatedAt: context.current.timestamp
                     )
@@ -1926,12 +2895,14 @@ public struct RecommendationEngine: Sendable {
 
         // Recovery is a system-only signal, so it must remain available when
         // the current pass intentionally skips the expensive process scan.
-        if let previousSystem = context.previousSystem {
+        if let system, let previousSystem {
             let previousPressureLevel = context.previousPressureLevel
                 ?? MemoryPressureEvaluator.observedLevel(for: previousSystem)
             if previousPressureLevel != .normal,
                currentPressureLevel == .normal,
                system.availableFraction > previousSystem.availableFraction,
+               system.swapUsedBytes > 0,
+               system.swapUsedBytes < previousSystem.swapUsedBytes,
                system.swapUsedBytes >= residualSwapThresholdBytes {
                 recommendations.append(
                     MemoryRecommendation(
@@ -1950,19 +2921,31 @@ public struct RecommendationEngine: Sendable {
             }
         }
 
+        let hasEstimatedFootprint = context.current.groups.contains {
+            $0.containsEstimatedFootprint
+        }
         if recommendations.isEmpty,
            context.current.didSampleProcesses,
-           context.current.processStatus.quality == .estimated {
+           (context.current.processStatus.quality == .estimated || hasEstimatedFootprint) {
+            let detail = hasEstimatedFootprint
+                ? "本轮部分 footprint 使用 RSS 估算，建议把当前排行作为方向参考，不据此执行清理。"
+                : "本轮有进程退出或受权限限制，建议把当前排行作为方向参考，不据此执行清理。"
+            var evidence = [
+                RecommendationEvidence(label: "成功读取", value: String(context.current.sampledProcessCount)),
+                RecommendationEvidence(label: "已枚举", value: String(context.current.listedProcessCount))
+            ]
+            if hasEstimatedFootprint {
+                evidence.append(
+                    RecommendationEvidence(label: "footprint 口径", value: "RSS 估算")
+                )
+            }
             recommendations.append(
                 MemoryRecommendation(
                     id: "data-quality-processes",
                     severity: .info,
                     title: "进程数据部分可用",
-                    detail: "本轮有进程退出或受权限限制，建议把当前排行作为方向参考，不据此执行清理。",
-                    evidence: [
-                        RecommendationEvidence(label: "成功读取", value: String(context.current.sampledProcessCount)),
-                        RecommendationEvidence(label: "已枚举", value: String(context.current.listedProcessCount))
-                    ],
+                    detail: detail,
+                    evidence: evidence,
                     confidence: 0.60,
                     generatedAt: context.current.timestamp
                 )
@@ -1980,15 +2963,87 @@ public struct RecommendationEngine: Sendable {
         }
     }
 
-    private func largestActionableGroup(in groups: [WorkloadGroupSnapshot]) -> WorkloadGroupSnapshot? {
+    private func largestActionableGroup(
+        in groups: [WorkloadGroupSnapshot],
+        excluding excludedProcessIDs: Set<Int32>
+    ) -> WorkloadGroupSnapshot? {
         groups
-            .filter { !$0.isSystem && !$0.id.hasPrefix("other-") }
+            .filter {
+                !$0.isSystem
+                    && !$0.id.hasPrefix("other-")
+                    && !$0.containsEstimatedFootprint
+                    && !containsExcludedProcess(
+                        $0,
+                        excludedProcessIDs: excludedProcessIDs
+                    )
+            }
             .max {
                 if $0.attributedFootprintBytes != $1.attributedFootprintBytes {
                     return $0.attributedFootprintBytes < $1.attributedFootprintBytes
                 }
                 return $0.id > $1.id
             }
+    }
+
+    private func processInventoryIsComplete(_ snapshot: MonitorSnapshot) -> Bool {
+        processInventoryHasCompleteRows(snapshot)
+            && snapshot.processStatus.quality == .available
+    }
+
+    private func processInventoryHasCompleteRows(_ snapshot: MonitorSnapshot) -> Bool {
+        snapshot.processDataIsUsable
+            && snapshot.sampledProcessCount > 0
+            && snapshot.sampledProcessCount == snapshot.listedProcessCount
+    }
+
+    private func containsExcludedProcess(
+        _ group: WorkloadGroupSnapshot,
+        excludedProcessIDs: Set<Int32>
+    ) -> Bool {
+        !excludedProcessIDs.isEmpty
+            && group.memberProcessIdentities.contains {
+                excludedProcessIDs.contains($0.pid)
+            }
+    }
+
+    /// Returns the same deterministic representative used by
+    /// `WorkloadTrendAnalyzer` when malformed callers provide duplicate IDs.
+    private func canonicalGroup(
+        _ id: String,
+        in groups: [WorkloadGroupSnapshot]
+    ) -> WorkloadGroupSnapshot? {
+        groups
+            .filter { $0.id == id }
+            .max { lhs, rhs in
+                if lhs.containsEstimatedFootprint != rhs.containsEstimatedFootprint {
+                    return lhs.containsEstimatedFootprint && !rhs.containsEstimatedFootprint
+                }
+                if lhs.physicalFootprintBytes != rhs.physicalFootprintBytes {
+                    return lhs.physicalFootprintBytes < rhs.physicalFootprintBytes
+                }
+                if lhs.residentBytes != rhs.residentBytes {
+                    return lhs.residentBytes < rhs.residentBytes
+                }
+                if lhs.processCount != rhs.processCount {
+                    return lhs.processCount < rhs.processCount
+                }
+                if lhs.title != rhs.title {
+                    return lhs.title > rhs.title
+                }
+                return lhs.representativeProcess > rhs.representativeProcess
+            }
+    }
+
+    private func growthDetail(
+        swapIsGrowing: Bool,
+        usesEstimatedFootprint: Bool
+    ) -> String {
+        let base = swapIsGrowing
+            ? "该工作组较上一轮增加，并伴随 Swap 上升；建议检查任务是否仍有必要运行。"
+            : "该工作组较上一轮增加；建议继续观察下一轮趋势。"
+        return usesEstimatedFootprint
+            ? base + "当前 footprint 为 RSS 估算，先确认后再判断实际内存影响。"
+            : base
     }
 
     private func confidence(
@@ -2016,8 +3071,29 @@ public struct RecommendationEngine: Sendable {
         return "\(MemoryFormatter.bytes(UInt64(perMinute)))/分钟"
     }
 
-    private func isSystemGroup(id: String) -> Bool {
-        id == "system" || id == "other-system"
+    private func systemIsPaired(
+        _ system: SystemMemorySnapshot,
+        with processSampleAt: Date
+    ) -> Bool {
+        let interval = system.timestamp.timeIntervalSince(processSampleAt)
+        return interval.isFinite
+            && abs(interval) <= MonitorSnapshot.processSampleTimestampTolerance
+    }
+
+    private func validatedSystem(
+        _ candidate: SystemMemorySnapshot?,
+        notAfter reference: Date? = nil
+    ) -> SystemMemorySnapshot? {
+        guard let candidate,
+              candidate.isStructurallyValid,
+              candidate.timestamp.timeIntervalSince1970.isFinite else {
+            return nil
+        }
+        if let reference {
+            let interval = reference.timeIntervalSince(candidate.timestamp)
+            guard interval.isFinite, interval >= 0 else { return nil }
+        }
+        return candidate
     }
 }
 
@@ -2078,6 +3154,30 @@ public struct SamplingDiagnostics: Codable, Sendable, Equatable {
         let normalizedListedProcessCount = max(listedProcessCount, 0)
         self.processCount = normalizedProcessCount
         self.listedProcessCount = max(normalizedListedProcessCount, normalizedProcessCount)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case mode
+        case totalDurationMilliseconds
+        case processDurationMilliseconds
+        case processSamplingPerformed
+        case processCount
+        case listedProcessCount
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            mode: try container.decode(SamplingMode.self, forKey: .mode),
+            totalDurationMilliseconds: try container.decode(Double.self, forKey: .totalDurationMilliseconds),
+            processDurationMilliseconds: try container.decodeIfPresent(
+                Double.self,
+                forKey: .processDurationMilliseconds
+            ),
+            processSamplingPerformed: try container.decode(Bool.self, forKey: .processSamplingPerformed),
+            processCount: try container.decode(Int.self, forKey: .processCount),
+            listedProcessCount: try container.decode(Int.self, forKey: .listedProcessCount)
+        )
     }
 
     private static func normalizedDuration(_ value: Double) -> Double {
@@ -2222,7 +3322,14 @@ public struct MemoryPressureEvaluator: Sendable, Equatable {
     }
 
     public mutating func update(snapshot: SystemMemorySnapshot) -> MemoryPressureLevel {
-        update(observed: Self.observedLevel(for: snapshot), at: snapshot.timestamp)
+        // Keep debounce state unchanged when a caller bypasses the normal
+        // MonitorSnapshot validation path. Returning the conservative level
+        // preserves the non-optional API while preventing a malformed sample
+        // from becoming a durable/stable state.
+        guard snapshot.isStructurallyValid else {
+            return stableLevel ?? .critical
+        }
+        return update(observed: Self.observedLevel(for: snapshot), at: snapshot.timestamp)
     }
 
     @discardableResult
@@ -2230,6 +3337,13 @@ public struct MemoryPressureEvaluator: Sendable, Equatable {
         observed: MemoryPressureLevel,
         at timestamp: Date
     ) -> MemoryPressureLevel {
+        // A non-finite wall-clock value cannot establish freshness. Return the
+        // existing stable level (or the observation for an uninitialized
+        // evaluator) without mutating debounce state.
+        guard timestamp.timeIntervalSince1970.isFinite else {
+            return stableLevel ?? observed
+        }
+
         guard let stableLevel else {
             self.stableLevel = observed
             pendingLevel = nil
@@ -2270,8 +3384,15 @@ public struct MemoryPressureEvaluator: Sendable, Equatable {
     }
 
     public static func observedLevel(for snapshot: SystemMemorySnapshot) -> MemoryPressureLevel {
+        // This API predates optional validation metadata and remains
+        // non-optional for source compatibility. Invalid data is treated as a
+        // conservative critical observation; `update(snapshot:)` above will
+        // ignore it rather than committing that observation.
+        guard snapshot.isStructurallyValid else { return .critical }
         if snapshot.availableFraction < 0.10
-            || (snapshot.swapTotalBytes > 0 && snapshot.swapFreeBytes < 1 * 1024 * 1024 * 1024)
+            || (snapshot.swapTotalBytes > 0
+                && snapshot.swapUsedBytes > 0
+                && snapshot.swapFreeBytes < 1 * 1024 * 1024 * 1024)
             || snapshot.throttledPages > 0 {
             return .critical
         }
@@ -2344,6 +3465,10 @@ public struct PersistedWorkloadRecord: Codable, Sendable, Equatable, Identifiabl
     public let processCount: Int
     public let attributedFootprintBytes: UInt64
     public let attributedResidentBytes: UInt64
+    /// Whether the attributed footprint contains one or more RSS fallbacks.
+    /// This marker is persisted so history consumers never compare values
+    /// from different footprint sources as if they were equivalent.
+    public let containsEstimatedFootprint: Bool
     public let isSystem: Bool
 
     public init(
@@ -2352,13 +3477,15 @@ public struct PersistedWorkloadRecord: Codable, Sendable, Equatable, Identifiabl
         processCount: Int,
         attributedFootprintBytes: UInt64,
         attributedResidentBytes: UInt64,
-        isSystem: Bool
+        isSystem: Bool,
+        containsEstimatedFootprint: Bool = false
     ) {
         self.id = id
         self.title = title
         self.processCount = processCount
         self.attributedFootprintBytes = attributedFootprintBytes
         self.attributedResidentBytes = attributedResidentBytes
+        self.containsEstimatedFootprint = containsEstimatedFootprint
         self.isSystem = isSystem
     }
 
@@ -2369,18 +3496,86 @@ public struct PersistedWorkloadRecord: Codable, Sendable, Equatable, Identifiabl
             processCount: group.processCount,
             attributedFootprintBytes: group.attributedFootprintBytes,
             attributedResidentBytes: group.attributedResidentBytes,
-            isSystem: group.isSystem
+            isSystem: group.isSystem,
+            containsEstimatedFootprint: group.containsEstimatedFootprint
         )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case processCount
+        case attributedFootprintBytes
+        case attributedResidentBytes
+        case containsEstimatedFootprint
+        case isSystem
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let id = try container.decode(String.self, forKey: .id)
+        let title = try container.decode(String.self, forKey: .title)
+        let processCount = try container.decode(Int.self, forKey: .processCount)
+        guard Self.hasValidText(id),
+              Self.hasValidText(title),
+              processCount >= 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .processCount,
+                in: container,
+                debugDescription: "Persisted workload contains invalid fields"
+            )
+        }
+        self.init(
+            id: id,
+            title: title,
+            processCount: processCount,
+            attributedFootprintBytes: try container.decode(UInt64.self, forKey: .attributedFootprintBytes),
+            attributedResidentBytes: try container.decode(UInt64.self, forKey: .attributedResidentBytes),
+            isSystem: try container.decode(Bool.self, forKey: .isSystem),
+            // v1 history files predate this quality marker. Their footprint
+            // values were physical-footprint samples, so retain the exact
+            // interpretation when the field is absent.
+            containsEstimatedFootprint: try container.decodeIfPresent(
+                Bool.self,
+                forKey: .containsEstimatedFootprint
+            ) ?? false
+        )
+    }
+
+    fileprivate var hasValidPersistedFields: Bool {
+        Self.hasValidText(id) && Self.hasValidText(title) && processCount >= 0
+    }
+
+    private static func hasValidText(_ value: String) -> Bool {
+        !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && value.count <= 256
+            && !value.unicodeScalars.contains { scalar in
+                let code = scalar.value
+                return code < 0x20 || (0x7F...0x9F).contains(code)
+            }
     }
 }
 
 /// One minute-level system and workload sample retained by `HistoryStore`.
 public struct MemoryHistoryRecord: Codable, Sendable, Identifiable, Equatable {
     public let timestamp: Date
+    /// The wall-clock instant at which the source system sample was captured.
+    /// `timestamp` is normalized to a minute bucket by `HistoryStore`, so this
+    /// optional marker is needed to choose the newest system values when two
+    /// callers update the same bucket. It is optional for v1 history files.
+    public let sourceSampledAt: Date?
     public let availableFraction: Double
     public let compressedBytes: UInt64
     public let swapUsedBytes: UInt64
     public let workloads: [PersistedWorkloadRecord]
+    /// The timestamp of the process snapshot used to derive `workloads`.
+    /// `nil` means this system sample had no fresh workload attribution.
+    /// This is optional for backwards compatibility with v1.0 history files.
+    public let workloadsSampledAt: Date?
+    // Public initializers intentionally remain non-throwing for source
+    // compatibility, but remember invalid non-nil markers so a later store
+    // append/merge can fail closed instead of silently turning them into nil.
+    private let hasInvalidFreshnessMarker: Bool
 
     public var id: Date { timestamp }
 
@@ -2393,12 +3588,17 @@ public struct MemoryHistoryRecord: Codable, Sendable, Identifiable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case timestamp
+        case sourceSampledAt
         case availableFraction
         case compressedBytes
         case swapUsedBytes
         case workloads
+        case workloadsSampledAt
     }
 
+    /// Backwards-compatible initializer for callers that provide workloads
+    /// without an explicit source timestamp. Historically those workloads
+    /// represented the same sample as `timestamp`, so retain that inference.
     public init(
         timestamp: Date,
         availableFraction: Double,
@@ -2406,20 +3606,74 @@ public struct MemoryHistoryRecord: Codable, Sendable, Identifiable, Equatable {
         swapUsedBytes: UInt64,
         workloads: [PersistedWorkloadRecord] = []
     ) {
+        self.init(
+            timestamp: timestamp,
+            availableFraction: availableFraction,
+            compressedBytes: compressedBytes,
+            swapUsedBytes: swapUsedBytes,
+            workloads: workloads,
+            workloadsSampledAt: workloads.isEmpty ? nil : timestamp,
+            sourceSampledAt: timestamp
+        )
+    }
+
+    /// Initializer with an explicit workload-source timestamp. Passing `nil`
+    /// is meaningful: it records that the workload list has no trustworthy
+    /// freshness marker and must not be used for transition events.
+    public init(
+        timestamp: Date,
+        availableFraction: Double,
+        compressedBytes: UInt64,
+        swapUsedBytes: UInt64,
+        workloads: [PersistedWorkloadRecord] = [],
+        workloadsSampledAt: Date?,
+        sourceSampledAt: Date? = nil
+    ) {
         self.timestamp = timestamp
+        self.hasInvalidFreshnessMarker =
+            (sourceSampledAt != nil && !isPersistableDate(sourceSampledAt!))
+            || (workloadsSampledAt != nil && !isPersistableDate(workloadsSampledAt!))
+        if let sourceSampledAt,
+           isPersistableDate(sourceSampledAt) {
+            self.sourceSampledAt = sourceSampledAt
+        } else {
+            self.sourceSampledAt = nil
+        }
         self.availableFraction = min(max(availableFraction, 0), 1)
         self.compressedBytes = compressedBytes
         self.swapUsedBytes = swapUsedBytes
         self.workloads = workloads
+        if let workloadsSampledAt,
+           isPersistableDate(workloadsSampledAt) {
+            self.workloadsSampledAt = workloadsSampledAt
+        } else {
+            self.workloadsSampledAt = nil
+        }
     }
 
+    /// Backwards-compatible snapshot initializer. A non-empty group list is
+    /// assumed to have been captured with the snapshot timestamp.
     public init(snapshot: SystemMemorySnapshot, groups: [WorkloadGroupSnapshot] = []) {
+        self.init(
+            snapshot: snapshot,
+            groups: groups,
+            workloadsSampledAt: groups.isEmpty ? nil : snapshot.timestamp
+        )
+    }
+
+    public init(
+        snapshot: SystemMemorySnapshot,
+        groups: [WorkloadGroupSnapshot] = [],
+        workloadsSampledAt: Date?
+    ) {
         self.init(
             timestamp: snapshot.timestamp,
             availableFraction: snapshot.availableFraction,
             compressedBytes: snapshot.compressedBytes,
             swapUsedBytes: snapshot.swapUsedBytes,
-            workloads: groups.map(PersistedWorkloadRecord.init(group:))
+            workloads: groups.map(PersistedWorkloadRecord.init(group:)),
+            workloadsSampledAt: workloadsSampledAt,
+            sourceSampledAt: snapshot.timestamp
         )
     }
 
@@ -2428,19 +3682,49 @@ public struct MemoryHistoryRecord: Codable, Sendable, Identifiable, Equatable {
             timestamp: entry.timestamp,
             availableFraction: entry.availableFraction,
             compressedBytes: entry.compressedBytes,
-            swapUsedBytes: entry.swapUsedBytes
+            swapUsedBytes: entry.swapUsedBytes,
+            workloadsSampledAt: nil,
+            sourceSampledAt: entry.timestamp
         )
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        let timestamp = try container.decode(Date.self, forKey: .timestamp)
+        let sourceSampledAt = try container.decodeIfPresent(Date.self, forKey: .sourceSampledAt)
+        let availableFraction = try container.decode(Double.self, forKey: .availableFraction)
+        let workloads = try container.decodeIfPresent([PersistedWorkloadRecord].self, forKey: .workloads) ?? []
+        let workloadsSampledAt = try container.decodeIfPresent(Date.self, forKey: .workloadsSampledAt)
+        guard isPersistableDate(timestamp),
+              sourceSampledAt.map(isPersistableDate) ?? true,
+              availableFraction.isFinite,
+              (0...1).contains(availableFraction),
+              workloadsSampledAt.map(isPersistableDate) ?? true else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .timestamp,
+                in: container,
+                debugDescription: "History record contains invalid persisted fields"
+            )
+        }
         self.init(
-            timestamp: try container.decode(Date.self, forKey: .timestamp),
-            availableFraction: try container.decode(Double.self, forKey: .availableFraction),
+            timestamp: timestamp,
+            availableFraction: availableFraction,
             compressedBytes: try container.decode(UInt64.self, forKey: .compressedBytes),
             swapUsedBytes: try container.decode(UInt64.self, forKey: .swapUsedBytes),
-            workloads: try container.decodeIfPresent([PersistedWorkloadRecord].self, forKey: .workloads) ?? []
+            workloads: workloads,
+            workloadsSampledAt: workloadsSampledAt,
+            sourceSampledAt: sourceSampledAt
         )
+    }
+
+    fileprivate var hasValidPersistedFields: Bool {
+        isPersistableDate(timestamp)
+            && (sourceSampledAt.map(isPersistableDate) ?? true)
+            && availableFraction.isFinite
+            && (0...1).contains(availableFraction)
+            && (workloadsSampledAt.map(isPersistableDate) ?? true)
+            && workloads.allSatisfy(\.hasValidPersistedFields)
+            && !hasInvalidFreshnessMarker
     }
 }
 
@@ -2643,9 +3927,24 @@ public struct MemoryHistoryAnalyzer: Sendable {
         var byTimestamp = [Date: MemoryHistoryRecord]()
         for record in records {
             guard record.timestamp.timeIntervalSince1970.isFinite else { continue }
-            byTimestamp[record.timestamp] = record
+            if let existing = byTimestamp[record.timestamp] {
+                byTimestamp[record.timestamp] = merged(existing: existing, candidate: record)
+            } else {
+                byTimestamp[record.timestamp] = record
+            }
         }
         return byTimestamp.values.sorted { $0.timestamp < $1.timestamp }
+    }
+
+    /// Multiple callers can hand the analyzer records from overlapping
+    /// recovery windows. Merge equal timestamps with the same freshness rule
+    /// used by `HistoryStore` instead of letting dictionary insertion order
+    /// silently discard the workload attribution from one record.
+    private func merged(
+        existing: MemoryHistoryRecord,
+        candidate: MemoryHistoryRecord
+    ) -> MemoryHistoryRecord {
+        HistoryStore.preferredRecord(existing: existing, candidate: candidate)
     }
 
     private func pressure(for record: MemoryHistoryRecord) -> MemoryPressureLevel {
@@ -2718,6 +4017,13 @@ public struct MemoryHistoryAnalyzer: Sendable {
         previous: MemoryHistoryRecord,
         current: MemoryHistoryRecord
     ) -> [MemoryHistoryEvent] {
+        // A system-only record has no fresh workload evidence. Do not turn a
+        // missing attribution into a false appeared/disappeared/growth event.
+        guard let previousSampleAt = previous.workloadsSampledAt,
+              let currentSampleAt = current.workloadsSampledAt,
+              currentSampleAt >= previousSampleAt else {
+            return []
+        }
         let previousByID = workloadDictionary(previous.workloads)
         let currentByID = workloadDictionary(current.workloads)
         var result = [MemoryHistoryEvent]()
@@ -2759,6 +4065,7 @@ public struct MemoryHistoryAnalyzer: Sendable {
         if let growth = currentByID.values
             .compactMap({ workload -> (PersistedWorkloadRecord, UInt64)? in
                 guard let prior = previousByID[workload.id], isActionable(workload),
+                      workload.containsEstimatedFootprint == prior.containsEstimatedFootprint,
                       workload.attributedFootprintBytes > prior.attributedFootprintBytes else {
                     return nil
                 }
@@ -2790,9 +4097,45 @@ public struct MemoryHistoryAnalyzer: Sendable {
     ) -> [String: PersistedWorkloadRecord] {
         workloads.reduce(into: [String: PersistedWorkloadRecord]()) { result, workload in
             // A malformed or hand-edited history file may contain duplicate
-            // IDs. Keep the last value instead of crashing the analyzer.
-            result[workload.id] = workload
+            // IDs. Choose the strongest deterministic value instead of
+            // allowing array order to change the emitted event.
+            if let existing = result[workload.id] {
+                result[workload.id] = preferredWorkload(workload, over: existing)
+            } else {
+                result[workload.id] = workload
+            }
         }
+    }
+
+    private func preferredWorkload(
+        _ candidate: PersistedWorkloadRecord,
+        over existing: PersistedWorkloadRecord
+    ) -> PersistedWorkloadRecord {
+        // Exact physical-footprint data is stronger evidence than RSS
+        // fallback, even when the fallback happens to report a larger value.
+        if candidate.containsEstimatedFootprint != existing.containsEstimatedFootprint {
+            return candidate.containsEstimatedFootprint ? existing : candidate
+        }
+        if candidate.attributedFootprintBytes != existing.attributedFootprintBytes {
+            return candidate.attributedFootprintBytes > existing.attributedFootprintBytes
+                ? candidate
+                : existing
+        }
+        if candidate.attributedResidentBytes != existing.attributedResidentBytes {
+            return candidate.attributedResidentBytes > existing.attributedResidentBytes
+                ? candidate
+                : existing
+        }
+        if candidate.processCount != existing.processCount {
+            return candidate.processCount > existing.processCount ? candidate : existing
+        }
+        if candidate.isSystem != existing.isSystem {
+            return candidate.isSystem ? existing : candidate
+        }
+        if candidate.title != existing.title {
+            return candidate.title < existing.title ? candidate : existing
+        }
+        return existing
     }
 
     private func isActionable(_ workload: PersistedWorkloadRecord) -> Bool {
@@ -2810,7 +4153,15 @@ public struct MemoryHistoryAnalyzer: Sendable {
 
     private func eventID(kind: MemoryHistoryEventKind, timestamp: Date, target: String) -> String {
         let seconds = timestamp.timeIntervalSince1970
-        return "\(kind.rawValue)-\(String(format: "%.0f", seconds))-\(target)"
+        // Event IDs are persisted/deduplicated keys, so they must not inherit
+        // the user's grouping separators or numeral system. Display strings
+        // elsewhere remain locale-aware; this key is intentionally POSIX.
+        let timestampKey = String(
+            format: "%.0f",
+            locale: Locale(identifier: "en_US_POSIX"),
+            seconds
+        )
+        return "\(kind.rawValue)-\(timestampKey)-\(target)"
     }
 }
 
@@ -2882,6 +4233,359 @@ public enum HistoryStoreError: Error, CustomStringConvertible, LocalizedError, S
     public var errorDescription: String? { description }
 }
 
+/// Classifies a JSON byte prefix without relying on Foundation's localized
+/// parser messages. Only an EOF reached while parsing an otherwise valid
+/// prefix is recoverable as a crash-truncated final journal line.
+private enum JSONPrefixState: Equatable {
+    case complete
+    case incomplete
+    case invalid
+}
+
+private struct JSONPrefixScanner {
+    private let bytes: [UInt8]
+    private var index = 0
+
+    init(_ data: Data) {
+        bytes = Array(data)
+    }
+
+    mutating func scan() -> JSONPrefixState {
+        switch validateUTF8(bytes) {
+        case .invalid:
+            return .invalid
+        case .valid:
+            break
+        case let .truncated(prefixLength):
+            // JSONEncoder emits non-ASCII UTF-8 inside strings. A crash can
+            // cut a scalar after the final byte written, but bytes outside a
+            // string are never a recoverable JSON tail.
+            let prefix = Array(bytes[..<prefixLength])
+            guard isInsideJSONString(prefix) else { return .invalid }
+            var prefixScanner = JSONPrefixScanner(Data(prefix))
+            return prefixScanner.scan() == .incomplete ? .incomplete : .invalid
+        }
+        skipWhitespace()
+        let state = scanValue()
+        guard state == .complete else { return state }
+        skipWhitespace()
+        return index == bytes.count ? .complete : .invalid
+    }
+
+    private mutating func scanValue() -> JSONPrefixState {
+        guard let byte = current else { return .incomplete }
+        switch byte {
+        case 0x7B: // {
+            return scanObject()
+        case 0x5B: // [
+            return scanArray()
+        case 0x22: // "
+            return scanString()
+        case 0x74: // true
+            return scanLiteral([0x74, 0x72, 0x75, 0x65])
+        case 0x66: // false
+            return scanLiteral([0x66, 0x61, 0x6C, 0x73, 0x65])
+        case 0x6E: // null
+            return scanLiteral([0x6E, 0x75, 0x6C, 0x6C])
+        case 0x2D, 0x30...0x39:
+            return scanNumber()
+        default:
+            return .invalid
+        }
+    }
+
+    private mutating func scanObject() -> JSONPrefixState {
+        index += 1
+        skipWhitespace()
+        guard let byte = current else { return .incomplete }
+        if byte == 0x7D {
+            index += 1
+            return .complete
+        }
+
+        while true {
+            guard current != nil else { return .incomplete }
+            guard current == 0x22 else { return .invalid }
+            let keyState = scanString()
+            guard keyState == .complete else { return keyState }
+            skipWhitespace()
+            guard let separator = current else { return .incomplete }
+            guard separator == 0x3A else { return .invalid }
+            index += 1
+            skipWhitespace()
+            let valueState = scanValue()
+            guard valueState == .complete else { return valueState }
+            skipWhitespace()
+            guard let terminator = current else { return .incomplete }
+            if terminator == 0x7D {
+                index += 1
+                return .complete
+            }
+            guard terminator == 0x2C else { return .invalid }
+            index += 1
+            skipWhitespace()
+            guard current != nil else { return .incomplete }
+        }
+    }
+
+    private mutating func scanArray() -> JSONPrefixState {
+        index += 1
+        skipWhitespace()
+        guard let byte = current else { return .incomplete }
+        if byte == 0x5D {
+            index += 1
+            return .complete
+        }
+
+        while true {
+            let valueState = scanValue()
+            guard valueState == .complete else { return valueState }
+            skipWhitespace()
+            guard let terminator = current else { return .incomplete }
+            if terminator == 0x5D {
+                index += 1
+                return .complete
+            }
+            guard terminator == 0x2C else { return .invalid }
+            index += 1
+            skipWhitespace()
+            guard current != nil else { return .incomplete }
+        }
+    }
+
+    private mutating func scanString() -> JSONPrefixState {
+        guard current == 0x22 else { return .invalid }
+        index += 1
+        while let byte = current {
+            index += 1
+            switch byte {
+            case 0x22:
+                return .complete
+            case 0x00...0x1F:
+                return .invalid
+            case 0x5C:
+                guard let escaped = current else { return .incomplete }
+                index += 1
+                switch escaped {
+                case 0x22, 0x2F, 0x5C, 0x62, 0x66, 0x6E, 0x72, 0x74:
+                    continue
+                case 0x75:
+                    for _ in 0..<4 {
+                        guard let hex = current else { return .incomplete }
+                        guard isHexDigit(hex) else { return .invalid }
+                        index += 1
+                    }
+                default:
+                    return .invalid
+                }
+            default:
+                continue
+            }
+        }
+        return .incomplete
+    }
+
+    private mutating func scanLiteral(_ literal: [UInt8]) -> JSONPrefixState {
+        for expected in literal {
+            guard let byte = current else { return .incomplete }
+            guard byte == expected else { return .invalid }
+            index += 1
+        }
+        return .complete
+    }
+
+    private mutating func scanNumber() -> JSONPrefixState {
+        if current == 0x2D {
+            index += 1
+            guard current != nil else { return .incomplete }
+        }
+
+        guard let first = current else { return .incomplete }
+        if first == 0x30 {
+            index += 1
+            if let byte = current, (0x30...0x39).contains(byte) {
+                return .invalid
+            }
+        } else if (0x31...0x39).contains(first) {
+            index += 1
+            consumeDigits()
+        } else {
+            return .invalid
+        }
+
+        if current == 0x2E {
+            index += 1
+            guard let digit = current else { return .incomplete }
+            guard (0x30...0x39).contains(digit) else { return .invalid }
+            consumeDigits()
+        }
+
+        if current == 0x65 || current == 0x45 {
+            index += 1
+            guard current != nil else { return .incomplete }
+            if current == 0x2B || current == 0x2D {
+                index += 1
+                guard current != nil else { return .incomplete }
+            }
+            guard let digit = current, (0x30...0x39).contains(digit) else {
+                return .invalid
+            }
+            consumeDigits()
+        }
+        return .complete
+    }
+
+    private mutating func consumeDigits() {
+        while let byte = current, (0x30...0x39).contains(byte) {
+            index += 1
+        }
+    }
+
+    private mutating func skipWhitespace() {
+        while let byte = current,
+              byte == 0x20 || byte == 0x09 || byte == 0x0D || byte == 0x0A {
+            index += 1
+        }
+    }
+
+    private var current: UInt8? {
+        index < bytes.count ? bytes[index] : nil
+    }
+
+    private func isHexDigit(_ byte: UInt8) -> Bool {
+        (0x30...0x39).contains(byte)
+            || (0x41...0x46).contains(byte)
+            || (0x61...0x66).contains(byte)
+    }
+}
+
+private enum UTF8ValidationResult {
+    case valid
+    case truncated(prefixLength: Int)
+    case invalid
+}
+
+/// Validates UTF-8 without replacing malformed scalars. The positional
+/// restrictions on E0/ED/F0/F4 reject overlong encodings, UTF-16 surrogates,
+/// and code points above U+10FFFF.
+private func validateUTF8(_ bytes: [UInt8]) -> UTF8ValidationResult {
+    var index = 0
+    while index < bytes.count {
+        let lead = bytes[index]
+        if lead <= 0x7F {
+            index += 1
+            continue
+        }
+
+        let expectedLength: Int
+        switch lead {
+        case 0xC2...0xDF:
+            expectedLength = 2
+        case 0xE0...0xEF:
+            expectedLength = 3
+        case 0xF0...0xF4:
+            expectedLength = 4
+        default:
+            return .invalid
+        }
+
+        let availableLength = bytes.count - index
+        let bytesToValidate = min(availableLength, expectedLength) - 1
+        if bytesToValidate > 0 {
+            for offset in 1...bytesToValidate {
+                guard isValidUTF8Continuation(
+                    bytes[index + offset],
+                    lead: lead,
+                    position: offset
+                ) else {
+                    return .invalid
+                }
+            }
+        }
+        guard availableLength >= expectedLength else {
+            return .truncated(prefixLength: index)
+        }
+        index += expectedLength
+    }
+    return .valid
+}
+
+private func isValidUTF8Continuation(
+    _ byte: UInt8,
+    lead: UInt8,
+    position: Int
+) -> Bool {
+    switch (lead, position) {
+    case (0xE0, 1):
+        return (0xA0...0xBF).contains(byte)
+    case (0xF0, 1):
+        // U+10000 starts at F0 90 80 80; 0x8F and below are overlong.
+        return (0x90...0xBF).contains(byte)
+    case (0xED, 1):
+        return (0x80...0x9F).contains(byte)
+    case (0xF4, 1):
+        return (0x80...0x8F).contains(byte)
+    default:
+        return (0x80...0xBF).contains(byte)
+    }
+}
+
+/// Reports whether a truncated scalar starts while the JSON lexer is inside
+/// a string. This is intentionally lexical: the full JSON grammar is checked
+/// by `JSONPrefixScanner` immediately afterwards.
+private func isInsideJSONString(_ bytes: [UInt8]) -> Bool {
+    var inString = false
+    var escaped = false
+    var unicodeEscapeDigits = 0
+
+    for byte in bytes {
+        if inString {
+            if unicodeEscapeDigits > 0 {
+                guard isHexDigit(byte) else { return false }
+                unicodeEscapeDigits -= 1
+                continue
+            }
+            if escaped {
+                escaped = false
+                if byte == 0x75 { // u
+                    unicodeEscapeDigits = 4
+                } else if ![0x22, 0x2F, 0x5C, 0x62, 0x66, 0x6E, 0x72, 0x74].contains(byte) {
+                    return false
+                }
+                continue
+            }
+            switch byte {
+            case 0x22:
+                inString = false
+            case 0x5C:
+                escaped = true
+            case 0x00...0x1F:
+                return false
+            default:
+                continue
+            }
+        } else if byte == 0x22 {
+            inString = true
+        } else if byte >= 0x80 {
+            // A non-ASCII scalar outside a JSON string is invalid JSON.
+            return false
+        }
+    }
+
+    return inString && !escaped && unicodeEscapeDigits == 0
+}
+
+private func isHexDigit(_ byte: UInt8) -> Bool {
+    (0x30...0x39).contains(byte)
+        || (0x41...0x46).contains(byte)
+        || (0x61...0x66).contains(byte)
+}
+
+private func isIncompleteJSONLine(_ data: Data) -> Bool {
+    var scanner = JSONPrefixScanner(data)
+    return scanner.scan() == .incomplete
+}
+
 /// A small, minute-coalesced JSON history store.
 ///
 /// Appending samples updates memory on every pass, but disk writes happen at
@@ -2891,6 +4595,12 @@ public enum HistoryStoreError: Error, CustomStringConvertible, LocalizedError, S
 /// represented by user/system attribution aggregates.
 public actor HistoryStore {
     public static let defaultRetentionInterval: TimeInterval = 24 * 60 * 60
+    /// Tolerate a small clock skew, but never let a far-future sample stay in
+    /// a retention window indefinitely.
+    public static let maximumFutureSkew: TimeInterval = 5 * 60
+    /// Prevent floating-point retention arithmetic from overflowing and
+    /// turning a bounded store into an effectively unbounded one.
+    public static let maximumRetentionInterval: TimeInterval = 10 * 365 * 24 * 60 * 60
     public static let defaultMaxPersistedWorkloads = 40
     public static let defaultCompactionRecordThreshold = 120
     public static let defaultCompactionByteThreshold = 1 * 1024 * 1024
@@ -2909,6 +4619,8 @@ public actor HistoryStore {
     /// A sidecar append-only file. It is intentionally derived from
     /// `fileURL`, so custom/test stores remain self-contained.
     public nonisolated let journalURL: URL
+    private let clockURL: URL
+    private let lockURL: URL
     public let retentionInterval: TimeInterval
     public let maxPersistedWorkloads: Int
     public let compactionRecordThreshold: Int
@@ -2919,11 +4631,20 @@ public actor HistoryStore {
     private var dirty = false
     private var lastPersistedMinute: Date?
     private var pendingRecords: [Date: MemoryHistoryRecord] = [:]
+    private var pendingWriteNeedsRetry = false
     private var journalRecordCount = 0
     private var journalByteCount = 0
     private var snapshotExists = false
     private var compactionCount = 0
     private var lastCompactionAt: Date?
+    /// Highest validated wall-clock instant observed by this store. The
+    /// sidecar anchor restores it after a restart so a clock rollback cannot
+    /// make otherwise-valid history look like far-future garbage.
+    private var lastObservedNow: Date?
+    /// Once an empty durable view has been established, a leftover sidecar no
+    /// longer protects any records. Ignore it until the next successful write
+    /// so resetting history cannot make the first new sample look expired.
+    private var ignorePersistedClockAnchorUntilWrite = false
 
     public init(
         fileURL: URL = HistoryStore.defaultFileURL,
@@ -2934,10 +4655,122 @@ public actor HistoryStore {
     ) {
         self.fileURL = fileURL
         self.journalURL = URL(fileURLWithPath: fileURL.path + ".journal")
-        self.retentionInterval = max(retentionInterval, 0)
+        self.clockURL = URL(fileURLWithPath: fileURL.path + ".clock")
+        self.lockURL = URL(fileURLWithPath: fileURL.path + ".lock")
+        // An unbounded or NaN retention value would silently disable pruning
+        // and allow the local file to grow forever. Fall back to the bounded
+        // product default for non-finite input.
+        self.retentionInterval = retentionInterval.isFinite
+            ? min(max(retentionInterval, 0), Self.maximumRetentionInterval)
+            : Self.defaultRetentionInterval
         self.maxPersistedWorkloads = max(maxPersistedWorkloads, 1)
         self.compactionRecordThreshold = max(compactionRecordThreshold, 1)
         self.compactionByteThreshold = max(compactionByteThreshold, 1)
+    }
+
+    private var clockRollbackLimit: TimeInterval {
+        min(
+            max(retentionInterval, 0) + Self.maximumFutureSkew,
+            Self.maximumRetentionInterval
+        )
+    }
+
+    /// Advances the in-memory anchor monotonically and returns the reference
+    /// used for retention. A disk anchor that is implausibly far ahead is
+    /// discarded instead of allowing an arbitrary future value to survive.
+    private func retentionReferenceNow(_ now: Date) -> Date {
+        if hasLoaded,
+           records.isEmpty,
+           pendingRecords.isEmpty,
+           !dirty {
+            lastObservedNow = now
+            ignorePersistedClockAnchorUntilWrite = true
+            return now
+        }
+
+        let diskAnchor = ignorePersistedClockAnchorUntilWrite
+            ? nil
+            : readClockAnchor(at: clockURL)
+        var candidate = lastObservedNow
+        if let diskAnchor, (candidate == nil || diskAnchor > candidate!) {
+            candidate = diskAnchor
+        }
+        let reference = boundedRetentionReference(
+            now: now,
+            anchor: candidate,
+            rollbackLimit: clockRollbackLimit
+        )
+        if reference == now, let candidate,
+           candidate.timeIntervalSince(now).isFinite,
+           candidate.timeIntervalSince(now) > clockRollbackLimit {
+            lastObservedNow = now
+        } else if let current = lastObservedNow {
+            if now > current { lastObservedNow = now }
+        } else {
+            lastObservedNow = now
+        }
+        if let candidate, candidate <= now || reference == candidate {
+            lastObservedNow = max(lastObservedNow ?? now, candidate)
+        }
+        return reference
+    }
+
+    private func persistClockAnchor(at date: Date) throws {
+        guard isPersistableDate(date) else { throw HistoryStoreError.invalidData }
+        let previousAnchorData = try? Data(contentsOf: clockURL)
+        let previousObservedNow = lastObservedNow
+        let previousIgnorePersistedAnchor = ignorePersistedClockAnchorUntilWrite
+        let observedAt: Date
+        var candidates = [date]
+        if let current = lastObservedNow {
+            candidates.append(current)
+        }
+        if !ignorePersistedClockAnchorUntilWrite,
+           let disk = readClockAnchor(at: clockURL),
+           disk > date,
+           disk.timeIntervalSince(date).isFinite,
+           disk.timeIntervalSince(date) <= clockRollbackLimit {
+            candidates.append(disk)
+        }
+        observedAt = candidates.max() ?? date
+        lastObservedNow = observedAt
+        let data: Data
+        do {
+            data = try clockAnchorData(for: observedAt)
+            try prepareDirectory()
+            try data.write(to: clockURL, options: [.atomic])
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: clockURL.path
+            )
+            ignorePersistedClockAnchorUntilWrite = false
+        } catch {
+            lastObservedNow = previousObservedNow
+            ignorePersistedClockAnchorUntilWrite = previousIgnorePersistedAnchor
+            if let previousAnchorData {
+                try? previousAnchorData.write(to: clockURL, options: [.atomic])
+                try? FileManager.default.setAttributes(
+                    [.posixPermissions: 0o600],
+                    ofItemAtPath: clockURL.path
+                )
+            } else {
+                try? FileManager.default.removeItem(at: clockURL)
+            }
+            throw HistoryStoreError.writeFailed
+        }
+    }
+
+    private func withStoreLock<T>(
+        failure: HistoryStoreError,
+        _ body: () throws -> T
+    ) throws -> T {
+        do {
+            return try withExclusivePersistedFileLock(at: lockURL, body)
+        } catch let error as HistoryStoreError {
+            throw error
+        } catch {
+            throw failure
+        }
     }
 
     public func diagnostics() -> HistoryStoreDiagnostics {
@@ -2953,9 +4786,38 @@ public actor HistoryStore {
 
     @discardableResult
     public func load(now: Date = Date()) throws -> [MemoryHistoryRecord] {
+        guard isPersistableDate(now) else {
+            throw HistoryStoreError.invalidData
+        }
+        return try withStoreLock(failure: .readFailed) {
+            if hasLoaded {
+                // A previously loaded actor may still have a valid in-memory
+                // view when the backing path becomes unreadable. Read APIs
+                // must surface that failure so health/UI callers do not
+                // mistake stale data for a successful refresh. Write paths
+                // intentionally keep the boolean fallback semantics below.
+                guard try synchronizeDurableViewLocked(now: now) else {
+                    throw HistoryStoreError.readFailed
+                }
+                return records
+            }
+            return try loadLocked(now: now)
+        }
+    }
+
+    @discardableResult
+    private func loadLocked(now: Date) throws -> [MemoryHistoryRecord] {
+        guard isPersistableDate(now) else {
+            throw HistoryStoreError.invalidData
+        }
+        let referenceNow = retentionReferenceNow(now)
         guard !hasLoaded else {
             let before = records
-            records = Self.pruned(coalesced(records), now: now, retentionInterval: retentionInterval)
+            records = Self.pruned(
+                coalesced(records),
+                now: referenceNow,
+                retentionInterval: retentionInterval
+            )
             if records != before {
                 dirty = true
                 try compactSnapshot(at: now)
@@ -2968,58 +4830,93 @@ public actor HistoryStore {
         let hasJournal = fileManager.fileExists(atPath: journalURL.path)
         var snapshotRecords: [MemoryHistoryRecord] = []
         var snapshotData = Data()
+        var snapshotError: HistoryStoreError?
 
         if hasSnapshot {
             do {
                 snapshotData = try Data(contentsOf: fileURL)
             } catch {
-                throw HistoryStoreError.readFailed
+                snapshotError = .readFailed
             }
 
-            do {
-                let file = try Self.decoder().decode(MemoryHistoryFile.self, from: snapshotData)
-                guard file.version == MemoryHistoryFile.currentVersion else {
-                    throw HistoryStoreError.unsupportedVersion(file.version)
+            if snapshotError == nil {
+                do {
+                    let file = try Self.decoder().decode(MemoryHistoryFile.self, from: snapshotData)
+                    guard file.version == MemoryHistoryFile.currentVersion else {
+                        throw HistoryStoreError.unsupportedVersion(file.version)
+                    }
+                    snapshotRecords = file.records
+                } catch let error as HistoryStoreError {
+                    snapshotError = error
+                } catch {
+                    snapshotError = .invalidData
                 }
-                snapshotRecords = file.records
-            } catch let error as HistoryStoreError {
-                throw error
-            } catch {
-                throw HistoryStoreError.invalidData
             }
         }
 
         var journalRecords: [MemoryHistoryRecord] = []
         var journalData = Data()
+        var journalError: HistoryStoreError?
         if hasJournal {
             do {
                 journalData = try Data(contentsOf: journalURL)
             } catch {
-                throw HistoryStoreError.readFailed
+                journalError = .readFailed
             }
-            let decodedJournal = try decodeJournal(journalData)
-            journalRecords = decodedJournal.records
-            if decodedJournal.validByteCount < journalData.count {
+            if journalError == nil {
                 do {
-                    journalData = Data(journalData.prefix(decodedJournal.validByteCount))
-                    try journalData.write(to: journalURL, options: [.atomic])
-                    try fileManager.setAttributes(
-                        [.posixPermissions: 0o600],
-                        ofItemAtPath: journalURL.path
-                    )
+                    let decodedJournal = try decodeJournal(journalData)
+                    journalRecords = decodedJournal.records
+                    if decodedJournal.validByteCount < journalData.count {
+                        journalData = Data(journalData.prefix(decodedJournal.validByteCount))
+                        do {
+                            try journalData.write(to: journalURL, options: [.atomic])
+                            try fileManager.setAttributes(
+                                [.posixPermissions: 0o600],
+                                ofItemAtPath: journalURL.path
+                            )
+                        } catch {
+                            throw HistoryStoreError.writeFailed
+                        }
+                    }
+                } catch let error as HistoryStoreError {
+                    journalError = error
                 } catch {
-                    throw HistoryStoreError.writeFailed
+                    journalError = .invalidData
                 }
             }
         }
 
+        // A malformed journal is never silently ignored: unlike a damaged
+        // snapshot it may contain the only copy of the newest records.
+        if let journalError {
+            throw journalError
+        }
+        // A damaged or unreadable snapshot can be rebuilt from a successfully
+        // decoded journal. Unsupported versions remain hard failures so a
+        // newer file is never overwritten by an older binary.
+        if let snapshotError {
+            // A damaged/unreadable snapshot can be reconstructed from a
+            // valid journal. Unsupported versions remain hard failures so a
+            // newer file is never overwritten by this binary.
+            guard (snapshotError == .invalidData || snapshotError == .readFailed),
+                  !journalRecords.isEmpty else {
+                throw snapshotError
+            }
+        }
+
         let coalescedRecords = coalesced(snapshotRecords + journalRecords)
-        records = Self.pruned(coalescedRecords, now: now, retentionInterval: retentionInterval)
+        records = Self.pruned(
+            coalescedRecords,
+            now: referenceNow,
+            retentionInterval: retentionInterval
+        )
         hasLoaded = true
         snapshotExists = hasSnapshot
         journalRecordCount = journalRecords.count
         journalByteCount = journalData.count
         pendingRecords.removeAll(keepingCapacity: false)
+        pendingWriteNeedsRetry = false
         dirty = false
         lastPersistedMinute = records.last?.timestamp
 
@@ -3027,62 +4924,308 @@ public actor HistoryStore {
         do {
             canonicalSnapshot = try Self.encoder().encode(MemoryHistoryFile(records: coalescedRecords))
         } catch {
+            // Keep the actor retryable if a malformed value somehow made it
+            // through decoding. The caller may repair the source and call
+            // `flush()`/`load()` again instead of being left in a clean state.
+            dirty = true
             throw HistoryStoreError.invalidData
         }
         let needsCompaction = (!hasSnapshot && !journalRecords.isEmpty)
+            || (snapshotError != nil && !journalRecords.isEmpty)
             || (records != coalescedRecords)
             || (hasSnapshot && !hasJournal && snapshotData != canonicalSnapshot)
         if needsCompaction {
-            try compactSnapshot(at: now)
+            do {
+                try compactSnapshot(at: now)
+            } catch {
+                // `hasLoaded` intentionally remains true so a later flush can
+                // retry the repair. Do not report a clean store after a
+                // successful parse followed by a failed write.
+                dirty = true
+                throw error
+            }
+        }
+        // Legacy files may predate the clock sidecar. Establish the anchor
+        // after their contents have been validated so a later wall-clock
+        // rollback cannot prune otherwise-valid history.
+        if (hasSnapshot || hasJournal), readClockAnchor(at: clockURL) == nil {
+            do {
+                try persistClockAnchor(at: now)
+            } catch {
+                dirty = true
+                throw error
+            }
         }
         return records
+    }
+
+    /// Discards only the in-memory durable view before re-reading the files.
+    /// The monotonic clock anchor and diagnostic counters intentionally stay
+    /// local to this actor; the record/journal counters are rebuilt by load.
+    private func resetDurableViewForReload() {
+        records.removeAll(keepingCapacity: false)
+        pendingRecords.removeAll(keepingCapacity: false)
+        pendingWriteNeedsRetry = false
+        journalRecordCount = 0
+        journalByteCount = 0
+        snapshotExists = false
+        lastPersistedMinute = nil
+        dirty = false
+        hasLoaded = false
+    }
+
+    private func reloadFromDiskLocked(now: Date) throws {
+        resetDurableViewForReload()
+        _ = try loadLocked(now: now)
+    }
+
+    /// Refreshes the durable view while preserving records from a prior
+    /// failed/pending local write. The lock makes the disk read and any later
+    /// rewrite one transaction; without this step a stale actor could compact
+    /// away a journal line committed by another instance.
+    @discardableResult
+    private func synchronizeDurableViewLocked(now: Date) throws -> Bool {
+        guard hasLoaded else {
+            _ = try loadLocked(now: now)
+            return true
+        }
+
+        let preserveLocal = dirty || pendingWriteNeedsRetry || !pendingRecords.isEmpty
+        let localRecords = preserveLocal ? records : []
+        let localRetry = pendingWriteNeedsRetry
+
+        // Keep a complete rollback point. A failed read (for example, a test
+        // or a transient filesystem race replacing the target with a
+        // directory) must not erase an in-memory pending sample.
+        let savedRecords = records
+        let savedPendingRecords = pendingRecords
+        let savedPendingRetry = pendingWriteNeedsRetry
+        let savedJournalRecordCount = journalRecordCount
+        let savedJournalByteCount = journalByteCount
+        let savedSnapshotExists = snapshotExists
+        let savedLastPersistedMinute = lastPersistedMinute
+        let savedDirty = dirty
+        let savedHasLoaded = hasLoaded
+        let savedLastObservedNow = lastObservedNow
+        let savedIgnorePersistedAnchor = ignorePersistedClockAnchorUntilWrite
+        do {
+            try reloadFromDiskLocked(now: now)
+        } catch let error as HistoryStoreError {
+            records = savedRecords
+            pendingRecords = savedPendingRecords
+            pendingWriteNeedsRetry = savedPendingRetry
+            journalRecordCount = savedJournalRecordCount
+            journalByteCount = savedJournalByteCount
+            snapshotExists = savedSnapshotExists
+            lastPersistedMinute = savedLastPersistedMinute
+            dirty = savedDirty
+            hasLoaded = savedHasLoaded
+            lastObservedNow = savedLastObservedNow
+            ignorePersistedClockAnchorUntilWrite = savedIgnorePersistedAnchor
+            if error == .readFailed {
+                // A write operation can encounter a target that is
+                // temporarily unreadable (for example, a path replaced by a
+                // directory). Keep the last known-good view and let the
+                // caller stage its record; the actual write path then reports
+                // writeFailed and leaves the state retryable. Malformed data
+                // and unsupported versions must still stop the operation.
+                return false
+            }
+            throw error
+        } catch {
+            records = savedRecords
+            pendingRecords = savedPendingRecords
+            pendingWriteNeedsRetry = savedPendingRetry
+            journalRecordCount = savedJournalRecordCount
+            journalByteCount = savedJournalByteCount
+            snapshotExists = savedSnapshotExists
+            lastPersistedMinute = savedLastPersistedMinute
+            dirty = savedDirty
+            hasLoaded = savedHasLoaded
+            lastObservedNow = savedLastObservedNow
+            ignorePersistedClockAnchorUntilWrite = savedIgnorePersistedAnchor
+            throw error
+        }
+        guard preserveLocal else { return true }
+
+        let diskRecords = records
+        let referenceNow = retentionReferenceNow(now)
+        let mergedRecords = Self.pruned(
+            coalesced(diskRecords + localRecords),
+            now: referenceNow,
+            retentionInterval: retentionInterval
+        )
+        records = mergedRecords
+        let diskByTimestamp = Dictionary(uniqueKeysWithValues: diskRecords.map { ($0.timestamp, $0) })
+        pendingRecords = Dictionary(uniqueKeysWithValues: mergedRecords.compactMap { record in
+            guard diskByTimestamp[record.timestamp] != record else { return nil }
+            return (record.timestamp, record)
+        })
+        let changed = mergedRecords != diskRecords
+        dirty = changed
+        pendingWriteNeedsRetry = localRetry && !pendingRecords.isEmpty
+        if !changed {
+            pendingRecords.removeAll(keepingCapacity: false)
+            pendingWriteNeedsRetry = false
+        }
+        return true
+    }
+
+    /// A fresh instance is loaded under the caller's file lock. An already
+    /// loaded instance is refreshed and any local pending value is merged.
+    private func synchronizeBeforeAppendLocked(now: Date) throws -> Bool {
+        try synchronizeDurableViewLocked(now: now)
     }
 
     @discardableResult
     public func append(
         snapshot: SystemMemorySnapshot,
         groups: [WorkloadGroupSnapshot] = [],
+        workloadsSampledAt: Date? = nil,
         now: Date = Date()
     ) throws -> [MemoryHistoryRecord] {
-        try append(MemoryHistoryRecord(snapshot: snapshot, groups: groups), now: now)
+        try append(
+            MemoryHistoryRecord(
+                snapshot: snapshot,
+                groups: groups,
+                // Preserve the historical convenience behavior for this
+                // overload: callers that provide groups but no marker have
+                // traditionally meant "captured with this snapshot".
+                workloadsSampledAt: workloadsSampledAt ?? (groups.isEmpty ? nil : snapshot.timestamp)
+            ),
+            now: now
+        )
     }
 
     @discardableResult
     public func append(_ record: MemoryHistoryRecord, now: Date = Date()) throws -> [MemoryHistoryRecord] {
-        if !hasLoaded {
-            _ = try load(now: now)
+        guard isPersistableDate(now) else {
+            throw HistoryStoreError.invalidData
         }
+        return try withStoreLock(failure: .writeFailed) {
+            try appendLocked(record, now: now)
+        }
+    }
+
+    @discardableResult
+    private func appendLocked(_ record: MemoryHistoryRecord, now: Date) throws -> [MemoryHistoryRecord] {
+        let sourceSampleIsFresh = record.sourceSampledAt.map {
+            isWithinFutureSkew($0, now: now, allowance: Self.maximumFutureSkew)
+        } ?? true
+        let workloadSampleIsFresh = record.workloadsSampledAt.map {
+            isWithinFutureSkew($0, now: now, allowance: Self.maximumFutureSkew)
+        } ?? true
+        guard isPersistableDate(now),
+              record.hasValidPersistedFields,
+              isWithinFutureSkew(record.timestamp, now: now, allowance: Self.maximumFutureSkew),
+              sourceSampleIsFresh,
+              workloadSampleIsFresh else {
+            throw HistoryStoreError.invalidData
+        }
+        let didSynchronize = try synchronizeBeforeAppendLocked(now: now)
+        if !didSynchronize {
+            // Force a canonical rewrite after a failed refresh. Appending a
+            // journal line against an unreadable snapshot could otherwise
+            // leave the new record stranded behind the damaged path.
+            dirty = true
+        }
+        let referenceNow = retentionReferenceNow(now)
 
         let normalized = normalized(record)
+        let recordsBeforeAppend = records
         let existingIndex = records.firstIndex(where: { $0.timestamp == normalized.timestamp })
         if let index = existingIndex {
-            records[index] = normalized
+            records[index] = merged(existing: records[index], candidate: normalized)
         } else {
             records.append(normalized)
         }
         let sortedRecords = records.sorted { $0.timestamp < $1.timestamp }
-        records = Self.pruned(sortedRecords, now: now, retentionInterval: retentionInterval)
-        dirty = true
-        pendingRecords[normalized.timestamp] = normalized
+        records = Self.pruned(
+            sortedRecords,
+            now: referenceNow,
+            retentionInterval: retentionInterval
+        )
+        let recordsChanged = records != recordsBeforeAppend
+
+        if recordsChanged {
+            dirty = true
+            if let retained = records.first(where: { $0.timestamp == normalized.timestamp }) {
+                pendingRecords[normalized.timestamp] = retained
+            } else {
+                // A caller may backfill a sample older than the retention
+                // window. It must not be resurrected in the journal after
+                // being pruned from the in-memory snapshot.
+                pendingRecords.removeValue(forKey: normalized.timestamp)
+            }
+            // Pruning is a deletion from the persisted view. A journal append
+            // cannot represent that deletion, so compact the canonical
+            // snapshot instead of leaving expired rows on disk.
+            pendingRecords = pendingRecords.filter { entry in
+                records.contains(entry.value)
+            }
+        }
+
+        guard recordsChanged else {
+            // A previous journal/compaction failure may have left the value
+            // unchanged but still dirty. Retry only after an actual failure;
+            // ordinary same-minute updates remain coalesced in memory.
+            if pendingWriteNeedsRetry {
+                try appendPending(at: now)
+            } else if !didSynchronize || (dirty && pendingRecords.isEmpty) {
+                try compactSnapshot(at: now)
+            }
+            return records
+        }
 
         // The first sample creates a compact snapshot. Later samples append a
         // single line when the minute changes; updates within one minute stay
         // in memory until the next boundary or an explicit flush.
         let removedExpiredRecords = records.count < sortedRecords.count
-        if !snapshotExists {
-            try compactSnapshot(at: now)
-        } else if lastPersistedMinute != normalized.timestamp || removedExpiredRecords {
+        if removedExpiredRecords || !didSynchronize {
+            do {
+                try compactSnapshot(at: now)
+            } catch {
+                dirty = true
+                throw error
+            }
+        } else if !snapshotExists {
+            // Avoid creating an empty snapshot for a record that was already
+            // outside the retention window and therefore produced no state.
+            if !records.isEmpty || journalRecordCount > 0 || !pendingRecords.isEmpty {
+                do {
+                    try compactSnapshot(at: now)
+                } catch {
+                    dirty = true
+                    throw error
+                }
+            } else {
+                dirty = false
+            }
+        } else if lastPersistedMinute != normalized.timestamp {
             try appendPending(at: now)
         }
         return records
     }
 
     public func currentRecords(now: Date = Date()) throws -> [MemoryHistoryRecord] {
-        if !hasLoaded {
-            return try load(now: now)
+        guard isPersistableDate(now) else {
+            throw HistoryStoreError.invalidData
         }
+        return try withStoreLock(failure: .readFailed) {
+            try currentRecordsLocked(now: now)
+        }
+    }
+
+    private func currentRecordsLocked(now: Date) throws -> [MemoryHistoryRecord] {
+        guard isPersistableDate(now) else {
+            throw HistoryStoreError.invalidData
+        }
+        guard try synchronizeDurableViewLocked(now: now) else {
+            throw HistoryStoreError.readFailed
+        }
+        let referenceNow = retentionReferenceNow(now)
         let before = records
-        records = Self.pruned(records, now: now, retentionInterval: retentionInterval)
+        records = Self.pruned(records, now: referenceNow, retentionInterval: retentionInterval)
         if records != before {
             dirty = true
             pendingRecords = pendingRecords.filter { records.contains($0.value) }
@@ -3091,13 +5234,121 @@ public actor HistoryStore {
         return records
     }
 
-    public func flush() throws {
+    /// Persists pending minute records using the caller's sample/diagnostic
+    /// clock. Keeping one validated instant for the whole operation makes
+    /// retries deterministic and avoids a wall-clock jump between journal and
+    /// snapshot writes.
+    public func flush(now: Date = Date()) throws {
+        guard isPersistableDate(now) else {
+            throw HistoryStoreError.invalidData
+        }
+        return try withStoreLock(failure: .writeFailed) {
+            try flushLocked(now: now)
+        }
+    }
+
+    private func flushLocked(now: Date) throws {
+        guard isPersistableDate(now) else {
+            throw HistoryStoreError.invalidData
+        }
         guard hasLoaded else { return }
+        // `flush()` historically persisted the actor's current view without
+        // applying a new retention pass. When a caller supplies a synthetic
+        // timestamp (or the wall clock has jumped far ahead), reloading with
+        // the current wall clock would incorrectly discard that view. Reuse
+        // the latest trusted anchor for the synchronization read in that
+        // case; the actual write still records the caller's validated time.
+        let synchronizationNow: Date
+        if let observed = lastObservedNow,
+           isPersistableDate(observed),
+           now.timeIntervalSince(observed).isFinite,
+           now.timeIntervalSince(observed) > clockRollbackLimit {
+            synchronizationNow = observed
+        } else {
+            synchronizationNow = now
+        }
+        try synchronizeDurableViewLocked(now: synchronizationNow)
         if !pendingRecords.isEmpty {
-            try appendPending(at: Date())
+            try appendPending(at: now)
         }
         guard dirty || journalRecordCount > 0 else { return }
-        try compactSnapshot(at: Date())
+        try compactSnapshot(at: now)
+    }
+
+    /// Merges records accumulated by a caller while the durable store was
+    /// unavailable. Records are normalized/coalesced once and written through
+    /// a single snapshot compaction, avoiding one disk write per recovered
+    /// sample. The actor remains dirty if compaction fails so a later retry can
+    /// safely continue.
+    @discardableResult
+    public func merge(
+        records incoming: [MemoryHistoryRecord],
+        now: Date = Date()
+    ) throws -> [MemoryHistoryRecord] {
+        guard isPersistableDate(now) else {
+            throw HistoryStoreError.invalidData
+        }
+        return try withStoreLock(failure: .writeFailed) {
+            try mergeLocked(records: incoming, now: now)
+        }
+    }
+
+    private func mergeLocked(
+        records incoming: [MemoryHistoryRecord],
+        now: Date
+    ) throws -> [MemoryHistoryRecord] {
+        guard isPersistableDate(now),
+              incoming.allSatisfy({ record in
+                  record.hasValidPersistedFields
+                      && isWithinFutureSkew(record.timestamp, now: now, allowance: Self.maximumFutureSkew)
+                      && (record.sourceSampledAt.map {
+                          isWithinFutureSkew($0, now: now, allowance: Self.maximumFutureSkew)
+                      } ?? true)
+                      && (record.workloadsSampledAt.map {
+                          isWithinFutureSkew($0, now: now, allowance: Self.maximumFutureSkew)
+                      } ?? true)
+              }) else {
+            throw HistoryStoreError.invalidData
+        }
+        if !hasLoaded {
+            _ = try loadLocked(now: now)
+        }
+        try synchronizeDurableViewLocked(now: now)
+        guard !incoming.isEmpty else { return records }
+
+        let referenceNow = retentionReferenceNow(now)
+        let before = records
+        let mergedRecords = Self.pruned(
+            coalesced(records + incoming),
+            now: referenceNow,
+            retentionInterval: retentionInterval
+        )
+        records = mergedRecords
+        let changed = records != before
+        if changed {
+            dirty = true
+        }
+
+        // Even when values are already present, a pending journal or dirty
+        // flag means the durable representation still needs repair. A store
+        // with no records at all should remain absent on disk: merging only
+        // expired recovery entries must not create an empty snapshot.
+        let needsCompaction = changed
+            || dirty
+            || journalRecordCount > 0
+            || (!snapshotExists && !records.isEmpty)
+        guard needsCompaction else {
+            return records
+        }
+        do {
+            try compactSnapshot(at: now)
+        } catch {
+            // Keep the actor retryable even when the state did not change
+            // before the write attempt (for example, a journal-only repair).
+            dirty = true
+            throw error
+        }
+        return records
     }
 
     private static func encoder() -> JSONEncoder {
@@ -3127,17 +5378,29 @@ public actor HistoryStore {
         let decoder = Self.decoder()
         var decoded = [MemoryHistoryRecord]()
         var ignoredIncompleteTail = false
-        for index in lines.indices {
-            let line = lines[index]
-            guard !line.isEmpty else { continue }
+        for (lineIndex, line) in lines.enumerated() {
+            let isTerminalEmptyLine = line.isEmpty
+                && lineIndex == lines.count - 1
+                && data.last == 0x0A
+            if line.isEmpty {
+                // Exactly one empty component is expected from a final
+                // newline. Blank lines in the middle (or multiple trailing
+                // newlines) indicate a damaged journal and must not be
+                // silently skipped.
+                guard isTerminalEmptyLine else {
+                    throw HistoryStoreError.invalidData
+                }
+                continue
+            }
             do {
                 decoded.append(try decoder.decode(MemoryHistoryRecord.self, from: Data(line)))
             } catch {
                 // A process may be terminated while the final line is being
                 // appended. Ignore only that incomplete tail; malformed data
                 // in a complete or middle line still invalidates the store.
-                let isLastLine = index == lines.index(before: lines.endIndex)
-                if isLastLine, data.last != 0x0A {
+                let isLastLine = lineIndex == lines.count - 1
+                if isLastLine, data.last != 0x0A,
+                   isIncompleteJSONLine(Data(line)) {
                     ignoredIncompleteTail = true
                     break
                 }
@@ -3160,6 +5423,12 @@ public actor HistoryStore {
 
         let ordered = pendingRecords.values.sorted { $0.timestamp < $1.timestamp }
         var payload = Data()
+        let fileManager = FileManager.default
+        // Capture the original target before directory preparation so a
+        // preparation failure cannot make rollback remove an unrelated file.
+        let journalPreviouslyExisted = fileManager.fileExists(atPath: journalURL.path)
+        var journalWriteStarted = false
+        var originalJournalSize: UInt64 = 0
         do {
             let encoder = Self.encoder()
             for record in ordered {
@@ -3168,33 +5437,88 @@ public actor HistoryStore {
             }
 
             try prepareDirectory()
-            let fileManager = FileManager.default
-            if fileManager.fileExists(atPath: journalURL.path) {
+            if journalPreviouslyExisted {
                 let handle = try FileHandle(forWritingTo: journalURL)
-                defer { try? handle.close() }
-                try handle.seekToEnd()
-                try handle.write(contentsOf: payload)
-                try handle.synchronize()
+                do {
+                    originalJournalSize = try handle.seekToEnd()
+                    journalWriteStarted = true
+                    if originalJournalSize > 0,
+                       !fileEndsWithNewline(journalURL) {
+                        // The separator is carried by the payload prefix. Do
+                        // not write a second newline here: two separators
+                        // would decode as an invalid blank journal line.
+                        payload.insert(0x0A, at: payload.startIndex)
+                    }
+                    try handle.write(contentsOf: payload)
+                    try handle.synchronize()
+                    try handle.close()
+                } catch {
+                    try? handle.close()
+                    throw error
+                }
             } else {
+                journalWriteStarted = true
                 try payload.write(to: journalURL, options: [.atomic])
             }
+            // Permissions are part of the same transaction as the append. If
+            // this step fails, the journal is rolled back and pending records
+            // remain available for a later retry.
             try fileManager.setAttributes(
                 [.posixPermissions: 0o600],
                 ofItemAtPath: journalURL.path
             )
+            // Keep the retention reference durable alongside the journal. If
+            // this write fails, the surrounding rollback removes the journal
+            // bytes as well, so a retry remains transactional.
+            try persistClockAnchor(at: timestamp)
         } catch {
+            pendingWriteNeedsRetry = true
+            if journalWriteStarted {
+                rollbackJournalWrite(
+                    existed: journalPreviouslyExisted,
+                    originalSize: originalJournalSize
+                )
+            }
             throw HistoryStoreError.writeFailed
         }
 
         journalRecordCount += ordered.count
         journalByteCount += payload.count
         pendingRecords.removeAll(keepingCapacity: false)
+        pendingWriteNeedsRetry = false
         dirty = false
         lastPersistedMinute = records.last?.timestamp
 
         if journalRecordCount >= compactionRecordThreshold
             || journalByteCount >= compactionByteThreshold {
-            try compactSnapshot(at: timestamp)
+            do {
+                try compactSnapshot(at: timestamp)
+            } catch {
+                // The journal append itself succeeded, but the optional
+                // compaction did not. Keep the store dirty so `flush()` can
+                // retry rather than claiming that the canonical snapshot is
+                // current.
+                dirty = true
+                throw error
+            }
+        }
+    }
+
+    private func rollbackJournalWrite(existed: Bool, originalSize: UInt64) {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: journalURL.path) else { return }
+        if !existed {
+            try? fileManager.removeItem(at: journalURL)
+            return
+        }
+
+        guard let handle = try? FileHandle(forWritingTo: journalURL) else { return }
+        do {
+            try handle.truncate(atOffset: originalSize)
+            try handle.synchronize()
+            try handle.close()
+        } catch {
+            try? handle.close()
         }
     }
 
@@ -3221,12 +5545,14 @@ public actor HistoryStore {
                     ofItemAtPath: journalURL.path
                 )
             }
+            try persistClockAnchor(at: timestamp)
         } catch {
             throw HistoryStoreError.writeFailed
         }
 
         snapshotExists = true
         pendingRecords.removeAll(keepingCapacity: false)
+        pendingWriteNeedsRetry = false
         dirty = false
         journalRecordCount = 0
         journalByteCount = 0
@@ -3252,10 +5578,24 @@ public actor HistoryStore {
         return max(value.intValue, 0)
     }
 
+    private func fileEndsWithNewline(_ url: URL) -> Bool {
+        guard let data = try? Data(contentsOf: url) else { return false }
+        guard !data.isEmpty else { return true }
+        return data.last == 0x0A
+    }
+
     private static func minuteStart(_ date: Date) -> Date {
         let seconds = date.timeIntervalSince1970
         guard seconds.isFinite else { return date }
-        return Date(timeIntervalSince1970: floor(seconds / 60) * 60)
+        let bucket = floor(seconds / 60)
+        guard bucket.isFinite else { return date }
+        let normalizedSeconds = bucket * 60
+        // Floating-point multiplication can overflow to infinity for a
+        // finite, attacker-supplied Date. Keep the original value so the
+        // caller can reject/prune it rather than constructing another invalid
+        // timestamp.
+        guard normalizedSeconds.isFinite else { return date }
+        return Date(timeIntervalSince1970: normalizedSeconds)
     }
 
     private func normalized(_ record: MemoryHistoryRecord) -> MemoryHistoryRecord {
@@ -3264,41 +5604,227 @@ public actor HistoryStore {
             availableFraction: record.availableFraction,
             compressedBytes: record.compressedBytes,
             swapUsedBytes: record.swapUsedBytes,
-            workloads: Self.compactWorkloads(record.workloads, limit: maxPersistedWorkloads)
+            workloads: Self.compactedWorkloads(record.workloads, limit: maxPersistedWorkloads),
+            workloadsSampledAt: record.workloadsSampledAt,
+            sourceSampledAt: record.sourceSampledAt
         )
+    }
+
+    private func merged(
+        existing: MemoryHistoryRecord,
+        candidate: MemoryHistoryRecord
+    ) -> MemoryHistoryRecord {
+        Self.preferredRecord(existing: existing, candidate: candidate)
+    }
+
+    /// Merges two records for the same minute without depending on insertion
+    /// order. System values prefer the newest source sample when available;
+    /// legacy records without that marker use a canonical field ordering.
+    /// Workload attribution follows the corresponding freshness rule in
+    /// `preferredWorkloadPayload` and is canonicalized before serialization.
+    public nonisolated static func preferredRecord(
+        existing: MemoryHistoryRecord,
+        candidate: MemoryHistoryRecord
+    ) -> MemoryHistoryRecord {
+        let preferredSystem = preferredSystemRecord(
+            existing: existing,
+            candidate: candidate
+        )
+        let workloadPayload = preferredWorkloadPayload(
+            existing: existing,
+            candidate: candidate
+        )
+        return MemoryHistoryRecord(
+            timestamp: candidate.timestamp,
+            availableFraction: preferredSystem.availableFraction,
+            compressedBytes: preferredSystem.compressedBytes,
+            swapUsedBytes: preferredSystem.swapUsedBytes,
+            workloads: workloadPayload.workloads,
+            workloadsSampledAt: workloadPayload.sampledAt,
+            sourceSampledAt: preferredSystem.sourceSampledAt
+        )
+    }
+
+    private nonisolated static func preferredSystemRecord(
+        existing: MemoryHistoryRecord,
+        candidate: MemoryHistoryRecord
+    ) -> MemoryHistoryRecord {
+        switch (existing.sourceSampledAt, candidate.sourceSampledAt) {
+        case (nil, nil):
+            return compareSystemPayload(candidate, existing) > 0 ? candidate : existing
+        case (nil, _?):
+            return candidate
+        case (_?, nil):
+            return existing
+        case let (existingAt?, candidateAt?):
+            if candidateAt != existingAt {
+                return candidateAt > existingAt ? candidate : existing
+            }
+            return compareSystemPayload(candidate, existing) > 0 ? candidate : existing
+        }
+    }
+
+    private nonisolated static func compareSystemPayload(
+        _ lhs: MemoryHistoryRecord,
+        _ rhs: MemoryHistoryRecord
+    ) -> Int {
+        if lhs.availableFraction != rhs.availableFraction {
+            return lhs.availableFraction < rhs.availableFraction ? -1 : 1
+        }
+        if lhs.compressedBytes != rhs.compressedBytes {
+            return lhs.compressedBytes < rhs.compressedBytes ? -1 : 1
+        }
+        if lhs.swapUsedBytes != rhs.swapUsedBytes {
+            return lhs.swapUsedBytes < rhs.swapUsedBytes ? -1 : 1
+        }
+        if lhs.sourceSampledAt != rhs.sourceSampledAt {
+            guard let left = lhs.sourceSampledAt else { return -1 }
+            guard let right = rhs.sourceSampledAt else { return 1 }
+            return left < right ? -1 : 1
+        }
+        return compareWorkloadArrays(lhs.workloads, rhs.workloads)
     }
 
     private func coalesced(_ source: [MemoryHistoryRecord]) -> [MemoryHistoryRecord] {
         var byMinute: [Date: MemoryHistoryRecord] = [:]
         for record in source {
             let normalizedRecord = normalized(record)
-            byMinute[normalizedRecord.timestamp] = normalizedRecord
+            guard let existing = byMinute[normalizedRecord.timestamp] else {
+                byMinute[normalizedRecord.timestamp] = normalizedRecord
+                continue
+            }
+
+            byMinute[normalizedRecord.timestamp] = merged(
+                existing: existing,
+                candidate: normalizedRecord
+            )
         }
         return byMinute.values.sorted { $0.timestamp < $1.timestamp }
     }
 
-    private static func compactWorkloads(
+    /// Selects the workload attribution that should survive a merge of two
+    /// records representing the same minute. Freshness wins first; when both
+    /// sources have the same (or no) marker, a canonical full-field ordering
+    /// makes the result independent of input order. The returned list is
+    /// canonicalized as well, so equivalent records serialize identically.
+    public nonisolated static func preferredWorkloadPayload(
+        existing: MemoryHistoryRecord,
+        candidate: MemoryHistoryRecord
+    ) -> (workloads: [PersistedWorkloadRecord], sampledAt: Date?) {
+        let useCandidate: Bool
+        switch (existing.workloadsSampledAt, candidate.workloadsSampledAt) {
+        case (nil, nil):
+            useCandidate = compareWorkloadArrays(candidate.workloads, existing.workloads) > 0
+        case (nil, _?):
+            useCandidate = true
+        case (_?, nil):
+            useCandidate = false
+        case let (existingAt?, candidateAt?):
+            if candidateAt != existingAt {
+                useCandidate = candidateAt > existingAt
+            } else {
+                useCandidate = compareWorkloadArrays(candidate.workloads, existing.workloads) > 0
+            }
+        }
+
+        let selected = useCandidate ? candidate : existing
+        return (
+            workloads: canonicalWorkloads(selected.workloads),
+            sampledAt: selected.workloadsSampledAt
+        )
+    }
+
+    private nonisolated static func canonicalWorkloads(
+        _ workloads: [PersistedWorkloadRecord]
+    ) -> [PersistedWorkloadRecord] {
+        workloads.sorted { compareWorkloads($0, $1) < 0 }
+    }
+
+    /// Lexicographic comparison over every persisted workload field. Keeping
+    /// this comparison numeric/textual (rather than locale-aware) provides a
+    /// stable total order across processes and machines.
+    private nonisolated static func compareWorkloads(
+        _ lhs: PersistedWorkloadRecord,
+        _ rhs: PersistedWorkloadRecord
+    ) -> Int {
+        if lhs.id != rhs.id { return lhs.id < rhs.id ? -1 : 1 }
+        if lhs.containsEstimatedFootprint != rhs.containsEstimatedFootprint {
+            // Keep exact values ahead of RSS fallbacks when duplicate IDs are
+            // compared. This prevents an estimate from winning solely because
+            // its numeric value is larger.
+            return lhs.containsEstimatedFootprint ? 1 : -1
+        }
+        if lhs.title != rhs.title { return lhs.title < rhs.title ? -1 : 1 }
+        if lhs.processCount != rhs.processCount {
+            return lhs.processCount < rhs.processCount ? -1 : 1
+        }
+        if lhs.attributedFootprintBytes != rhs.attributedFootprintBytes {
+            return lhs.attributedFootprintBytes < rhs.attributedFootprintBytes ? -1 : 1
+        }
+        if lhs.attributedResidentBytes != rhs.attributedResidentBytes {
+            return lhs.attributedResidentBytes < rhs.attributedResidentBytes ? -1 : 1
+        }
+        if lhs.isSystem != rhs.isSystem {
+            return lhs.isSystem ? -1 : 1
+        }
+        return 0
+    }
+
+    private nonisolated static func compareWorkloadArrays(
+        _ lhs: [PersistedWorkloadRecord],
+        _ rhs: [PersistedWorkloadRecord]
+    ) -> Int {
+        let left = canonicalWorkloads(lhs)
+        let right = canonicalWorkloads(rhs)
+        for (leftWorkload, rightWorkload) in zip(left, right) {
+            let comparison = compareWorkloads(leftWorkload, rightWorkload)
+            if comparison != 0 { return comparison }
+        }
+        if left.count == right.count { return 0 }
+        return left.count < right.count ? -1 : 1
+    }
+
+    /// Applies the same top-workload and aggregate policy used by durable
+    /// history persistence. Callers that must buffer records in memory can
+    /// use this helper to keep their temporary representation bounded too.
+    public nonisolated static func compactedWorkloads(
         _ source: [PersistedWorkloadRecord],
         limit: Int
     ) -> [PersistedWorkloadRecord] {
+        let safeLimit = max(limit, 1)
         let ranked = source.sorted {
             if $0.attributedFootprintBytes != $1.attributedFootprintBytes {
                 return $0.attributedFootprintBytes > $1.attributedFootprintBytes
+            }
+            if $0.containsEstimatedFootprint != $1.containsEstimatedFootprint {
+                return !$0.containsEstimatedFootprint
             }
             if $0.isSystem != $1.isSystem {
                 return !$0.isSystem
             }
             return $0.id < $1.id
         }
-        guard ranked.count > limit else { return ranked }
+        guard ranked.count > safeLimit else { return ranked }
 
-        var result = Array(ranked.prefix(limit))
-        var aggregateBySystem: [Bool: (processCount: Int, footprint: UInt64, resident: UInt64)] = [:]
-        for workload in ranked.dropFirst(limit) {
-            var aggregate = aggregateBySystem[workload.isSystem] ?? (0, 0, 0)
+        var result = Array(ranked.prefix(safeLimit))
+        var aggregateBySystem: [Bool: (
+            processCount: Int,
+            footprint: UInt64,
+            resident: UInt64,
+            containsEstimatedFootprint: Bool
+        )] = [:]
+        for workload in ranked.dropFirst(safeLimit) {
+            var aggregate = aggregateBySystem[workload.isSystem] ?? (
+                processCount: 0,
+                footprint: 0,
+                resident: 0,
+                containsEstimatedFootprint: false
+            )
             aggregate.processCount = adding(aggregate.processCount, workload.processCount)
             aggregate.footprint = adding(aggregate.footprint, workload.attributedFootprintBytes)
             aggregate.resident = adding(aggregate.resident, workload.attributedResidentBytes)
+            aggregate.containsEstimatedFootprint = aggregate.containsEstimatedFootprint
+                || workload.containsEstimatedFootprint
             aggregateBySystem[workload.isSystem] = aggregate
         }
 
@@ -3310,13 +5836,17 @@ public actor HistoryStore {
                     processCount: aggregate.processCount,
                     attributedFootprintBytes: aggregate.footprint,
                     attributedResidentBytes: aggregate.resident,
-                    isSystem: isSystem
+                    isSystem: isSystem,
+                    containsEstimatedFootprint: aggregate.containsEstimatedFootprint
                 )
             )
         }
         return result.sorted {
             if $0.attributedFootprintBytes != $1.attributedFootprintBytes {
                 return $0.attributedFootprintBytes > $1.attributedFootprintBytes
+            }
+            if $0.containsEstimatedFootprint != $1.containsEstimatedFootprint {
+                return !$0.containsEstimatedFootprint
             }
             if $0.isSystem != $1.isSystem {
                 return !$0.isSystem
@@ -3325,12 +5855,12 @@ public actor HistoryStore {
         }
     }
 
-    private static func adding(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
+    private nonisolated static func adding(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
         let (value, overflow) = lhs.addingReportingOverflow(rhs)
         return overflow ? UInt64.max : value
     }
 
-    private static func adding(_ lhs: Int, _ rhs: Int) -> Int {
+    private nonisolated static func adding(_ lhs: Int, _ rhs: Int) -> Int {
         guard rhs > 0 else { return lhs }
         return lhs > Int.max - rhs ? Int.max : lhs + rhs
     }
@@ -3340,9 +5870,31 @@ public actor HistoryStore {
         now: Date,
         retentionInterval: TimeInterval
     ) -> [MemoryHistoryRecord] {
-        let cutoff = now.timeIntervalSince1970 - retentionInterval
-        guard cutoff.isFinite else { return source }
-        return source.filter { $0.timestamp.timeIntervalSince1970 >= cutoff }
+        guard isPersistableDate(now), retentionInterval.isFinite else { return [] }
+        let cutoff = now.timeIntervalSince1970 - min(max(retentionInterval, 0), maximumRetentionInterval)
+        guard cutoff.isFinite else {
+            // With the supported retention bound this should not normally be
+            // reached, but returning an empty set is safer than retaining an
+            // unbounded file when arithmetic receives an extreme value.
+            return []
+        }
+        return source.filter { record in
+            let timestamp = record.timestamp.timeIntervalSince1970
+            guard timestamp.isFinite,
+                  timestamp >= cutoff,
+                  isWithinFutureSkew(record.timestamp, now: now, allowance: maximumFutureSkew) else {
+                return false
+            }
+            if let sourceSampledAt = record.sourceSampledAt,
+               !isWithinFutureSkew(sourceSampledAt, now: now, allowance: maximumFutureSkew) {
+                return false
+            }
+            if let workloadsSampledAt = record.workloadsSampledAt,
+               !isWithinFutureSkew(workloadsSampledAt, now: now, allowance: maximumFutureSkew) {
+                return false
+            }
+            return true
+        }
     }
 }
 
@@ -3371,6 +5923,8 @@ public enum ProcessActionAuditStoreError: Error, CustomStringConvertible, Locali
 public actor ProcessActionAuditStore {
     public static let defaultRetentionInterval: TimeInterval = 7 * 24 * 60 * 60
     public static let defaultMaximumEvents = 200
+    public static let maximumFutureSkew: TimeInterval = HistoryStore.maximumFutureSkew
+    public static let maximumRetentionInterval: TimeInterval = HistoryStore.maximumRetentionInterval
 
     public static var defaultFileURL: URL {
         HistoryStore.defaultFileURL
@@ -3379,11 +5933,16 @@ public actor ProcessActionAuditStore {
     }
 
     public nonisolated let fileURL: URL
+    private let clockURL: URL
+    private let lockURL: URL
     public let retentionInterval: TimeInterval
     public let maximumEvents: Int
 
     private var events: [ProcessActionAuditEvent] = []
     private var hasLoaded = false
+    private var dirty = false
+    private var lastObservedNow: Date?
+    private var ignorePersistedClockAnchorUntilWrite = false
 
     public init(
         fileURL: URL = ProcessActionAuditStore.defaultFileURL,
@@ -3391,17 +5950,157 @@ public actor ProcessActionAuditStore {
         maximumEvents: Int = ProcessActionAuditStore.defaultMaximumEvents
     ) {
         self.fileURL = fileURL
-        self.retentionInterval = max(retentionInterval, 0)
+        self.clockURL = URL(fileURLWithPath: fileURL.path + ".clock")
+        self.lockURL = URL(fileURLWithPath: fileURL.path + ".lock")
+        self.retentionInterval = retentionInterval.isFinite
+            ? min(max(retentionInterval, 0), Self.maximumRetentionInterval)
+            : Self.defaultRetentionInterval
         self.maximumEvents = max(maximumEvents, 1)
+    }
+
+    private var clockRollbackLimit: TimeInterval {
+        min(
+            max(retentionInterval, 0) + Self.maximumFutureSkew,
+            Self.maximumRetentionInterval
+        )
+    }
+
+    private func retentionReferenceNow(_ now: Date) -> Date {
+        if hasLoaded, events.isEmpty, !dirty {
+            lastObservedNow = now
+            ignorePersistedClockAnchorUntilWrite = true
+            return now
+        }
+
+        let diskAnchor = ignorePersistedClockAnchorUntilWrite
+            ? nil
+            : readClockAnchor(at: clockURL)
+        var candidate = lastObservedNow
+        if let diskAnchor, (candidate == nil || diskAnchor > candidate!) {
+            candidate = diskAnchor
+        }
+        let reference = boundedRetentionReference(
+            now: now,
+            anchor: candidate,
+            rollbackLimit: clockRollbackLimit
+        )
+        if reference == now, let candidate,
+           candidate.timeIntervalSince(now).isFinite,
+           candidate.timeIntervalSince(now) > clockRollbackLimit {
+            lastObservedNow = now
+        } else if let current = lastObservedNow {
+            if now > current { lastObservedNow = now }
+        } else {
+            lastObservedNow = now
+        }
+        if let candidate, candidate <= now || reference == candidate {
+            lastObservedNow = max(lastObservedNow ?? now, candidate)
+        }
+        return reference
+    }
+
+    private func persistClockAnchor(at date: Date) throws {
+        guard isPersistableDate(date) else { throw ProcessActionAuditStoreError.invalidData }
+        let previousAnchorData = try? Data(contentsOf: clockURL)
+        let previousObservedNow = lastObservedNow
+        let previousIgnorePersistedAnchor = ignorePersistedClockAnchorUntilWrite
+        let observedAt: Date
+        var candidates = [date]
+        if let current = lastObservedNow {
+            candidates.append(current)
+        }
+        if !ignorePersistedClockAnchorUntilWrite,
+           let disk = readClockAnchor(at: clockURL),
+           disk > date,
+           disk.timeIntervalSince(date).isFinite,
+           disk.timeIntervalSince(date) <= clockRollbackLimit {
+            candidates.append(disk)
+        }
+        observedAt = candidates.max() ?? date
+        lastObservedNow = observedAt
+        do {
+            let data = try clockAnchorData(for: observedAt)
+            try prepareDirectory()
+            try data.write(to: clockURL, options: [.atomic])
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: clockURL.path
+            )
+            ignorePersistedClockAnchorUntilWrite = false
+        } catch {
+            lastObservedNow = previousObservedNow
+            ignorePersistedClockAnchorUntilWrite = previousIgnorePersistedAnchor
+            if let previousAnchorData {
+                try? previousAnchorData.write(to: clockURL, options: [.atomic])
+                try? FileManager.default.setAttributes(
+                    [.posixPermissions: 0o600],
+                    ofItemAtPath: clockURL.path
+                )
+            } else {
+                try? FileManager.default.removeItem(at: clockURL)
+            }
+            throw ProcessActionAuditStoreError.writeFailed
+        }
+    }
+
+    private func withStoreLock<T>(
+        failure: ProcessActionAuditStoreError,
+        _ body: () throws -> T
+    ) throws -> T {
+        do {
+            return try withExclusivePersistedFileLock(at: lockURL, body)
+        } catch let error as ProcessActionAuditStoreError {
+            throw error
+        } catch {
+            throw failure
+        }
     }
 
     @discardableResult
     public func load(now: Date = Date()) throws -> [ProcessActionAuditEvent] {
+        guard isPersistableDate(now) else {
+            throw ProcessActionAuditStoreError.invalidData
+        }
+        return try withStoreLock(failure: .readFailed) {
+            if hasLoaded {
+                // Keep the actor's last validated events available to a
+                // subsequent write retry, but never report them as a
+                // successful read when the durable path cannot be refreshed.
+                guard try synchronizeDurableViewLocked(now: now) else {
+                    throw ProcessActionAuditStoreError.readFailed
+                }
+                return events
+            }
+            return try loadLocked(now: now)
+        }
+    }
+
+    @discardableResult
+    private func loadLocked(now: Date) throws -> [ProcessActionAuditEvent] {
+        guard isPersistableDate(now) else {
+            throw ProcessActionAuditStoreError.invalidData
+        }
+        let referenceNow = retentionReferenceNow(now)
         guard !hasLoaded else {
-            let prunedEvents = Self.pruned(events, now: now, retentionInterval: retentionInterval, limit: maximumEvents)
+            let prunedEvents = Self.pruned(
+                events,
+                now: referenceNow,
+                retentionInterval: retentionInterval,
+                limit: maximumEvents
+            )
             if prunedEvents != events {
                 events = prunedEvents
-                try persist()
+                dirty = true
+                do {
+                    try persist(observedAt: now)
+                    dirty = false
+                } catch {
+                    // Keep the pruned in-memory view and mark it for a later
+                    // retry; a transient permission/disk error must not make
+                    // the actor look clean.
+                    dirty = true
+                    throw error
+                }
             }
             return events
         }
@@ -3420,15 +6119,115 @@ public actor ProcessActionAuditStore {
         }
 
         let decoded = try decode(data)
-        events = Self.pruned(decoded.events, now: now, retentionInterval: retentionInterval, limit: maximumEvents)
+        let uniqueDecodedEvents = Self.deduplicated(decoded.events)
+        events = Self.pruned(
+            uniqueDecodedEvents,
+            now: referenceNow,
+            retentionInterval: retentionInterval,
+            limit: maximumEvents
+        )
         hasLoaded = true
 
-        if decoded.validByteCount < data.count || events.count != decoded.events.count {
-            try persist()
+        if decoded.validByteCount < data.count
+            || uniqueDecodedEvents.count != decoded.events.count
+            || events.count != uniqueDecodedEvents.count {
+            dirty = true
+            do {
+                try persist(observedAt: now)
+                dirty = false
+            } catch {
+                dirty = true
+                throw error
+            }
         } else if data.isEmpty {
             try setFilePermissionsIfPresent()
         }
+        // Older audit logs may not have a clock sidecar. Establish it after
+        // validating the complete log so a later rollback cannot evict valid
+        // events merely because the first post-upgrade load uses a smaller
+        // wall-clock value.
+        if readClockAnchor(at: clockURL) == nil {
+            do {
+                try persistClockAnchor(at: now)
+            } catch {
+                dirty = true
+                throw error
+            }
+        }
         return events
+    }
+
+    private func reloadFromDiskLocked(now: Date) throws {
+        events.removeAll(keepingCapacity: false)
+        dirty = false
+        hasLoaded = false
+        _ = try loadLocked(now: now)
+    }
+
+    /// Refreshes the durable view under the path lock. A prior failed rewrite
+    /// may have left an in-memory event set that is newer than disk; merge it
+    /// back after reloading so a repair cannot discard that event or another
+    /// instance's concurrent append.
+    @discardableResult
+    private func synchronizeDurableViewLocked(now: Date) throws -> Bool {
+        guard hasLoaded else {
+            _ = try loadLocked(now: now)
+            return true
+        }
+
+        let preserveLocal = dirty
+        let localEvents = preserveLocal ? events : []
+        let savedEvents = events
+        let savedDirty = dirty
+        let savedHasLoaded = hasLoaded
+        let savedLastObservedNow = lastObservedNow
+        let savedIgnorePersistedAnchor = ignorePersistedClockAnchorUntilWrite
+        do {
+            try reloadFromDiskLocked(now: now)
+        } catch let error as ProcessActionAuditStoreError {
+            events = savedEvents
+            dirty = savedDirty
+            hasLoaded = savedHasLoaded
+            lastObservedNow = savedLastObservedNow
+            ignorePersistedClockAnchorUntilWrite = savedIgnorePersistedAnchor
+            if error == .readFailed {
+                // Preserve the last validated event set and let the caller
+                // attempt the write. This keeps a failed append retryable
+                // when the target path is temporarily unreadable; malformed
+                // content still remains a hard read failure.
+                dirty = true
+                return false
+            }
+            throw error
+        } catch {
+            events = savedEvents
+            dirty = savedDirty
+            hasLoaded = savedHasLoaded
+            lastObservedNow = savedLastObservedNow
+            ignorePersistedClockAnchorUntilWrite = savedIgnorePersistedAnchor
+            throw error
+        }
+        guard preserveLocal else { return true }
+
+        let diskEvents = events
+        let referenceNow = retentionReferenceNow(now)
+        let mergedEvents = Self.pruned(
+            Self.deduplicated(diskEvents + localEvents),
+            now: referenceNow,
+            retentionInterval: retentionInterval,
+            limit: maximumEvents
+        )
+        events = mergedEvents
+        dirty = mergedEvents != diskEvents
+        return true
+    }
+
+    /// Audit appends are whole-file transactions when retention/repair is
+    /// required. Always refresh a previously loaded actor while holding the
+    /// path lock so a stale event list cannot replace another instance's
+    /// recent events.
+    private func synchronizeBeforeAppendLocked(now: Date) throws -> Bool {
+        try synchronizeDurableViewLocked(now: now)
     }
 
     @discardableResult
@@ -3436,27 +6235,91 @@ public actor ProcessActionAuditStore {
         _ event: ProcessActionAuditEvent,
         now: Date = Date()
     ) throws -> [ProcessActionAuditEvent] {
-        if !hasLoaded {
-            _ = try load(now: now)
+        guard isPersistableDate(now) else {
+            throw ProcessActionAuditStoreError.invalidData
         }
+        return try withStoreLock(failure: .writeFailed) {
+            try appendLocked(event, now: now)
+        }
+    }
 
+    @discardableResult
+    private func appendLocked(
+        _ event: ProcessActionAuditEvent,
+        now: Date
+    ) throws -> [ProcessActionAuditEvent] {
+        guard isPersistableDate(now),
+              event.hasValidPersistedFields,
+              isWithinFutureSkew(event.timestamp, now: now, allowance: Self.maximumFutureSkew) else {
+            throw ProcessActionAuditStoreError.invalidData
+        }
+        let didSynchronize = try synchronizeBeforeAppendLocked(now: now)
+
+        let referenceNow = retentionReferenceNow(now)
+        let previousEvents = events
+        let hadPendingMismatch = dirty || !didSynchronize
         let beforeCount = events.count
+        if let existing = events.first(where: { $0.id == event.id }) {
+            // Replaying the same event is idempotent; a conflicting duplicate
+            // would make SwiftUI's Identifiable collection ambiguous.
+            if existing == event { return events }
+            throw ProcessActionAuditStoreError.invalidData
+        }
         events.append(event)
-        let prunedEvents = Self.pruned(events, now: now, retentionInterval: retentionInterval, limit: maximumEvents)
+        let prunedEvents = Self.pruned(
+            events,
+            now: referenceNow,
+            retentionInterval: retentionInterval,
+            limit: maximumEvents
+        )
         let requiresRewrite = prunedEvents.count != beforeCount + 1
         events = prunedEvents
 
-        if requiresRewrite {
-            try persist()
-        } else {
-            try appendLine(event)
+        do {
+            if requiresRewrite || hadPendingMismatch {
+                try persist(observedAt: now)
+            } else {
+                try appendLine(event, observedAt: now)
+            }
+            dirty = false
+        } catch {
+            // An append is transactional from the actor's perspective. The
+            // failed event must not remain in memory and accidentally appear
+            // in a later rewrite; the next `flush()` can repair any residual
+            // bytes left by an unusual partial write.
+            events = previousEvents
+            dirty = true
+            throw error
         }
         return events
     }
 
-    public func flush() throws {
+    public func flush(now: Date = Date()) throws {
+        guard isPersistableDate(now) else {
+            throw ProcessActionAuditStoreError.invalidData
+        }
+        return try withStoreLock(failure: .writeFailed) {
+            try flushLocked(now: now)
+        }
+    }
+
+    private func flushLocked(now: Date) throws {
+        guard isPersistableDate(now) else {
+            throw ProcessActionAuditStoreError.invalidData
+        }
         guard hasLoaded else { return }
-        try persist()
+        let synchronizationNow: Date
+        if let observed = lastObservedNow,
+           isPersistableDate(observed),
+           now.timeIntervalSince(observed).isFinite,
+           now.timeIntervalSince(observed) > clockRollbackLimit {
+            synchronizationNow = observed
+        } else {
+            synchronizationNow = now
+        }
+        try synchronizeDurableViewLocked(now: synchronizationNow)
+        _ = retentionReferenceNow(now)
+        try persist(observedAt: now)
     }
 
     private struct DecodeResult {
@@ -3473,14 +6336,22 @@ public actor ProcessActionAuditStore {
         var decoded: [ProcessActionAuditEvent] = []
         var ignoredIncompleteTail = false
 
-        for index in lines.indices {
-            let line = lines[index]
-            guard !line.isEmpty else { continue }
+        for (lineIndex, line) in lines.enumerated() {
+            let isTerminalEmptyLine = line.isEmpty
+                && lineIndex == lines.count - 1
+                && data.last == 0x0A
+            if line.isEmpty {
+                guard isTerminalEmptyLine else {
+                    throw ProcessActionAuditStoreError.invalidData
+                }
+                continue
+            }
             do {
                 decoded.append(try decoder.decode(ProcessActionAuditEvent.self, from: Data(line)))
             } catch {
-                let isLastLine = index == lines.index(before: lines.endIndex)
-                if isLastLine, data.last != 0x0A {
+                let isLastLine = lineIndex == lines.count - 1
+                if isLastLine, data.last != 0x0A,
+                   isIncompleteJSONLine(Data(line)) {
                     ignoredIncompleteTail = true
                     break
                 }
@@ -3499,7 +6370,11 @@ public actor ProcessActionAuditStore {
         return DecodeResult(events: decoded, validByteCount: validByteCount)
     }
 
-    private func appendLine(_ event: ProcessActionAuditEvent) throws {
+    private func appendLine(_ event: ProcessActionAuditEvent, observedAt: Date) throws {
+        let fileManager = FileManager.default
+        let filePreviouslyExisted = fileManager.fileExists(atPath: fileURL.path)
+        var writeStarted = false
+        var originalSize: UInt64 = 0
         do {
             try prepareDirectory()
             let encoder = JSONEncoder()
@@ -3508,23 +6383,51 @@ public actor ProcessActionAuditStore {
             var payload = try encoder.encode(event)
             payload.append(0x0A)
 
-            let fileManager = FileManager.default
-            if fileManager.fileExists(atPath: fileURL.path) {
+            if filePreviouslyExisted {
                 let handle = try FileHandle(forWritingTo: fileURL)
-                defer { try? handle.close() }
-                try handle.seekToEnd()
-                try handle.write(contentsOf: payload)
-                try handle.synchronize()
+                do {
+                    originalSize = try handle.seekToEnd()
+                    writeStarted = true
+                    if originalSize > 0,
+                       !fileEndsWithNewline(fileURL) {
+                        // The separator is carried by the payload prefix. A
+                        // second write would leave an invalid blank JSONL
+                        // line between the old and new events.
+                        payload.insert(0x0A, at: payload.startIndex)
+                    }
+                    try handle.write(contentsOf: payload)
+                    try handle.synchronize()
+                    try handle.close()
+                } catch {
+                    try? handle.close()
+                    throw error
+                }
             } else {
+                writeStarted = true
                 try payload.write(to: fileURL, options: [.atomic])
             }
             try setFilePermissionsIfPresent()
+            try persistClockAnchor(at: observedAt)
         } catch {
+            if writeStarted {
+                rollbackFileWrite(
+                    existed: filePreviouslyExisted,
+                    originalSize: originalSize
+                )
+            }
             throw ProcessActionAuditStoreError.writeFailed
         }
     }
 
-    private func persist() throws {
+    private func persist(observedAt: Date? = nil) throws {
+        let fileManager = FileManager.default
+        let filePreviouslyExisted = fileManager.fileExists(atPath: fileURL.path)
+        let previousData = filePreviouslyExisted ? try? Data(contentsOf: fileURL) : nil
+        let previousClockData = try? Data(contentsOf: clockURL)
+        let anchorDate = observedAt ?? lastObservedNow ?? events.first?.timestamp
+        guard let anchorDate, isPersistableDate(anchorDate) else {
+            throw ProcessActionAuditStoreError.invalidData
+        }
         do {
             try prepareDirectory()
             let encoder = JSONEncoder()
@@ -3537,8 +6440,47 @@ public actor ProcessActionAuditStore {
             }
             try payload.write(to: fileURL, options: [.atomic])
             try setFilePermissionsIfPresent()
+            try persistClockAnchor(at: anchorDate)
         } catch {
+            // `Data.write(.atomic)` normally leaves the old file intact on
+            // failure, but permission changes can fail after replacement. A
+            // best-effort restore keeps a failed rewrite from exposing a
+            // half-applied event set to the next load.
+            if filePreviouslyExisted, let previousData {
+                try? previousData.write(to: fileURL, options: [.atomic])
+                try? setFilePermissionsIfPresent()
+            } else if !filePreviouslyExisted {
+                try? fileManager.removeItem(at: fileURL)
+            }
+            if let previousClockData {
+                try? previousClockData.write(to: clockURL, options: [.atomic])
+                try? FileManager.default.setAttributes(
+                    [.posixPermissions: 0o600],
+                    ofItemAtPath: clockURL.path
+                )
+            } else {
+                try? fileManager.removeItem(at: clockURL)
+            }
             throw ProcessActionAuditStoreError.writeFailed
+        }
+        dirty = false
+    }
+
+    private func rollbackFileWrite(existed: Bool, originalSize: UInt64) {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: fileURL.path) else { return }
+        if !existed {
+            try? fileManager.removeItem(at: fileURL)
+            return
+        }
+
+        guard let handle = try? FileHandle(forWritingTo: fileURL) else { return }
+        do {
+            try handle.truncate(atOffset: originalSize)
+            try handle.synchronize()
+            try handle.close()
+        } catch {
+            try? handle.close()
         }
     }
 
@@ -3559,23 +6501,76 @@ public actor ProcessActionAuditStore {
         )
     }
 
+    private func fileEndsWithNewline(_ url: URL) -> Bool {
+        guard let data = try? Data(contentsOf: url) else { return false }
+        guard !data.isEmpty else { return true }
+        return data.last == 0x0A
+    }
+
     private static func pruned(
         _ source: [ProcessActionAuditEvent],
         now: Date,
         retentionInterval: TimeInterval,
         limit: Int
     ) -> [ProcessActionAuditEvent] {
-        let cutoff = now.timeIntervalSince1970 - retentionInterval
+        guard isPersistableDate(now), retentionInterval.isFinite else { return [] }
+        let cutoff = now.timeIntervalSince1970
+            - min(max(retentionInterval, 0), maximumRetentionInterval)
+        guard cutoff.isFinite else { return [] }
         let retained = source
             .filter { event in
                 let timestamp = event.timestamp.timeIntervalSince1970
-                return timestamp.isFinite && timestamp >= cutoff
+                return timestamp.isFinite
+                    && timestamp >= cutoff
+                    && isWithinFutureSkew(
+                        event.timestamp,
+                        now: now,
+                        allowance: maximumFutureSkew
+                    )
             }
             .sorted {
                 if $0.timestamp != $1.timestamp { return $0.timestamp > $1.timestamp }
                 return $0.id < $1.id
             }
         return Array(retained.prefix(limit))
+    }
+
+    private static func deduplicated(
+        _ source: [ProcessActionAuditEvent]
+    ) -> [ProcessActionAuditEvent] {
+        var byID: [String: ProcessActionAuditEvent] = [:]
+        for event in source {
+            guard let existing = byID[event.id] else {
+                byID[event.id] = event
+                continue
+            }
+            if preferred(event, over: existing) {
+                byID[event.id] = event
+            }
+        }
+        return byID.values.sorted {
+            if $0.timestamp != $1.timestamp { return $0.timestamp > $1.timestamp }
+            return $0.id < $1.id
+        }
+    }
+
+    private static func preferred(
+        _ candidate: ProcessActionAuditEvent,
+        over existing: ProcessActionAuditEvent
+    ) -> Bool {
+        if candidate.timestamp != existing.timestamp {
+            return candidate.timestamp > existing.timestamp
+        }
+        if candidate.outcome != existing.outcome {
+            return candidate.outcome.rawValue < existing.outcome.rawValue
+        }
+        if candidate.action != existing.action {
+            return candidate.action.rawValue < existing.action.rawValue
+        }
+        if candidate.processLabel != existing.processLabel {
+            return candidate.processLabel < existing.processLabel
+        }
+        return candidate.detail < existing.detail
     }
 }
 
@@ -3602,8 +6597,17 @@ private func sysctlUInt64(named name: String) throws -> UInt64 {
     let result = name.withCString { sysctlName in
         sysctlbyname(sysctlName, &value, &size, nil, 0)
     }
+    let callError = Int32(Darwin.errno)
     guard result == 0 else {
-        throw MemoryMonitorError.systemCall(name: "sysctl(\(name))", code: result)
+        throw MemoryMonitorError.systemCall(name: "sysctl(\(name))", code: callError)
+    }
+    guard SystemMemorySampler.hasExpectedSysctlByteCount(
+        actual: size,
+        expected: MemoryLayout<UInt64>.size
+    ) else {
+        throw MemoryMonitorError.invalidData(
+            description: "sysctl(\(name)) 返回的数据大小异常"
+        )
     }
     return value
 }

@@ -6,7 +6,7 @@
 - 物理内存基线：16 GiB
 - 首版形态：菜单栏常驻 + 点击弹出详细面板
 - 首版范围（历史基线）：只监视、分析和给出建议，不执行进程退出或强制结束
-- 当前版本：v1.0.0，支持运行健康诊断、可选登录启动和只读操作审计总览
+- 当前版本：v1.0.1，支持运行健康诊断、可选登录启动、只读操作审计总览和可靠性加固
 - 文档状态：设计基线，可作为后续实现的验收依据
 
 ## 1. 产品定位
@@ -591,3 +591,13 @@ open "$HOME/Library/Application Support/MemoryMonitor/dist/MemoryMonitor.app"
 - `./scripts/build-app.sh`：成功生成 arm64 `MemoryMonitor.app`；`CFBundleShortVersionString=1.0.0`、`CFBundleVersion=10`，`codesign --verify --deep --strict` 通过，且已链接 `ServiceManagement.framework`。
 - Release probe：系统总内存 16.0 GiB，进程采样 481/728（部分进程受 macOS 权限限制），未归属 WebKit 归因总量约 13.6 GiB；受限状态按设计显示为部分可用。
 - 本机部署：`/Users/rongyi/Applications/MemoryMonitor.app` 以 `open -g` 启动并稳定运行；登录启动保持关闭，未修改真实登录项或系统设置。
+
+### Phase 10 completed：可靠性加固（v1.0.1）
+
+- 采样失败、空结果和低覆盖率结果不会清空最近一次可用的进程/工作组快照；诊断会保留失败原因并按策略重试。
+- 系统、进程、GPU、历史和审计数据增加有限值、时间戳、长度、控制字符及整数溢出校验，避免坏数据触发崩溃或污染建议。
+- 历史快照与 journal 分层恢复，损坏尾部可截断并继续读取；重复 workload 标识、重复时间戳和大规模聚合采用确定性处理。
+- 进程操作状态机增加取消、超时、token 和目标身份校验，过期异步任务不能覆盖新状态。
+- 设计与验证记录见 [`docs/reliability-hardening-v1.0.1.md`](docs/reliability-hardening-v1.0.1.md)。
+
+当前实现已通过核心与应用测试、Debug/Release 严格并发构建、Release probe 和 app bundle 签名验证；本阶段未自动提交或推送 Git 改动。

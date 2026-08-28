@@ -56,6 +56,58 @@ final class AppIntegrationTests: XCTestCase {
         XCTAssertEqual(coordinator.status, .notRegistered)
     }
 
+    func testLoginCoordinatorCancelsInFlightUpdateAndClearsBusyState() async {
+        let runtime = BlockingLoginLaunchRuntime()
+        let coordinator = LoginLaunchCoordinator(runtime: runtime)
+
+        coordinator.setEnabled(true)
+        await waitUntil { runtime.registerStarted }
+        XCTAssertTrue(coordinator.isUpdating)
+
+        coordinator.cancelUpdate()
+
+        XCTAssertFalse(coordinator.isUpdating)
+        XCTAssertEqual(coordinator.status, .notRegistered)
+        XCTAssertNil(coordinator.lastError)
+        await Task.yield()
+        XCTAssertFalse(coordinator.isUpdating)
+    }
+
+    func testLoginCoordinatorRefreshesStatusAfterCancelledOperationCompletesLate() async {
+        let runtime = LateCompletingLoginLaunchRuntime()
+        let coordinator = LoginLaunchCoordinator(runtime: runtime)
+
+        coordinator.setEnabled(true)
+        await waitUntil { runtime.registerStarted }
+        coordinator.cancelUpdate()
+        XCTAssertFalse(coordinator.isUpdating)
+        XCTAssertEqual(coordinator.status, .notRegistered)
+
+        // The underlying service completes despite cancellation. Its result
+        // must become visible, but must not be able to resurrect the busy flag.
+        runtime.completeRegister()
+        await waitUntil { coordinator.status == .enabled }
+        XCTAssertFalse(coordinator.isUpdating)
+        XCTAssertNil(coordinator.lastError)
+    }
+
+    func testLoginCoordinatorCanBeReleasedWhileRuntimeIsSuspended() async {
+        let runtime = BlockingLoginLaunchRuntime()
+        weak var weakCoordinator: LoginLaunchCoordinator?
+        var coordinator: LoginLaunchCoordinator? = LoginLaunchCoordinator(runtime: runtime)
+        weakCoordinator = coordinator
+
+        coordinator?.setEnabled(true)
+        await waitUntil { runtime.registerStarted }
+        coordinator = nil
+
+        for _ in 0..<2_000 {
+            if weakCoordinator == nil { break }
+            await Task.yield()
+        }
+        XCTAssertNil(weakCoordinator)
+    }
+
     func testHealthEvaluatorMarksPartialSourcesAsDegraded() {
         let input = makeHealthInput(
             gpuStatus: .unavailable(message: "系统未提供 GPU 利用率"),
@@ -121,6 +173,922 @@ final class AppIntegrationTests: XCTestCase {
         )
     }
 
+    func testHealthEvaluatorFlagsStaleRequiredSamples() {
+        let input = makeHealthInput(
+            now: Date(timeIntervalSince1970: 1_000)
+        )
+
+        let snapshot = MonitorHealthEvaluator.evaluate(input)
+
+        XCTAssertEqual(snapshot.overall, .attention)
+        XCTAssertEqual(
+            snapshot.items.first(where: { $0.id == "system" })?.status,
+            "已过期"
+        )
+        XCTAssertEqual(
+            snapshot.items.first(where: { $0.id == "processes" })?.level,
+            .attention
+        )
+        XCTAssertTrue(
+            snapshot.items.first(where: { $0.id == "processes" })?.detail.contains("距采样") == true
+        )
+        XCTAssertEqual(
+            snapshot.items.first(where: { $0.id == "cpu" })?.level,
+            .degraded
+        )
+    }
+
+    func testHealthEvaluatorRejectsFutureSampleTimestamp() {
+        let future = Date(timeIntervalSince1970: 200)
+        let input = makeHealthInput(
+            systemStatus: .available(at: future),
+            now: Date(timeIntervalSince1970: 100)
+        )
+
+        let snapshot = MonitorHealthEvaluator.evaluate(input)
+        let system = snapshot.items.first(where: { $0.id == "system" })
+
+        XCTAssertEqual(system?.status, "时间异常")
+        XCTAssertEqual(system?.level, .attention)
+        XCTAssertTrue(system?.detail.contains("晚于诊断时间") == true)
+    }
+
+    func testHealthEvaluatorRejectsUsableStatusWithoutSampleTimestamp() {
+        let input = makeHealthInput(
+            systemStatus: SampleStatus(quality: .available),
+            now: Date(timeIntervalSince1970: 100)
+        )
+
+        let snapshot = MonitorHealthEvaluator.evaluate(input)
+        let system = snapshot.items.first(where: { $0.id == "system" })
+
+        XCTAssertEqual(system?.status, "时间异常")
+        XCTAssertEqual(system?.level, .attention)
+    }
+
+    func testMonitorViewModelRetainsLastUsableProcessSnapshot() async throws {
+        let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let firstProcess = makeProcess(pid: 9001, name: "first")
+        let secondProcess = makeProcess(pid: 9002, name: "second")
+        let firstGroup = makeGroup(id: "first", title: "First", process: firstProcess)
+        let secondGroup = makeGroup(id: "second", title: "Second", process: secondProcess)
+        let source = FakeMonitorSamplingSource(snapshots: [
+            makeMonitorSnapshot(
+                timestamp: timestamp,
+                processes: [firstProcess],
+                groups: [firstGroup],
+                status: .available(at: timestamp),
+                listedCount: 1
+            ),
+            makeMonitorSnapshot(
+                timestamp: timestamp.addingTimeInterval(3),
+                processes: [],
+                groups: [],
+                status: .error("provider denied"),
+                listedCount: 0
+            ),
+            makeMonitorSnapshot(
+                timestamp: timestamp.addingTimeInterval(6),
+                processes: [secondProcess],
+                groups: [secondGroup],
+                status: .estimated(at: timestamp.addingTimeInterval(6)),
+                listedCount: 10
+            ),
+            makeMonitorSnapshot(
+                timestamp: timestamp.addingTimeInterval(9),
+                processes: [secondProcess],
+                groups: [secondGroup],
+                status: .estimated(at: timestamp.addingTimeInterval(9)),
+                listedCount: 2
+            )
+        ])
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: url),
+            startRefreshTask: false
+        )
+        model.setPanelPresented(true)
+
+        await model.refreshOnce(at: timestamp)
+        XCTAssertEqual(model.processes, [firstProcess])
+        XCTAssertEqual(model.groups, [firstGroup])
+
+        await model.refreshOnce(at: timestamp.addingTimeInterval(3))
+        XCTAssertEqual(model.processes, [firstProcess])
+        XCTAssertEqual(model.groups, [firstGroup])
+        XCTAssertEqual(model.processStatus.quality, .error)
+
+        await model.refreshOnce(at: timestamp.addingTimeInterval(6))
+        XCTAssertEqual(model.processes, [firstProcess])
+        XCTAssertEqual(model.groups, [firstGroup])
+
+        await model.refreshOnce(at: timestamp.addingTimeInterval(9))
+        XCTAssertEqual(model.processes, [secondProcess])
+        XCTAssertEqual(model.groups, [secondGroup])
+        XCTAssertEqual(source.requestedModes, [.panel, .panel, .panel, .panel])
+    }
+
+    func testMonitorViewModelPublishesLowCoverageCountsWithoutReplacingRows() async throws {
+        let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let process = makeProcess(pid: 9060, name: "partial")
+        let group = makeGroup(id: "partial", title: "Partial", process: process)
+        let source = FakeMonitorSamplingSource(snapshots: [
+            makeMonitorSnapshot(
+                timestamp: timestamp,
+                processes: [process],
+                groups: [group],
+                status: .available(at: timestamp),
+                listedCount: 1
+            ),
+            makeMonitorSnapshot(
+                timestamp: timestamp.addingTimeInterval(3),
+                processes: [process],
+                groups: [group],
+                status: .estimated(
+                    at: timestamp.addingTimeInterval(3),
+                    message: "多数条目在扫描期间退出"
+                ),
+                listedCount: 10
+            )
+        ])
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: url),
+            startRefreshTask: false
+        )
+        model.setPanelPresented(true)
+
+        await model.refreshOnce(at: timestamp)
+        await model.refreshOnce(at: timestamp.addingTimeInterval(3))
+
+        XCTAssertEqual(model.processes, [process])
+        XCTAssertEqual(model.groups, [group])
+        XCTAssertEqual(model.observedProcessCount, 1)
+        XCTAssertEqual(model.listedProcessCount, 10)
+        XCTAssertTrue(model.healthSnapshot.items
+            .first(where: { $0.id == "processes" })?.detail.contains("1/10") == true)
+    }
+
+    func testMonitorViewModelPublishesZeroCoverageWithoutReplacingRows() async throws {
+        let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let process = makeProcess(pid: 9061, name: "retained")
+        let group = makeGroup(id: "retained", title: "Retained", process: process)
+        let unavailableMessage = "已枚举 10 个进程，但没有获得可用快照"
+        let source = FakeMonitorSamplingSource(snapshots: [
+            makeMonitorSnapshot(
+                timestamp: timestamp,
+                processes: [process],
+                groups: [group],
+                status: .available(at: timestamp),
+                listedCount: 1
+            ),
+            makeMonitorSnapshot(
+                timestamp: timestamp.addingTimeInterval(3),
+                processes: [],
+                groups: [],
+                status: .unavailable(message: unavailableMessage),
+                listedCount: 10
+            )
+        ])
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: url),
+            startRefreshTask: false
+        )
+        model.setPanelPresented(true)
+
+        await model.refreshOnce(at: timestamp)
+        await model.refreshOnce(at: timestamp.addingTimeInterval(3))
+
+        XCTAssertEqual(model.processes, [process])
+        XCTAssertEqual(model.groups, [group])
+        XCTAssertEqual(model.observedProcessCount, 0)
+        XCTAssertEqual(model.listedProcessCount, 10)
+        XCTAssertEqual(model.processStatus.quality, .unavailable)
+        let processHealth = model.healthSnapshot.items.first { $0.id == "processes" }
+        XCTAssertEqual(processHealth?.status, "暂无新数据")
+        XCTAssertEqual(processHealth?.detail, unavailableMessage)
+    }
+
+    func testMonitorViewModelMergesFallbackHistoryAfterStoreRecovery() async throws {
+        let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let source = FakeMonitorSamplingSource(snapshots: [
+            makeMonitorSnapshot(
+                timestamp: timestamp,
+                processes: [],
+                groups: [],
+                status: .unavailable(message: "测试无进程数据"),
+                listedCount: 0
+            ),
+            makeMonitorSnapshot(
+                timestamp: timestamp.addingTimeInterval(60),
+                processes: [],
+                groups: [],
+                status: .unavailable(message: "测试无进程数据"),
+                listedCount: 0
+            ),
+            makeMonitorSnapshot(
+                timestamp: timestamp.addingTimeInterval(120),
+                processes: [],
+                groups: [],
+                status: .unavailable(message: "测试无进程数据"),
+                listedCount: 0
+            )
+        ])
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        // Make the initial read fail. Samples must remain visible in the
+        // ViewModel and be merged once the path becomes writable again.
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: url),
+            startRefreshTask: false
+        )
+
+        await model.refreshOnce(at: timestamp)
+        await model.refreshOnce(at: timestamp.addingTimeInterval(60))
+        XCTAssertEqual(model.history.count, 2)
+
+        try FileManager.default.removeItem(at: url)
+        await model.refreshOnce(at: timestamp.addingTimeInterval(120))
+
+        XCTAssertEqual(model.history.count, 3)
+        let persisted = try await HistoryStore(fileURL: url).load(
+            now: timestamp.addingTimeInterval(120)
+        )
+        XCTAssertEqual(persisted.count, 3)
+    }
+
+    func testMonitorViewModelRefreshTaskDoesNotRetainModelWhileWaiting() async throws {
+        let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let process = makeProcess(pid: 9050, name: "lifecycle")
+        let group = makeGroup(id: "lifecycle", title: "Lifecycle", process: process)
+        let source = FakeMonitorSamplingSource(snapshots: [
+            makeMonitorSnapshot(
+                timestamp: timestamp,
+                processes: [process],
+                groups: [group],
+                status: .available(at: timestamp),
+                listedCount: 1
+            )
+        ])
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        weak var weakModel: MonitorViewModel?
+        var model: MonitorViewModel? = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: url),
+            startRefreshTask: true
+        )
+        weakModel = model
+
+        // Ensure the task has entered a real refresh pass before releasing the
+        // only external strong reference. This makes the test catch a task
+        // that retains the model while sleeping between samples.
+        await waitUntil { source.requestedModes.count == 1 }
+        model = nil
+
+        for _ in 0..<2_000 {
+            if weakModel == nil { break }
+            await Task.yield()
+        }
+        XCTAssertNil(weakModel)
+    }
+
+    func testFailedProcessScanDoesNotDelayNextBackgroundRetry() async throws {
+        let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let process = makeProcess(pid: 9010, name: "worker")
+        let group = makeGroup(id: "worker", title: "Worker", process: process)
+        let source = FakeMonitorSamplingSource(snapshots: [
+            makeMonitorSnapshot(
+                timestamp: timestamp,
+                processes: [process],
+                groups: [group],
+                status: .available(at: timestamp),
+                listedCount: 1
+            ),
+            makeMonitorSnapshot(
+                timestamp: timestamp.addingTimeInterval(20),
+                processes: [],
+                groups: [],
+                status: .error("provider denied"),
+                listedCount: 0
+            ),
+            makeMonitorSnapshot(
+                timestamp: timestamp.addingTimeInterval(60),
+                processes: [process],
+                groups: [group],
+                status: .available(at: timestamp.addingTimeInterval(60)),
+                listedCount: 1
+            )
+        ])
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: url),
+            startRefreshTask: false
+        )
+
+        await model.refreshOnce(at: timestamp)
+        await model.refreshOnce(at: timestamp.addingTimeInterval(20))
+        await model.refreshOnce(at: timestamp.addingTimeInterval(60))
+
+        XCTAssertEqual(source.requestedModes, [.backgroundProcess, .background, .backgroundProcess])
+    }
+
+    func testMonitorViewModelUsesValidatedProcessTimestampForCadenceAndHistory() async throws {
+        let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let firstSampleAt = timestamp.addingTimeInterval(-30)
+        let secondTimestamp = timestamp.addingTimeInterval(40)
+        let secondSampleAt = secondTimestamp.addingTimeInterval(-2)
+        let process = makeProcess(pid: 9011, name: "timestamped-worker")
+        let group = makeGroup(id: "timestamped-worker", title: "Timestamped Worker", process: process)
+        let source = FakeMonitorSamplingSource(snapshots: [
+            makeMonitorSnapshot(
+                timestamp: timestamp,
+                processes: [process],
+                groups: [group],
+                status: .available(at: firstSampleAt),
+                listedCount: 1
+            ),
+            makeMonitorSnapshot(
+                timestamp: secondTimestamp,
+                processes: [process],
+                groups: [group],
+                status: .available(at: secondSampleAt),
+                listedCount: 1
+            )
+        ])
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: url),
+            startRefreshTask: false
+        )
+
+        await model.refreshOnce(at: timestamp)
+        await model.refreshOnce(at: secondTimestamp)
+
+        // The first process sample is already 30 seconds old. At the next
+        // pass (40 seconds later), the actual marker makes the 60-second
+        // background process interval due; using the enclosing pass timestamp
+        // would incorrectly skip this scan.
+        XCTAssertEqual(source.requestedModes, [.backgroundProcess, .backgroundProcess])
+        XCTAssertTrue(model.history.contains { $0.workloadsSampledAt == firstSampleAt })
+        XCTAssertTrue(model.history.contains { $0.workloadsSampledAt == secondSampleAt })
+    }
+
+    func testMonitorViewModelCoalescesConcurrentRefreshesToLatestRequest() async throws {
+        let base = Date(timeIntervalSince1970: 1_700_100_000)
+        let firstProcess = makeProcess(pid: 9020, name: "first")
+        let latestProcess = makeProcess(pid: 9021, name: "latest")
+        let first = makeMonitorSnapshot(
+            timestamp: base,
+            processes: [firstProcess],
+            groups: [makeGroup(id: "first", title: "First", process: firstProcess)],
+            status: .available(at: base),
+            listedCount: 1
+        )
+        let latestTimestamp = base.addingTimeInterval(120)
+        let latest = makeMonitorSnapshot(
+            timestamp: latestTimestamp,
+            processes: [latestProcess],
+            groups: [makeGroup(id: "latest", title: "Latest", process: latestProcess)],
+            status: .available(at: latestTimestamp),
+            listedCount: 1
+        )
+        let source = BlockingMonitorSamplingSource(snapshots: [first, latest])
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: url),
+            startRefreshTask: false
+        )
+        model.setPanelPresented(true)
+
+        let firstTask = Task { await model.refreshOnce(at: base) }
+        await waitUntil { source.requestedTimestamps.count == 1 }
+
+        // Both requests arrive while the first provider call is suspended.
+        // The middle timestamp is intentionally superseded by the latest one.
+        let middleTask = Task {
+            await model.refreshOnce(at: base.addingTimeInterval(60))
+        }
+        let latestTask = Task { await model.refreshOnce(at: latestTimestamp) }
+        for _ in 0..<20 { await Task.yield() }
+        source.releaseFirst()
+
+        await firstTask.value
+        await middleTask.value
+        await latestTask.value
+
+        XCTAssertEqual(source.requestedTimestamps, [base, latestTimestamp])
+        XCTAssertEqual(model.processes, [latestProcess])
+        XCTAssertEqual(model.updatedAt, latestTimestamp)
+    }
+
+    func testMonitorViewModelRejectsLateSnapshotWithoutCorruptingBaselines() async throws {
+        let firstTimestamp = Date(timeIntervalSince1970: 1_700_110_000)
+        // This result is older than the pass already accepted, even though it
+        // is returned for a newer request. A provider may legitimately return
+        // a slightly cached value, so the rejection contract is based on the
+        // accepted snapshot timeline rather than the request wall clock.
+        let lateTimestamp = firstTimestamp.addingTimeInterval(-30)
+        let secondTimestamp = firstTimestamp.addingTimeInterval(60)
+        let firstProcess = makeProcess(pid: 9030, name: "first")
+        let lateProcess = makeProcess(pid: 9031, name: "late")
+        let secondProcess = makeProcess(pid: 9032, name: "second")
+
+        let first = makeMonitorSnapshot(
+            timestamp: firstTimestamp,
+            processes: [firstProcess],
+            groups: [makeGroup(id: "first", title: "First", process: firstProcess)],
+            status: .available(at: firstTimestamp),
+            listedCount: 1,
+            cpuTime: CPUTimeSnapshot(userTicks: 100, systemTicks: 0, idleTicks: 100, niceTicks: 0)
+        )
+        let late = makeMonitorSnapshot(
+            timestamp: lateTimestamp,
+            processes: [lateProcess],
+            groups: [makeGroup(id: "late", title: "Late", process: lateProcess)],
+            status: .available(at: lateTimestamp),
+            listedCount: 1,
+            cpuTime: CPUTimeSnapshot(userTicks: 10_000, systemTicks: 0, idleTicks: 0, niceTicks: 0)
+        )
+        let finalTimestamp = firstTimestamp.addingTimeInterval(120)
+        let second = makeMonitorSnapshot(
+            timestamp: finalTimestamp,
+            processes: [secondProcess],
+            groups: [makeGroup(id: "second", title: "Second", process: secondProcess)],
+            status: .available(at: secondTimestamp),
+            listedCount: 1,
+            cpuTime: CPUTimeSnapshot(userTicks: 200, systemTicks: 0, idleTicks: 200, niceTicks: 0)
+        )
+        let source = TimestampedMonitorSamplingSource(snapshots: [
+            firstTimestamp: first,
+            secondTimestamp: late,
+            firstTimestamp.addingTimeInterval(120): second
+        ])
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: url),
+            startRefreshTask: false
+        )
+        model.setPanelPresented(true)
+
+        await model.refreshOnce(at: firstTimestamp)
+        // The provider deliberately returns a pass older than the one already
+        // accepted for this newer request. It must not replace visible rows or
+        // the CPU baseline.
+        await model.refreshOnce(at: secondTimestamp)
+        XCTAssertEqual(model.updatedAt, firstTimestamp)
+        XCTAssertEqual(model.processes, [firstProcess])
+
+        await model.refreshOnce(at: finalTimestamp)
+        XCTAssertEqual(model.updatedAt, finalTimestamp)
+        XCTAssertEqual(model.processes, [secondProcess])
+        XCTAssertEqual(try XCTUnwrap(model.cpuUsageFraction), 0.5, accuracy: 0.000_1)
+    }
+
+    func testMonitorViewModelChoosesNewestTimestampWhenQueuedRequestsArriveOutOfOrder() async throws {
+        let base = Date(timeIntervalSince1970: 1_700_120_000)
+        let newerTimestamp = base.addingTimeInterval(120)
+        let olderTimestamp = base.addingTimeInterval(60)
+        let firstProcess = makeProcess(pid: 9040, name: "first")
+        let newestProcess = makeProcess(pid: 9041, name: "newest")
+        let source = BlockingMonitorSamplingSource(snapshots: [
+            makeMonitorSnapshot(
+                timestamp: base,
+                processes: [firstProcess],
+                groups: [makeGroup(id: "first", title: "First", process: firstProcess)],
+                status: .available(at: base),
+                listedCount: 1
+            ),
+            makeMonitorSnapshot(
+                timestamp: newerTimestamp,
+                processes: [newestProcess],
+                groups: [makeGroup(id: "newest", title: "Newest", process: newestProcess)],
+                status: .available(at: newerTimestamp),
+                listedCount: 1
+            )
+        ])
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: url),
+            startRefreshTask: false
+        )
+        model.setPanelPresented(true)
+
+        let firstTask = Task { await model.refreshOnce(at: base) }
+        await waitUntil { source.requestedTimestamps.count == 1 }
+        // Deliberately submit the newer point first, then an older point.
+        let newerTask = Task { await model.refreshOnce(at: newerTimestamp) }
+        let olderTask = Task { await model.refreshOnce(at: olderTimestamp) }
+        source.releaseFirst()
+
+        await firstTask.value
+        await newerTask.value
+        await olderTask.value
+
+        XCTAssertEqual(source.requestedTimestamps, [base, newerTimestamp])
+        XCTAssertEqual(model.updatedAt, newerTimestamp)
+        XCTAssertEqual(model.processes, [newestProcess])
+    }
+
+    func testMonitorViewModelHealthCheckTimestampWaitsForSampling() async throws {
+        let timestamp = Date(timeIntervalSince1970: 1_700_200_000)
+        let process = makeProcess(pid: 9022, name: "health")
+        let source = BlockingMonitorSamplingSource(
+            snapshots: [makeMonitorSnapshot(
+                timestamp: timestamp,
+                processes: [process],
+                groups: [makeGroup(id: "health", title: "Health", process: process)],
+                status: .available(at: timestamp),
+                listedCount: 1
+            )]
+        )
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: url),
+            startRefreshTask: false
+        )
+        let before = model.healthCheckedAt
+
+        model.refreshHealth()
+        await waitUntil { source.requestedTimestamps.count == 1 }
+        XCTAssertEqual(model.healthCheckedAt, before)
+
+        source.releaseFirst()
+        await waitUntil { model.healthCheckedAt > before }
+    }
+
+    func testMonitorViewModelKeepsRecommendationAndPairedBaselineWhenSystemSampleFails() async throws {
+        let base = Date(timeIntervalSince1970: 1_700_300_000)
+        let process = makeProcess(pid: 9023, name: "memory-worker", footprint: 200_000_000)
+        let group = makeGroup(
+            id: "memory-worker",
+            title: "Memory Worker",
+            process: process,
+            footprint: 200_000_000
+        )
+        let criticalSystem = SystemMemorySnapshot(
+            timestamp: base,
+            totalBytes: 1_000_000_000,
+            pageSize: 1,
+            freeBytes: 1,
+            activeBytes: 700_000_000,
+            inactiveBytes: 0,
+            speculativeBytes: 0,
+            wiredBytes: 200_000_000,
+            purgeableBytes: 10_000_000,
+            compressedBytes: 100,
+            throttledPages: 0,
+            swapTotalBytes: 2_000_000_000,
+            swapUsedBytes: 0,
+            swapFreeBytes: 2_000_000_000
+        )
+        let valid = MonitorSnapshot(
+            timestamp: base,
+            system: criticalSystem,
+            systemStatus: .available(at: base),
+            cpuTime: nil,
+            cpuStatus: .unavailable(),
+            gpuUsageFraction: nil,
+            gpuStatus: .unavailable(),
+            processes: [process],
+            processStatus: .available(at: base),
+            listedProcessCount: 1,
+            sampledProcessCount: 1,
+            groups: [group],
+            samplingMode: .panel,
+            diagnostics: SamplingDiagnostics(
+                mode: .panel,
+                totalDurationMilliseconds: 1,
+                processDurationMilliseconds: 1,
+                processSamplingPerformed: true,
+                processCount: 1,
+                listedProcessCount: 1
+            )
+        )
+        let invalidSystem = MonitorSnapshot(
+            timestamp: base.addingTimeInterval(3),
+            // The non-positive total makes this system value unusable while
+            // the process result remains a valid, fresh sample.
+            system: SystemMemorySnapshot(
+                timestamp: base.addingTimeInterval(3),
+                totalBytes: 0,
+                pageSize: 1,
+                freeBytes: 0,
+                activeBytes: 0,
+                inactiveBytes: 0,
+                speculativeBytes: 0,
+                wiredBytes: 0,
+                purgeableBytes: 0,
+                compressedBytes: 0,
+                throttledPages: 0,
+                swapTotalBytes: 0,
+                swapUsedBytes: 0,
+                swapFreeBytes: 0
+            ),
+            systemStatus: .available(at: base.addingTimeInterval(3)),
+            cpuTime: nil,
+            cpuStatus: .unavailable(),
+            gpuUsageFraction: nil,
+            gpuStatus: .unavailable(),
+            processes: [process],
+            processStatus: .available(at: base.addingTimeInterval(3)),
+            listedProcessCount: 1,
+            sampledProcessCount: 1,
+            groups: [group],
+            samplingMode: .panel,
+            diagnostics: valid.diagnostics
+        )
+        let source = FakeMonitorSamplingSource(snapshots: [valid, invalidSystem])
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: url),
+            startRefreshTask: false
+        )
+        model.setPanelPresented(true)
+
+        await model.refreshOnce(at: base)
+        let recommendationBefore = try XCTUnwrap(model.recommendation)
+        await model.refreshOnce(at: base.addingTimeInterval(3))
+
+        XCTAssertEqual(model.recommendation, recommendationBefore)
+        XCTAssertFalse(model.systemDataIsUsable)
+        XCTAssertEqual(model.processes, [process])
+    }
+
+    func testMonitorViewModelStartsNewClockEpochAndRejectsOlderInFlightPass() async throws {
+        let base = Date(timeIntervalSince1970: 1_700_400_000)
+        let preRollback = base.addingTimeInterval(60)
+        let afterRollback = base.addingTimeInterval(-3_600)
+        let initialProcess = makeProcess(pid: 9050, name: "initial")
+        let staleProcess = makeProcess(pid: 9051, name: "stale")
+        let recoveredProcess = makeProcess(pid: 9052, name: "recovered")
+        let source = SecondPassBlockingMonitorSamplingSource(snapshots: [
+            makeMonitorSnapshot(
+                timestamp: base,
+                processes: [initialProcess],
+                groups: [makeGroup(id: "initial", title: "Initial", process: initialProcess)],
+                status: .available(at: base),
+                listedCount: 1,
+                cpuTime: CPUTimeSnapshot(userTicks: 100, systemTicks: 0, idleTicks: 100, niceTicks: 0)
+            ),
+            makeMonitorSnapshot(
+                timestamp: preRollback,
+                processes: [staleProcess],
+                groups: [makeGroup(id: "stale", title: "Stale", process: staleProcess)],
+                status: .available(at: preRollback),
+                listedCount: 1,
+                cpuTime: CPUTimeSnapshot(userTicks: 200, systemTicks: 0, idleTicks: 200, niceTicks: 0)
+            ),
+            makeMonitorSnapshot(
+                timestamp: afterRollback,
+                processes: [recoveredProcess],
+                groups: [makeGroup(id: "recovered", title: "Recovered", process: recoveredProcess)],
+                status: .available(at: afterRollback),
+                listedCount: 1,
+                cpuTime: CPUTimeSnapshot(userTicks: 300, systemTicks: 0, idleTicks: 300, niceTicks: 0)
+            )
+        ])
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: url),
+            startRefreshTask: false
+        )
+        model.setPanelPresented(true)
+
+        await model.refreshOnce(at: base)
+        let staleTask = Task { await model.refreshOnce(at: preRollback) }
+        await waitUntil { source.requestedTimestamps.count == 2 }
+        let recoveredTask = Task { await model.refreshOnce(at: afterRollback) }
+        for _ in 0..<20 { await Task.yield() }
+        source.releaseSecond()
+
+        await staleTask.value
+        await recoveredTask.value
+
+        XCTAssertEqual(source.requestedTimestamps, [base, preRollback, afterRollback])
+        XCTAssertEqual(model.updatedAt, afterRollback)
+        XCTAssertEqual(model.processes, [recoveredProcess])
+        XCTAssertNil(model.cpuUsageFraction)
+    }
+
+    func testMonitorViewModelUpdatesSameIDRecommendationWhenEvidenceEscalates() async throws {
+        let base = Date(timeIntervalSince1970: 1_700_500_000)
+        let secondTimestamp = base.addingTimeInterval(60)
+        let thirdTimestamp = base.addingTimeInterval(120)
+        let firstProcess = makeProcess(pid: 9060, name: "node", footprint: 100 * 1024 * 1024)
+        let secondProcess = makeProcess(pid: 9060, name: "node", footprint: 200 * 1024 * 1024)
+        let thirdProcess = makeProcess(pid: 9060, name: "node", footprint: 300 * 1024 * 1024)
+        let snapshots = [
+            makeMonitorSnapshot(
+                timestamp: base,
+                processes: [firstProcess],
+                groups: [makeGroup(id: "runtime-node-api", title: "Node · api", process: firstProcess)],
+                status: .available(at: base),
+                listedCount: 1
+            ),
+            makeMonitorSnapshot(
+                timestamp: secondTimestamp,
+                processes: [secondProcess],
+                groups: [makeGroup(id: "runtime-node-api", title: "Node · api", process: secondProcess)],
+                status: .available(at: secondTimestamp),
+                listedCount: 1
+            ),
+            makeMonitorSnapshot(
+                timestamp: thirdTimestamp,
+                processes: [thirdProcess],
+                groups: [makeGroup(id: "runtime-node-api", title: "Node · api", process: thirdProcess)],
+                status: .available(at: thirdTimestamp),
+                listedCount: 1,
+                systemOverride: makeSystemSnapshot(
+                    timestamp: thirdTimestamp,
+                    swapUsedBytes: 128 * 1024 * 1024
+                )
+            )
+        ]
+        let source = FakeMonitorSamplingSource(snapshots: snapshots)
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: url),
+            startRefreshTask: false
+        )
+        model.setPanelPresented(true)
+
+        await model.refreshOnce(at: base)
+        await model.refreshOnce(at: secondTimestamp)
+        XCTAssertEqual(model.recommendation?.severity, .info)
+        let previousGeneratedAt = model.recommendation?.generatedAt
+
+        await model.refreshOnce(at: thirdTimestamp)
+
+        XCTAssertEqual(model.recommendation?.id, "growth-runtime-node-api")
+        XCTAssertEqual(model.recommendation?.severity, .attention)
+        XCTAssertEqual(model.recommendation?.generatedAt, thirdTimestamp)
+        XCTAssertNotEqual(model.recommendation?.generatedAt, previousGeneratedAt)
+        XCTAssertTrue(model.recommendation?.evidence.contains {
+            $0.label == "Swap 增量"
+        } == true)
+    }
+
+    func testMonitorViewModelAdvancesProcessBaselineWhenSystemSampleFails() async throws {
+        let base = Date(timeIntervalSince1970: 1_700_600_000)
+        let secondTimestamp = base.addingTimeInterval(60)
+        let thirdTimestamp = base.addingTimeInterval(120)
+        let firstProcess = makeProcess(pid: 9070, name: "worker", footprint: 100 * 1024 * 1024)
+        let secondProcess = makeProcess(pid: 9070, name: "worker", footprint: 200 * 1024 * 1024)
+        let thirdProcess = makeProcess(pid: 9070, name: "worker", footprint: 205 * 1024 * 1024)
+        let invalidSystem = SystemMemorySnapshot(
+            timestamp: secondTimestamp,
+            totalBytes: 0,
+            pageSize: 1,
+            freeBytes: 0,
+            activeBytes: 0,
+            inactiveBytes: 0,
+            speculativeBytes: 0,
+            wiredBytes: 0,
+            purgeableBytes: 0,
+            compressedBytes: 0,
+            throttledPages: 0,
+            swapTotalBytes: 0,
+            swapUsedBytes: 0,
+            swapFreeBytes: 0
+        )
+        let source = FakeMonitorSamplingSource(snapshots: [
+            makeMonitorSnapshot(
+                timestamp: base,
+                processes: [firstProcess],
+                groups: [makeGroup(id: "worker", title: "Worker", process: firstProcess)],
+                status: .available(at: base),
+                listedCount: 1
+            ),
+            makeMonitorSnapshot(
+                timestamp: secondTimestamp,
+                processes: [secondProcess],
+                groups: [makeGroup(id: "worker", title: "Worker", process: secondProcess)],
+                status: .available(at: secondTimestamp),
+                listedCount: 1,
+                systemOverride: invalidSystem
+            ),
+            makeMonitorSnapshot(
+                timestamp: thirdTimestamp,
+                processes: [thirdProcess],
+                groups: [makeGroup(id: "worker", title: "Worker", process: thirdProcess)],
+                status: .available(at: thirdTimestamp),
+                listedCount: 1
+            )
+        ])
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: url),
+            startRefreshTask: false
+        )
+        model.setPanelPresented(true)
+
+        await model.refreshOnce(at: base)
+        await model.refreshOnce(at: secondTimestamp)
+        XCTAssertEqual(model.recommendation?.id, "growth-worker")
+
+        await model.refreshOnce(at: thirdTimestamp)
+
+        XCTAssertNil(model.recommendation)
+        XCTAssertEqual(model.processes, [thirdProcess])
+    }
+
+    func testMonitorViewModelRecoveryUsesSystemPairedWithStablePressure() async throws {
+        let base = Date(timeIntervalSince1970: 1_700_700_000)
+        let pendingTimestamp = base.addingTimeInterval(10)
+        let recoveredTimestamp = base.addingTimeInterval(40)
+        let critical = makePressureSystemSnapshot(
+            timestamp: base,
+            availableFraction: 0.05,
+            swapUsedBytes: 5 * 1024 * 1024 * 1024
+        )
+        let pending = makePressureSystemSnapshot(
+            timestamp: pendingTimestamp,
+            availableFraction: 0.30,
+            swapUsedBytes: 4 * 1024 * 1024 * 1024
+        )
+        let recovered = makePressureSystemSnapshot(
+            timestamp: recoveredTimestamp,
+            availableFraction: 0.30,
+            swapUsedBytes: 4 * 1024 * 1024 * 1024
+        )
+        let source = FakeMonitorSamplingSource(snapshots: [
+            makeMonitorSnapshot(
+                timestamp: base,
+                processes: [],
+                groups: [],
+                status: .unavailable(),
+                listedCount: 0,
+                systemOverride: critical,
+                didSampleProcesses: false
+            ),
+            makeMonitorSnapshot(
+                timestamp: pendingTimestamp,
+                processes: [],
+                groups: [],
+                status: .unavailable(),
+                listedCount: 0,
+                systemOverride: pending,
+                didSampleProcesses: false
+            ),
+            makeMonitorSnapshot(
+                timestamp: recoveredTimestamp,
+                processes: [],
+                groups: [],
+                status: .unavailable(),
+                listedCount: 0,
+                systemOverride: recovered,
+                didSampleProcesses: false
+            )
+        ])
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: url),
+            startRefreshTask: false
+        )
+
+        await model.refreshOnce(at: base)
+        XCTAssertEqual(model.pressureLevel, .critical)
+        await model.refreshOnce(at: pendingTimestamp)
+        XCTAssertEqual(model.pressureLevel, .critical)
+        await model.refreshOnce(at: recoveredTimestamp)
+
+        XCTAssertEqual(model.pressureLevel, .normal)
+        XCTAssertEqual(model.recommendation?.id, "recovery-swap")
+    }
+
     func testAuditFilteringSearchesSanitizedFieldsAndSortsNewestFirst() {
         let now = Date(timeIntervalSince1970: 2_000)
         let completed = ProcessActionAuditEvent(
@@ -170,7 +1138,8 @@ final class AppIntegrationTests: XCTestCase {
         auditError: String? = nil,
         loginStatus: LoginLaunchStatus = .notRegistered,
         samplingDurationMilliseconds: Double = 90,
-        processDurationMilliseconds: Double? = 80
+        processDurationMilliseconds: Double? = 80,
+        now: Date? = nil
     ) -> MonitorHealthInput {
         MonitorHealthInput(
             systemStatus: systemStatus,
@@ -200,7 +1169,8 @@ final class AppIntegrationTests: XCTestCase {
             auditError: auditError,
             loginStatus: loginStatus,
             loginError: nil,
-            checkedAt: Date(timeIntervalSince1970: 100)
+            checkedAt: Date(timeIntervalSince1970: 100),
+            now: now
         )
     }
 
@@ -214,6 +1184,236 @@ final class AppIntegrationTests: XCTestCase {
             await Task.yield()
         }
         XCTFail("condition was not reached", file: file, line: line)
+    }
+
+    private func makeTemporaryHistoryURL() -> (url: URL, directory: URL) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MemoryMonitorViewModel-" + UUID().uuidString, isDirectory: true)
+        return (directory.appendingPathComponent("history.json"), directory)
+    }
+
+    private func makeSystemSnapshot(
+        timestamp: Date,
+        swapUsedBytes: UInt64 = 0
+    ) -> SystemMemorySnapshot {
+        let swapTotalBytes: UInt64 = 2_000_000_000
+        return SystemMemorySnapshot(
+            timestamp: timestamp,
+            totalBytes: 1_000,
+            pageSize: 1,
+            freeBytes: 300,
+            activeBytes: 400,
+            inactiveBytes: 100,
+            speculativeBytes: 0,
+            wiredBytes: 100,
+            purgeableBytes: 100,
+            compressedBytes: 0,
+            throttledPages: 0,
+            swapTotalBytes: swapTotalBytes,
+            swapUsedBytes: min(swapUsedBytes, swapTotalBytes),
+            swapFreeBytes: swapTotalBytes - min(swapUsedBytes, swapTotalBytes)
+        )
+    }
+
+    private func makePressureSystemSnapshot(
+        timestamp: Date,
+        availableFraction: Double,
+        swapUsedBytes: UInt64
+    ) -> SystemMemorySnapshot {
+        let totalBytes: UInt64 = 16 * 1024 * 1024 * 1024
+        let swapTotalBytes: UInt64 = 8 * 1024 * 1024 * 1024
+        let freeBytes = UInt64(Double(totalBytes) * availableFraction)
+        let normalizedSwapUsed = min(swapUsedBytes, swapTotalBytes)
+        return SystemMemorySnapshot(
+            timestamp: timestamp,
+            totalBytes: totalBytes,
+            pageSize: 4096,
+            freeBytes: freeBytes,
+            activeBytes: totalBytes - freeBytes,
+            inactiveBytes: 0,
+            speculativeBytes: 0,
+            wiredBytes: 0,
+            purgeableBytes: 0,
+            compressedBytes: 0,
+            throttledPages: 0,
+            swapTotalBytes: swapTotalBytes,
+            swapUsedBytes: normalizedSwapUsed,
+            swapFreeBytes: swapTotalBytes - normalizedSwapUsed
+        )
+    }
+
+    private func makeProcess(
+        pid: Int32,
+        name: String,
+        footprint: UInt64 = 200
+    ) -> ProcessSnapshot {
+        ProcessSnapshot(
+            identity: ProcessIdentity(pid: pid, startTimeSeconds: 1, startTimeMicroseconds: UInt64(pid)),
+            parentPID: 1,
+            userID: 501,
+            isSystem: false,
+            name: name,
+            executablePath: "/Users/test/bin/" + name,
+            residentBytes: min(footprint, 100),
+            physicalFootprintBytes: footprint,
+            virtualBytes: 300,
+            userTimeNanos: 0,
+            systemTimeNanos: 0,
+            threadCount: 1
+        )
+    }
+
+    private func makeGroup(
+        id: String,
+        title: String,
+        process: ProcessSnapshot,
+        footprint: UInt64? = nil
+    ) -> WorkloadGroupSnapshot {
+        WorkloadGroupSnapshot(
+            id: id,
+            title: title,
+            processCount: 1,
+            physicalFootprintBytes: footprint ?? process.physicalFootprintBytes,
+            residentBytes: process.residentBytes,
+            isSystem: false,
+            representativeProcess: process.name,
+            memberProcessIdentities: [process.identity]
+        )
+    }
+
+    private func makeMonitorSnapshot(
+        timestamp: Date,
+        processes: [ProcessSnapshot],
+        groups: [WorkloadGroupSnapshot],
+        status: SampleStatus,
+        listedCount: Int,
+        cpuTime: CPUTimeSnapshot? = nil,
+        systemOverride: SystemMemorySnapshot? = nil,
+        didSampleProcesses: Bool = true
+    ) -> MonitorSnapshot {
+        let system = systemOverride ?? makeSystemSnapshot(timestamp: timestamp)
+        return MonitorSnapshot(
+            timestamp: timestamp,
+            system: system,
+            systemStatus: .estimated(at: system.timestamp),
+            cpuTime: cpuTime,
+            cpuStatus: cpuTime.map { _ in .available(at: timestamp) } ?? .unavailable(),
+            gpuUsageFraction: nil,
+            gpuStatus: .unavailable(),
+            processes: processes,
+            processStatus: status,
+            listedProcessCount: listedCount,
+            sampledProcessCount: processes.count,
+            groups: groups,
+            samplingMode: didSampleProcesses ? .panel : .background,
+            diagnostics: SamplingDiagnostics(
+                mode: didSampleProcesses ? .panel : .background,
+                totalDurationMilliseconds: 1,
+                processDurationMilliseconds: didSampleProcesses ? 1 : nil,
+                processSamplingPerformed: didSampleProcesses,
+                processCount: processes.count,
+                listedProcessCount: listedCount
+            )
+        )
+    }
+}
+
+@MainActor
+private final class TimestampedMonitorSamplingSource: MonitorSamplingSource {
+    private let snapshots: [Date: MonitorSnapshot]
+
+    init(snapshots: [Date: MonitorSnapshot]) {
+        self.snapshots = snapshots
+    }
+
+    func sample(mode: SamplingMode, at timestamp: Date) async -> MonitorSnapshot {
+        snapshots[timestamp] ?? MonitorSnapshot(
+            timestamp: timestamp,
+            system: nil,
+            systemStatus: .error("missing test snapshot"),
+            cpuTime: nil,
+            cpuStatus: .unavailable(),
+            gpuUsageFraction: nil,
+            gpuStatus: .unavailable(),
+            processes: [],
+            processStatus: .error("missing test snapshot"),
+            listedProcessCount: 0,
+            sampledProcessCount: 0,
+            groups: [],
+            samplingMode: mode
+        )
+    }
+}
+
+@MainActor
+private final class FakeMonitorSamplingSource: MonitorSamplingSource {
+    private var snapshots: [MonitorSnapshot]
+    private(set) var requestedModes: [SamplingMode] = []
+
+    init(snapshots: [MonitorSnapshot]) {
+        self.snapshots = snapshots
+    }
+
+    func sample(mode: SamplingMode, at timestamp: Date) async -> MonitorSnapshot {
+        requestedModes.append(mode)
+        if snapshots.count > 1 {
+            return snapshots.removeFirst()
+        }
+        return snapshots[0]
+    }
+}
+
+@MainActor
+private final class BlockingMonitorSamplingSource: MonitorSamplingSource {
+    private var snapshots: [MonitorSnapshot]
+    private var firstRelease: CheckedContinuation<Void, Never>?
+    private(set) var requestedTimestamps: [Date] = []
+
+    init(snapshots: [MonitorSnapshot]) {
+        self.snapshots = snapshots
+    }
+
+    func sample(mode: SamplingMode, at timestamp: Date) async -> MonitorSnapshot {
+        let index = requestedTimestamps.count
+        requestedTimestamps.append(timestamp)
+        if index == 0 {
+            await withCheckedContinuation { continuation in
+                firstRelease = continuation
+            }
+        }
+        return snapshots[min(index, snapshots.count - 1)]
+    }
+
+    func releaseFirst() {
+        firstRelease?.resume()
+        firstRelease = nil
+    }
+}
+
+@MainActor
+private final class SecondPassBlockingMonitorSamplingSource: MonitorSamplingSource {
+    private let snapshots: [MonitorSnapshot]
+    private var secondRelease: CheckedContinuation<Void, Never>?
+    private(set) var requestedTimestamps: [Date] = []
+
+    init(snapshots: [MonitorSnapshot]) {
+        self.snapshots = snapshots
+    }
+
+    func sample(mode: SamplingMode, at timestamp: Date) async -> MonitorSnapshot {
+        let index = requestedTimestamps.count
+        requestedTimestamps.append(timestamp)
+        if index == 1 {
+            await withCheckedContinuation { continuation in
+                secondRelease = continuation
+            }
+        }
+        return snapshots[min(index, snapshots.count - 1)]
+    }
+
+    func releaseSecond() {
+        secondRelease?.resume()
+        secondRelease = nil
     }
 }
 
@@ -239,6 +1439,55 @@ private final class FakeLoginLaunchRuntime: LoginLaunchRuntime {
         if let unregisterError { throw unregisterError }
         statusValue = .notRegistered
         await Task.yield()
+    }
+
+    func openSystemSettings() {}
+}
+
+@MainActor
+private final class BlockingLoginLaunchRuntime: LoginLaunchRuntime {
+    var statusValue: LoginLaunchStatus = .notRegistered
+    private(set) var registerStarted = false
+
+    func status() -> LoginLaunchStatus { statusValue }
+
+    func register() async throws {
+        registerStarted = true
+        try await Task.sleep(for: .seconds(3_600))
+        statusValue = .enabled
+    }
+
+    func unregister() async throws {
+        try await Task.sleep(for: .seconds(3_600))
+        statusValue = .notRegistered
+    }
+
+    func openSystemSettings() {}
+}
+
+@MainActor
+private final class LateCompletingLoginLaunchRuntime: LoginLaunchRuntime {
+    var statusValue: LoginLaunchStatus = .notRegistered
+    private(set) var registerStarted = false
+    private var registerContinuation: CheckedContinuation<Void, Never>?
+
+    func status() -> LoginLaunchStatus { statusValue }
+
+    func register() async throws {
+        registerStarted = true
+        await withCheckedContinuation { continuation in
+            registerContinuation = continuation
+        }
+        statusValue = .enabled
+    }
+
+    func unregister() async throws {
+        statusValue = .notRegistered
+    }
+
+    func completeRegister() {
+        registerContinuation?.resume()
+        registerContinuation = nil
     }
 
     func openSystemSettings() {}

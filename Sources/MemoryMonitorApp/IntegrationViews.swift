@@ -4,10 +4,17 @@ import SwiftUI
 
 struct MonitorHealthPanel: View {
     @ObservedObject var model: MonitorViewModel
+    @ObservedObject var processActions: ProcessActionController
     @ObservedObject var loginLaunch: LoginLaunchCoordinator
     @Environment(\.dismiss) private var dismiss
 
-    private var snapshot: MonitorHealthSnapshot { model.healthSnapshot }
+    private var snapshot: MonitorHealthSnapshot {
+        // The audit controller is independent from the sampling model. Touch
+        // its published error while deriving the snapshot so this panel
+        // refreshes immediately after an audit write failure or recovery.
+        _ = processActions.auditError
+        return model.healthSnapshot
+    }
 
     var body: some View {
         ScrollView {
@@ -304,8 +311,17 @@ private func auditOutcomeColor(_ outcome: ProcessActionOutcome) -> Color {
 }
 
 private func openPrivacySettings() {
-    guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") else {
-        return
+    // The preference pane identifier changed in macOS 13. Try the modern
+    // Privacy & Security route first, then retain the legacy URL for older
+    // systems. `open` reports whether Launch Services accepted the URL, so a
+    // failed modern route does not prevent the fallback from being tried.
+    let candidates = [
+        "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles",
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles",
+        "x-apple.systempreferences:com.apple.settings.PrivacySecurity"
+    ].compactMap(URL.init(string:))
+
+    for url in candidates where NSWorkspace.shared.open(url) {
+        break
     }
-    NSWorkspace.shared.open(url)
 }

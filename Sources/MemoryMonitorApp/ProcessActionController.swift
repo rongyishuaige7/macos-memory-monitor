@@ -10,6 +10,7 @@ enum ProcessActionState: Equatable {
     case waitingForGraceful(ProcessIdentity, Date)
     case timedOut(ProcessIdentity)
     case forceTerminating(ProcessIdentity)
+    case verifyingForce(ProcessIdentity)
     case completed(ProcessIdentity, ProcessActionKind, String)
     case denied(ProcessIdentity?, String)
     case failed(ProcessIdentity?, String)
@@ -173,6 +174,13 @@ private func continuousNanoseconds() -> UInt64 {
 /// the user confirms a second time.
 @MainActor
 final class ProcessActionController: ObservableObject {
+    /// The timeout is a product-level safety valve as well as a UI value. A
+    /// caller supplying `Double.greatestFiniteMagnitude` must not make the
+    /// controller wait effectively forever or overflow when formatting the
+    /// confirmation text.
+    private static let maximumGracefulTimeout: TimeInterval = 24 * 60 * 60
+    private static let maximumForceVerificationTimeout: TimeInterval = 60 * 60
+
     @Published private(set) var state: ProcessActionState = .idle
     @Published private(set) var recentEvents: [ProcessActionAuditEvent] = []
     @Published private(set) var auditError: String?
@@ -183,10 +191,16 @@ final class ProcessActionController: ObservableObject {
     private let gracefulTimeout: TimeInterval
     private let forceVerificationTimeout: TimeInterval
     private let pollInterval: Duration = .milliseconds(250)
+    private let timeoutReconciliationInterval: Duration = .seconds(1)
 
     private var targetProcess: ProcessSnapshot?
     private var actionTask: Task<Void, Never>?
+    private var timeoutReconciliationTask: Task<Void, Never>?
+    private var timeoutReconciliationToken: UUID?
     private var operationToken = UUID()
+    /// Every audit request gets a publication generation. A slower append or
+    /// initial load must never put an older result back over a newer list.
+    private var auditPublicationGeneration: UInt64 = 0
 
     init(
         currentUserID: UInt32 = UInt32(getuid()),
@@ -203,9 +217,15 @@ final class ProcessActionController: ObservableObject {
         )
         self.runtime = runtime ?? LiveProcessActionRuntime(sampler: sampler)
         self.auditStore = auditStore
-        self.gracefulTimeout = max(gracefulTimeout.isFinite ? gracefulTimeout : 8, 1)
+        self.gracefulTimeout = min(
+            max(gracefulTimeout.isFinite ? gracefulTimeout : 8, 1),
+            Self.maximumGracefulTimeout
+        )
         self.forceVerificationTimeout = max(
-            forceVerificationTimeout.isFinite ? forceVerificationTimeout : 2,
+            min(
+                forceVerificationTimeout.isFinite ? forceVerificationTimeout : 2,
+                Self.maximumForceVerificationTimeout
+            ),
             0.5
         )
 
@@ -216,18 +236,27 @@ final class ProcessActionController: ObservableObject {
 
     deinit {
         actionTask?.cancel()
+        timeoutReconciliationTask?.cancel()
     }
 
     var isBusy: Bool {
         switch state {
-        case .requestingGraceful, .waitingForGraceful, .forceTerminating:
+        case .requestingGraceful, .waitingForGraceful, .timedOut,
+             .forceTerminating, .verifyingForce:
             return true
-        case .idle, .timedOut, .completed, .denied, .failed, .cancelled:
+        case .idle, .completed, .denied, .failed, .cancelled:
             return false
         }
     }
 
     var gracefulTimeoutForDisplay: TimeInterval { gracefulTimeout }
+
+    private var gracefulTimeoutDisplaySeconds: Int {
+        // `maximumGracefulTimeout` keeps this conversion bounded, but retain a
+        // defensive clamp in case the policy changes independently later.
+        let bounded = min(max(gracefulTimeout.rounded(.up), 1), Double(Int.max))
+        return Int(bounded)
+    }
 
     func eligibility(for process: ProcessSnapshot) -> ProcessActionValidation {
         policy.validate(expected: process, current: process)
@@ -256,7 +285,7 @@ final class ProcessActionController: ObservableObject {
             )
         case .waitingForGraceful(let target, _ ) where target == identity:
             return ProcessActionStatus(
-                message: "已请求优雅退出，等待进程结束（最长 \(Int(gracefulTimeout)) 秒）…",
+                message: "已请求优雅退出，等待进程结束（最长 \(gracefulTimeoutDisplaySeconds) 秒）…",
                 tone: .neutral
             )
         case .timedOut(let target) where target == identity:
@@ -267,6 +296,11 @@ final class ProcessActionController: ObservableObject {
         case .forceTerminating(let target) where target == identity:
             return ProcessActionStatus(
                 message: "正在重新验证并发送强制结束请求…",
+                tone: .warning
+            )
+        case .verifyingForce(let target) where target == identity:
+            return ProcessActionStatus(
+                message: "强制结束请求已发送，正在确认进程是否结束…",
                 tone: .warning
             )
         case .completed(let target, let action, let message) where target == identity:
@@ -389,6 +423,7 @@ final class ProcessActionController: ObservableObject {
              .waitingForGraceful(let identity, _),
              .timedOut(let identity),
              .forceTerminating(let identity),
+             .verifyingForce(let identity),
              .completed(let identity, _, _):
             return identity
         case .denied(let identity, _), .failed(let identity, _), .cancelled(let identity, _):
@@ -400,11 +435,11 @@ final class ProcessActionController: ObservableObject {
 
     private var cancellableAction: ProcessActionKind? {
         switch state {
-        case .requestingGraceful, .waitingForGraceful:
+        case .requestingGraceful, .waitingForGraceful, .timedOut:
             return .gracefulExit
-        case .forceTerminating:
+        case .forceTerminating, .verifyingForce:
             return .forceTerminate
-        case .idle, .timedOut, .completed, .denied, .failed, .cancelled:
+        case .idle, .completed, .denied, .failed, .cancelled:
             return nil
         }
     }
@@ -448,7 +483,10 @@ final class ProcessActionController: ObservableObject {
         }
         guard isCurrent(token), !Task.isCancelled else { return }
 
-        switch await runtime.sendGraceful(to: current) {
+        let gracefulResult = await runtime.sendGraceful(to: current)
+        guard isCurrent(token), !Task.isCancelled else { return }
+
+        switch gracefulResult {
         case .alreadyExited:
             await finish(
                 state: .completed(expected.identity, .gracefulExit, "进程已经退出"),
@@ -494,6 +532,12 @@ final class ProcessActionController: ObservableObject {
                     detail: "优雅退出等待超时；未自动强制结束",
                     token: token
                 )
+                // The audit append above is asynchronous. A second
+                // confirmation may start while it is suspended, so only
+                // launch reconciliation if this operation is still current.
+                if isCurrent(token), state == .timedOut(expected.identity) {
+                    startTimeoutReconciliation(expected: expected, token: token)
+                }
             case .cancelled:
                 return
             case .failed(let message):
@@ -550,7 +594,10 @@ final class ProcessActionController: ObservableObject {
         }
         guard isCurrent(token), !Task.isCancelled else { return }
 
-        switch await runtime.sendForce(to: current) {
+        let forceResult = await runtime.sendForce(to: current)
+        guard isCurrent(token), !Task.isCancelled else { return }
+
+        switch forceResult {
         case .alreadyExited:
             await finish(
                 state: .completed(expected.identity, .forceTerminate, "进程已经退出"),
@@ -570,6 +617,7 @@ final class ProcessActionController: ObservableObject {
                 token: token
             )
         case .sent:
+            state = .verifyingForce(expected.identity)
             let deadlineNanoseconds = timeoutDeadline(after: forceVerificationTimeout)
             switch await waitForOriginalExit(
                 expected: expected,
@@ -665,8 +713,12 @@ final class ProcessActionController: ObservableObject {
             return "操作已取消；尚未确认是否发送优雅退出请求。"
         case .waitingForGraceful:
             return "等待已取消；优雅退出请求已发送，未发送强制结束。"
+        case .timedOut:
+            return "已停止跟踪；优雅退出请求已发送，未发送强制结束。"
         case .forceTerminating:
-            return "操作已取消；请重新采样确认进程状态。"
+            return "操作已取消；尚未确认是否发送强制结束请求。"
+        case .verifyingForce:
+            return "强制结束请求已发送；已停止等待结果，请重新采样确认进程状态。"
         default:
             return "操作已取消，未发送新的进程信号。"
         }
@@ -716,6 +768,8 @@ final class ProcessActionController: ObservableObject {
         process: ProcessSnapshot,
         detail: String
     ) async {
+        auditPublicationGeneration &+= 1
+        let generation = auditPublicationGeneration
         let event = ProcessActionAuditEvent(
             action: action,
             outcome: outcome,
@@ -724,18 +778,31 @@ final class ProcessActionController: ObservableObject {
             detail: detail
         )
         do {
-            recentEvents = try await auditStore.append(event)
+            // Reload after the append so this publication includes any older
+            // append that completed while this request was suspended. The
+            // generation check below prevents a stale reload from replacing a
+            // newer publication.
+            _ = try await auditStore.append(event)
+            let latestEvents = try await auditStore.load()
+            guard generation == auditPublicationGeneration else { return }
+            recentEvents = latestEvents
             auditError = nil
         } catch {
+            guard generation == auditPublicationGeneration else { return }
             auditError = error.localizedDescription
         }
     }
 
     private func loadAuditEvents() async {
+        auditPublicationGeneration &+= 1
+        let generation = auditPublicationGeneration
         do {
-            recentEvents = try await auditStore.load()
+            let loadedEvents = try await auditStore.load()
+            guard generation == auditPublicationGeneration else { return }
+            recentEvents = loadedEvents
             auditError = nil
         } catch {
+            guard generation == auditPublicationGeneration else { return }
             auditError = error.localizedDescription
         }
     }
@@ -748,5 +815,61 @@ final class ProcessActionController: ObservableObject {
         operationToken = UUID()
         actionTask?.cancel()
         actionTask = nil
+        timeoutReconciliationTask?.cancel()
+        timeoutReconciliationTask = nil
+        timeoutReconciliationToken = nil
+    }
+
+    /// A process can exit in the small interval between the final timeout
+    /// check and the user's second confirmation. Keep the timeout actionable
+    /// while the original identity exists, but reconcile it in the background
+    /// so a naturally exiting target does not leave the controller busy
+    /// forever. The closure avoids retaining `self` while sleeping.
+    private func startTimeoutReconciliation(
+        expected: ProcessSnapshot,
+        token: UUID
+    ) {
+        timeoutReconciliationTask?.cancel()
+        timeoutReconciliationToken = token
+        let runtime = self.runtime
+        let interval = timeoutReconciliationInterval
+        timeoutReconciliationTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await runtime.sleep(for: interval)
+                } catch {
+                    self?.clearTimeoutReconciliation(for: token)
+                    return
+                }
+                guard let self,
+                      self.isCurrent(token),
+                      self.state == .timedOut(expected.identity) else {
+                    self?.clearTimeoutReconciliation(for: token)
+                    return
+                }
+                if !(await self.originalProcessIsAlive(expected)) {
+                    await self.finish(
+                        state: .completed(expected.identity, .gracefulExit, "进程已退出"),
+                        action: .gracefulExit,
+                        outcome: .completed,
+                        process: expected,
+                        detail: "优雅退出超时后确认原进程已退出",
+                        token: token
+                    )
+                    self.clearTimeoutReconciliation(for: token)
+                    return
+                }
+            }
+            self?.clearTimeoutReconciliation(for: token)
+        }
+    }
+
+    /// Clears only the reconciliation task created for `token`. An older task
+    /// can resume after a newer operation has installed its own task handle;
+    /// comparing the token prevents that stale task from erasing the handle.
+    private func clearTimeoutReconciliation(for token: UUID) {
+        guard timeoutReconciliationToken == token else { return }
+        timeoutReconciliationTask = nil
+        timeoutReconciliationToken = nil
     }
 }
