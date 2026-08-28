@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 @testable import MemoryMonitorCore
 
@@ -1433,6 +1434,336 @@ final class MemoryMonitorCoreTests: XCTestCase {
         } catch let error as ProcessActionAuditStoreError {
             XCTAssertEqual(error, .invalidData)
         }
+    }
+
+    func testPersistenceStoresRejectOversizedSnapshotJournalAuditAndClockFiles() async throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+
+        let snapshotPaths = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: snapshotPaths.directory) }
+        try createSparseFile(
+            at: snapshotPaths.file,
+            size: HistoryStore.maximumSnapshotFileBytes + 1
+        )
+        do {
+            _ = try await HistoryStore(fileURL: snapshotPaths.file).load(now: now)
+            XCTFail("Expected oversized history snapshot to fail")
+        } catch let error as HistoryStoreError {
+            XCTAssertEqual(error, .fileTooLarge)
+        }
+
+        let journalPaths = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: journalPaths.directory) }
+        try createSparseFile(
+            at: URL(fileURLWithPath: journalPaths.file.path + ".journal"),
+            size: HistoryStore.maximumJournalFileBytes + 1
+        )
+        do {
+            _ = try await HistoryStore(fileURL: journalPaths.file).load(now: now)
+            XCTFail("Expected oversized history journal to fail")
+        } catch let error as HistoryStoreError {
+            XCTAssertEqual(error, .fileTooLarge)
+        }
+
+        let historyClockPaths = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: historyClockPaths.directory) }
+        try createSparseFile(
+            at: URL(fileURLWithPath: historyClockPaths.file.path + ".clock"),
+            size: HistoryStore.maximumClockFileBytes + 1
+        )
+        do {
+            _ = try await HistoryStore(fileURL: historyClockPaths.file).load(now: now)
+            XCTFail("Expected oversized history clock to fail")
+        } catch let error as HistoryStoreError {
+            XCTAssertEqual(error, .fileTooLarge)
+        }
+
+        let auditPaths = makeTemporaryActionURL()
+        defer { try? FileManager.default.removeItem(at: auditPaths.directory) }
+        try createSparseFile(
+            at: auditPaths.file,
+            size: ProcessActionAuditStore.maximumFileBytes + 1
+        )
+        do {
+            _ = try await ProcessActionAuditStore(fileURL: auditPaths.file).load(now: now)
+            XCTFail("Expected oversized audit log to fail")
+        } catch let error as ProcessActionAuditStoreError {
+            XCTAssertEqual(error, .fileTooLarge)
+        }
+
+        let auditClockPaths = makeTemporaryActionURL()
+        defer { try? FileManager.default.removeItem(at: auditClockPaths.directory) }
+        try createSparseFile(
+            at: URL(fileURLWithPath: auditClockPaths.file.path + ".clock"),
+            size: ProcessActionAuditStore.maximumClockFileBytes + 1
+        )
+        do {
+            _ = try await ProcessActionAuditStore(fileURL: auditClockPaths.file).load(now: now)
+            XCTFail("Expected oversized audit clock to fail")
+        } catch let error as ProcessActionAuditStoreError {
+            XCTAssertEqual(error, .fileTooLarge)
+        }
+    }
+
+    func testPersistenceStoresRejectOversizedJSONLines() async throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let historyPaths = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: historyPaths.directory) }
+        let oversizedHistoryLine = Data(
+            repeating: 0x20,
+            count: HistoryStore.maximumJournalLineBytes + 1
+        )
+        try createFile(
+            at: URL(fileURLWithPath: historyPaths.file.path + ".journal"),
+            data: oversizedHistoryLine
+        )
+        do {
+            _ = try await HistoryStore(fileURL: historyPaths.file).load(now: now)
+            XCTFail("Expected oversized history line to fail")
+        } catch let error as HistoryStoreError {
+            XCTAssertEqual(error, .fileTooLarge)
+        }
+
+        let auditPaths = makeTemporaryActionURL()
+        defer { try? FileManager.default.removeItem(at: auditPaths.directory) }
+        let oversizedAuditLine = Data(
+            repeating: 0x20,
+            count: ProcessActionAuditStore.maximumLineBytes + 1
+        )
+        try createFile(at: auditPaths.file, data: oversizedAuditLine)
+        do {
+            _ = try await ProcessActionAuditStore(fileURL: auditPaths.file).load(now: now)
+            XCTFail("Expected oversized audit line to fail")
+        } catch let error as ProcessActionAuditStoreError {
+            XCTAssertEqual(error, .fileTooLarge)
+        }
+    }
+
+    func testPersistenceStoresRejectExcessiveJSONNesting() async throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let nestedValue = String(repeating: "[", count: 80)
+            + "0"
+            + String(repeating: "]", count: 80)
+
+        let historyPaths = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: historyPaths.directory) }
+        let historyJSON = "{\"version\":1,\"records\":[],\"extra\":" + nestedValue + "}"
+        try createFile(at: historyPaths.file, data: Data(historyJSON.utf8))
+        do {
+            _ = try await HistoryStore(fileURL: historyPaths.file).load(now: now)
+            XCTFail("Expected deeply nested history JSON to fail")
+        } catch let error as HistoryStoreError {
+            XCTAssertEqual(error, .invalidData)
+        }
+
+        let auditPaths = makeTemporaryActionURL()
+        defer { try? FileManager.default.removeItem(at: auditPaths.directory) }
+        let auditJSON = "{\"id\":\"deep\",\"timestamp\":\"2023-11-14T22:13:20Z\","
+            + "\"action\":\"gracefulExit\",\"outcome\":\"completed\","
+            + "\"processLabel\":\"worker\",\"detail\":\"done\",\"extra\":"
+            + nestedValue + "}\n"
+        try createFile(at: auditPaths.file, data: Data(auditJSON.utf8))
+        do {
+            _ = try await ProcessActionAuditStore(fileURL: auditPaths.file).load(now: now)
+            XCTFail("Expected deeply nested audit JSON to fail")
+        } catch let error as ProcessActionAuditStoreError {
+            XCTAssertEqual(error, .invalidData)
+        }
+    }
+
+    func testPersistenceStoreLocksTimeOutAndObserveCancellation() async throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let historyPaths = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: historyPaths.directory) }
+        let historyLock = URL(fileURLWithPath: historyPaths.file.path + ".lock")
+        let historyDescriptor = try acquireExclusiveLock(at: historyLock)
+        defer {
+            _ = flock(historyDescriptor, LOCK_UN)
+            close(historyDescriptor)
+        }
+        let historyStore = HistoryStore(
+            fileURL: historyPaths.file,
+            lockTimeoutSeconds: 0.02
+        )
+        do {
+            _ = try await historyStore.load(now: now)
+            XCTFail("Expected history lock timeout")
+        } catch let error as HistoryStoreError {
+            XCTAssertEqual(error, .lockTimedOut)
+        }
+
+        let auditPaths = makeTemporaryActionURL()
+        defer { try? FileManager.default.removeItem(at: auditPaths.directory) }
+        let auditLock = URL(fileURLWithPath: auditPaths.file.path + ".lock")
+        let auditDescriptor = try acquireExclusiveLock(at: auditLock)
+        defer {
+            _ = flock(auditDescriptor, LOCK_UN)
+            close(auditDescriptor)
+        }
+        let auditStore = ProcessActionAuditStore(
+            fileURL: auditPaths.file,
+            lockTimeoutSeconds: 0.02
+        )
+        do {
+            _ = try await auditStore.load(now: now)
+            XCTFail("Expected audit lock timeout")
+        } catch let error as ProcessActionAuditStoreError {
+            XCTAssertEqual(error, .lockTimedOut)
+        }
+
+        let cancelledStore = HistoryStore(
+            fileURL: historyPaths.file,
+            lockTimeoutSeconds: 2
+        )
+        let task = Task {
+            do {
+                _ = try await cancelledStore.load(now: now)
+                return false
+            } catch is CancellationError {
+                return true
+            } catch {
+                return false
+            }
+        }
+        for _ in 0..<20 { await Task.yield() }
+        task.cancel()
+        let observedCancellation = await task.value
+        XCTAssertTrue(observedCancellation)
+    }
+
+    func testHistoryStoreUsesGenerationFastPathAndReloadsExternalChanges() async throws {
+        let paths = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let firstStore = HistoryStore(fileURL: paths.file, compactionRecordThreshold: 10_000)
+
+        _ = try await firstStore.append(
+            makeHistoryRecord(timestamp: base, availableFraction: 0.5, swapUsedBytes: 1),
+            now: base
+        )
+        _ = try await firstStore.append(
+            makeHistoryRecord(
+                timestamp: base.addingTimeInterval(60),
+                availableFraction: 0.4,
+                swapUsedBytes: 2
+            ),
+            now: base.addingTimeInterval(60)
+        )
+        let fastDiagnostics = await firstStore.diagnostics()
+        XCTAssertEqual(fastDiagnostics.fullReloadCount, 0)
+        XCTAssertGreaterThanOrEqual(fastDiagnostics.generationFastPathCount, 1)
+
+        let secondStore = HistoryStore(fileURL: paths.file, compactionRecordThreshold: 10_000)
+        _ = try await secondStore.load(now: base.addingTimeInterval(60))
+        _ = try await firstStore.append(
+            makeHistoryRecord(
+                timestamp: base.addingTimeInterval(120),
+                availableFraction: 0.3,
+                swapUsedBytes: 3
+            ),
+            now: base.addingTimeInterval(120)
+        )
+        let merged = try await secondStore.append(
+            makeHistoryRecord(
+                timestamp: base.addingTimeInterval(180),
+                availableFraction: 0.2,
+                swapUsedBytes: 4
+            ),
+            now: base.addingTimeInterval(180)
+        )
+        let reloadDiagnostics = await secondStore.diagnostics()
+
+        XCTAssertEqual(Set(merged.map(\.swapUsedBytes)), Set([1, 2, 3, 4]))
+        XCTAssertEqual(reloadDiagnostics.fullReloadCount, 1)
+    }
+
+    func testPersistenceReadsLegacyDatesAndWritesFractionalRFC3339() async throws {
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let historyPaths = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: historyPaths.directory) }
+        let legacyRecord = makeHistoryRecord(
+            timestamp: base,
+            availableFraction: 0.5,
+            swapUsedBytes: 1
+        )
+        let legacyEncoder = JSONEncoder()
+        legacyEncoder.dateEncodingStrategy = .iso8601
+        try createFile(
+            at: historyPaths.file,
+            data: try legacyEncoder.encode(MemoryHistoryFile(records: [legacyRecord]))
+        )
+        let fractionalHistoryDate = base.addingTimeInterval(60.123)
+        let historyStore = HistoryStore(fileURL: historyPaths.file)
+        _ = try await historyStore.append(
+            makeHistoryRecord(
+                timestamp: fractionalHistoryDate,
+                availableFraction: 0.4,
+                swapUsedBytes: 2
+            ),
+            now: fractionalHistoryDate
+        )
+        try await historyStore.flush(now: fractionalHistoryDate)
+        let historyText = String(decoding: try Data(contentsOf: historyPaths.file), as: UTF8.self)
+        XCTAssertTrue(historyText.contains(".123Z"))
+        let historyReloaded = try await HistoryStore(fileURL: historyPaths.file)
+            .load(now: fractionalHistoryDate)
+        XCTAssertTrue(historyReloaded.contains { record in
+            abs((record.sourceSampledAt ?? .distantPast).timeIntervalSince(fractionalHistoryDate)) < 0.001
+        })
+
+        let auditPaths = makeTemporaryActionURL()
+        defer { try? FileManager.default.removeItem(at: auditPaths.directory) }
+        var legacyAuditData = try legacyEncoder.encode(makeAuditEvent(id: "legacy", timestamp: base))
+        legacyAuditData.append(0x0A)
+        try createFile(at: auditPaths.file, data: legacyAuditData)
+        let fractionalAuditDate = base.addingTimeInterval(1.789)
+        let auditStore = ProcessActionAuditStore(fileURL: auditPaths.file)
+        _ = try await auditStore.append(
+            makeAuditEvent(id: "fractional", timestamp: fractionalAuditDate),
+            now: fractionalAuditDate
+        )
+        let auditText = String(decoding: try Data(contentsOf: auditPaths.file), as: UTF8.self)
+        XCTAssertTrue(auditText.contains(".789Z"))
+        let auditReloaded = try await ProcessActionAuditStore(fileURL: auditPaths.file)
+            .load(now: fractionalAuditDate)
+        XCTAssertEqual(Set(auditReloaded.map(\.id)), Set(["legacy", "fractional"]))
+    }
+
+    func testHistoryStorePreservesNewestSubsecondSampleAcrossActors() async throws {
+        let paths = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let minute = Date(timeIntervalSince1970: 1_699_999_980)
+        let firstAt = minute.addingTimeInterval(20.1)
+        let newestAt = minute.addingTimeInterval(20.9)
+        let middleAt = minute.addingTimeInterval(20.5)
+        let firstStore = HistoryStore(fileURL: paths.file)
+        let secondStore = HistoryStore(fileURL: paths.file)
+
+        _ = try await firstStore.append(
+            snapshot: makeSystemSnapshot(timestamp: firstAt, compressed: 1, swap: 1),
+            now: firstAt
+        )
+        _ = try await secondStore.load(now: firstAt)
+        _ = try await firstStore.append(
+            snapshot: makeSystemSnapshot(timestamp: newestAt, compressed: 9, swap: 9),
+            now: newestAt
+        )
+        _ = try await secondStore.append(
+            snapshot: makeSystemSnapshot(timestamp: middleAt, compressed: 5, swap: 5),
+            now: middleAt
+        )
+        try await secondStore.flush(now: newestAt)
+        try await firstStore.flush(now: newestAt)
+
+        let loaded = try await HistoryStore(fileURL: paths.file).load(now: newestAt)
+        XCTAssertEqual(loaded.count, 1)
+        XCTAssertEqual(loaded[0].compressedBytes, 9)
+        XCTAssertEqual(loaded[0].swapUsedBytes, 9)
+        XCTAssertEqual(
+            try XCTUnwrap(loaded[0].sourceSampledAt).timeIntervalSince1970,
+            newestAt.timeIntervalSince1970,
+            accuracy: 0.001
+        )
     }
 
     func testWorkingDirectoryLabelSanitizerFiltersCommonRoots() {
@@ -4385,6 +4716,41 @@ final class MemoryMonitorCoreTests: XCTestCase {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("MemoryMonitorTests-" + UUID().uuidString, isDirectory: true)
         return (directory.appendingPathComponent("history.json"), directory)
+    }
+
+    private func createFile(at url: URL, data: Data) throws {
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try data.write(to: url, options: [.atomic])
+    }
+
+    private func createSparseFile(at url: URL, size: Int) throws {
+        try createFile(at: url, data: Data())
+        let handle = try FileHandle(forWritingTo: url)
+        do {
+            try handle.truncate(atOffset: UInt64(size))
+            try handle.close()
+        } catch {
+            try? handle.close()
+            throw error
+        }
+    }
+
+    private func acquireExclusiveLock(at url: URL) throws -> Int32 {
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let descriptor = url.path.withCString { path in
+            open(path, O_RDWR | O_CREAT, mode_t(S_IRUSR | S_IWUSR))
+        }
+        guard descriptor >= 0, flock(descriptor, LOCK_EX) == 0 else {
+            if descriptor >= 0 { close(descriptor) }
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        return descriptor
     }
 
     private func makeTemporaryActionURL() -> (file: URL, directory: URL) {

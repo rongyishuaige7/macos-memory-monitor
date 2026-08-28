@@ -13,6 +13,11 @@ private let maximumPersistableUnixSeconds = 253_402_300_799.0 // 9999-12-31
 // finite-but-absurd Date after conversion through Double.
 private let maximumProcessStartTimeSeconds: UInt64 = 253_402_300_799
 
+private enum PersistedDataLimit {
+    static let clockBytes = 16 * 1024
+    static let jsonNestingDepth = 64
+}
+
 private func isPersistableDate(_ date: Date) -> Bool {
     let seconds = date.timeIntervalSince1970
     return seconds.isFinite
@@ -36,16 +41,54 @@ private struct PersistedClockAnchor: Codable {
     let observedAt: Date
 }
 
-private func clockAnchorData(for date: Date) throws -> Data {
+private func persistedJSONEncoder(sortedKeys: Bool = false) -> JSONEncoder {
     let encoder = JSONEncoder()
-    encoder.dateEncodingStrategy = .iso8601
+    encoder.dateEncodingStrategy = .custom { date, encoder in
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        var container = encoder.singleValueContainer()
+        try container.encode(formatter.string(from: date))
+    }
+    if sortedKeys {
+        encoder.outputFormatting = [.sortedKeys]
+    }
+    return encoder
+}
+
+private func persistedJSONDecoder() -> JSONDecoder {
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .custom { decoder in
+        let container = try decoder.singleValueContainer()
+        let value = try container.decode(String.self)
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: value) {
+            return date
+        }
+        let legacy = ISO8601DateFormatter()
+        legacy.formatOptions = [.withInternetDateTime]
+        guard let date = legacy.date(from: value) else {
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "Invalid RFC 3339 timestamp"
+            )
+        }
+        return date
+    }
+    return decoder
+}
+
+private func clockAnchorData(for date: Date) throws -> Data {
+    let encoder = persistedJSONEncoder(sortedKeys: true)
     return try encoder.encode(PersistedClockAnchor(observedAt: date))
 }
 
 private func readClockAnchor(at url: URL) -> Date? {
-    guard let data = try? Data(contentsOf: url), !data.isEmpty else { return nil }
-    let decoder = JSONDecoder()
-    decoder.dateDecodingStrategy = .iso8601
+    guard let data = try? readBoundedFile(
+        at: url,
+        maximumBytes: PersistedDataLimit.clockBytes
+    ), !data.isEmpty else { return nil }
+    let decoder = persistedJSONDecoder()
     guard let anchor = try? decoder.decode(PersistedClockAnchor.self, from: data),
           isPersistableDate(anchor.observedAt) else {
         return nil
@@ -72,6 +115,105 @@ private func boundedRetentionReference(
 private enum PersistedFileLockError: Error {
     case openFailed
     case lockFailed
+    case timedOut
+    case cancelled
+}
+
+private enum BoundedFileReadError: Error {
+    case readFailed
+    case tooLarge
+}
+
+private struct PersistedFileGeneration: Equatable {
+    let device: UInt64
+    let inode: UInt64
+    let size: UInt64
+    let modifiedSeconds: Int64
+    let modifiedNanoseconds: Int64
+}
+
+private func persistedFileGeneration(at url: URL) throws -> PersistedFileGeneration? {
+    let descriptor = url.path.withCString { path in
+        open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK)
+    }
+    if descriptor < 0 {
+        if errno == ENOENT { return nil }
+        throw BoundedFileReadError.readFailed
+    }
+    defer { close(descriptor) }
+
+    var information = stat()
+    if fstat(descriptor, &information) != 0 {
+        throw BoundedFileReadError.readFailed
+    }
+    guard information.st_size >= 0 else {
+        throw BoundedFileReadError.readFailed
+    }
+    return PersistedFileGeneration(
+        device: UInt64(information.st_dev),
+        inode: UInt64(information.st_ino),
+        size: UInt64(information.st_size),
+        modifiedSeconds: Int64(information.st_mtimespec.tv_sec),
+        modifiedNanoseconds: Int64(information.st_mtimespec.tv_nsec)
+    )
+}
+
+private func validateFileSize(at url: URL, maximumBytes: Int) throws {
+    guard maximumBytes >= 0 else { throw BoundedFileReadError.tooLarge }
+    guard let generation = try persistedFileGeneration(at: url) else { return }
+    guard generation.size <= UInt64(maximumBytes) else {
+        throw BoundedFileReadError.tooLarge
+    }
+}
+
+private func readBoundedFile(at url: URL, maximumBytes: Int) throws -> Data {
+    let descriptor = url.path.withCString { path in
+        open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK)
+    }
+    guard descriptor >= 0 else { throw BoundedFileReadError.readFailed }
+    defer { close(descriptor) }
+
+    var information = stat()
+    guard fstat(descriptor, &information) == 0,
+          information.st_size >= 0 else {
+        throw BoundedFileReadError.readFailed
+    }
+    guard UInt64(information.st_size) <= UInt64(max(maximumBytes, 0)) else {
+        throw BoundedFileReadError.tooLarge
+    }
+
+    var data = Data()
+    data.reserveCapacity(min(maximumBytes, 64 * 1024))
+    var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+    while true {
+        let count = buffer.withUnsafeMutableBytes { bytes in
+            read(descriptor, bytes.baseAddress, bytes.count)
+        }
+        if count == 0 { return data }
+        if count < 0 {
+            if errno == EINTR { continue }
+            throw BoundedFileReadError.readFailed
+        }
+        guard data.count <= maximumBytes - count else {
+            throw BoundedFileReadError.tooLarge
+        }
+        data.append(contentsOf: buffer.prefix(count))
+    }
+}
+
+private func fileEndsWithNewline(at url: URL) -> Bool {
+    let descriptor = url.path.withCString { path in
+        open(path, O_RDONLY | O_CLOEXEC)
+    }
+    guard descriptor >= 0 else { return false }
+    defer { close(descriptor) }
+
+    let end = lseek(descriptor, 0, SEEK_END)
+    guard end >= 0 else { return false }
+    if end == 0 { return true }
+    guard lseek(descriptor, -1, SEEK_END) >= 0 else { return false }
+    var byte: UInt8 = 0
+    return read(descriptor, &byte, 1) == 1 && byte == 0x0A
 }
 
 /// Serializes read-modify-write transactions for stores that may be opened by
@@ -79,6 +221,7 @@ private enum PersistedFileLockError: Error {
 /// instance, so every durable operation must also hold this path-level lock.
 private func withExclusivePersistedFileLock<T>(
     at url: URL,
+    timeoutSeconds: TimeInterval = 2,
     _ body: () throws -> T
 ) throws -> T {
     let fileManager = FileManager.default
@@ -97,12 +240,26 @@ private func withExclusivePersistedFileLock<T>(
     }
     defer { close(descriptor) }
 
-    var lockResult: Int32
-    repeat {
-        lockResult = flock(descriptor, LOCK_EX)
-    } while lockResult != 0 && errno == EINTR
-    guard lockResult == 0 else {
-        throw PersistedFileLockError.lockFailed
+    let clock = ContinuousClock()
+    let timeout = timeoutSeconds.isFinite && timeoutSeconds >= 0
+        ? timeoutSeconds
+        : 0
+    let deadline = clock.now.advanced(by: .seconds(timeout))
+    while true {
+        if withUnsafeCurrentTask(body: { $0?.isCancelled == true }) {
+            throw PersistedFileLockError.cancelled
+        }
+        if flock(descriptor, LOCK_EX | LOCK_NB) == 0 {
+            break
+        }
+        if errno == EINTR { continue }
+        guard errno == EWOULDBLOCK || errno == EAGAIN else {
+            throw PersistedFileLockError.lockFailed
+        }
+        guard clock.now < deadline else {
+            throw PersistedFileLockError.timedOut
+        }
+        usleep(10_000)
     }
     defer { _ = flock(descriptor, LOCK_UN) }
 
@@ -4257,6 +4414,8 @@ public struct HistoryStoreDiagnostics: Sendable, Equatable {
     public let journalRecordCount: Int
     public let compactionCount: Int
     public let lastCompactionAt: Date?
+    public let fullReloadCount: Int
+    public let generationFastPathCount: Int
 
     public init(
         snapshotBytes: Int,
@@ -4264,7 +4423,9 @@ public struct HistoryStoreDiagnostics: Sendable, Equatable {
         pendingRecordCount: Int,
         journalRecordCount: Int,
         compactionCount: Int,
-        lastCompactionAt: Date?
+        lastCompactionAt: Date?,
+        fullReloadCount: Int = 0,
+        generationFastPathCount: Int = 0
     ) {
         self.snapshotBytes = max(snapshotBytes, 0)
         self.journalBytes = max(journalBytes, 0)
@@ -4272,6 +4433,8 @@ public struct HistoryStoreDiagnostics: Sendable, Equatable {
         self.journalRecordCount = max(journalRecordCount, 0)
         self.compactionCount = max(compactionCount, 0)
         self.lastCompactionAt = lastCompactionAt
+        self.fullReloadCount = max(fullReloadCount, 0)
+        self.generationFastPathCount = max(generationFastPathCount, 0)
     }
 
     public var totalBytes: Int {
@@ -4283,6 +4446,8 @@ public struct HistoryStoreDiagnostics: Sendable, Equatable {
 public enum HistoryStoreError: Error, CustomStringConvertible, LocalizedError, Sendable, Equatable {
     case readFailed
     case writeFailed
+    case fileTooLarge
+    case lockTimedOut
     case invalidData
     case unsupportedVersion(Int)
 
@@ -4292,6 +4457,10 @@ public enum HistoryStoreError: Error, CustomStringConvertible, LocalizedError, S
             return "无法读取 24 小时历史文件"
         case .writeFailed:
             return "无法写入 24 小时历史文件"
+        case .fileTooLarge:
+            return "24 小时历史文件超过安全大小限制"
+        case .lockTimedOut:
+            return "等待 24 小时历史文件锁超时"
         case .invalidData:
             return "24 小时历史文件格式无效或已损坏"
         case let .unsupportedVersion(version):
@@ -4313,10 +4482,12 @@ private enum JSONPrefixState: Equatable {
 
 private struct JSONPrefixScanner {
     private let bytes: [UInt8]
+    private let maximumDepth: Int
     private var index = 0
 
-    init(_ data: Data) {
+    init(_ data: Data, maximumDepth: Int = PersistedDataLimit.jsonNestingDepth) {
         bytes = Array(data)
+        self.maximumDepth = max(maximumDepth, 0)
     }
 
     mutating func scan() -> JSONPrefixState {
@@ -4331,23 +4502,28 @@ private struct JSONPrefixScanner {
             // string are never a recoverable JSON tail.
             let prefix = Array(bytes[..<prefixLength])
             guard isInsideJSONString(prefix) else { return .invalid }
-            var prefixScanner = JSONPrefixScanner(Data(prefix))
+            var prefixScanner = JSONPrefixScanner(
+                Data(prefix),
+                maximumDepth: maximumDepth
+            )
             return prefixScanner.scan() == .incomplete ? .incomplete : .invalid
         }
         skipWhitespace()
-        let state = scanValue()
+        let state = scanValue(depth: 0)
         guard state == .complete else { return state }
         skipWhitespace()
         return index == bytes.count ? .complete : .invalid
     }
 
-    private mutating func scanValue() -> JSONPrefixState {
+    private mutating func scanValue(depth: Int) -> JSONPrefixState {
         guard let byte = current else { return .incomplete }
         switch byte {
         case 0x7B: // {
-            return scanObject()
+            guard depth < maximumDepth else { return .invalid }
+            return scanObject(depth: depth + 1)
         case 0x5B: // [
-            return scanArray()
+            guard depth < maximumDepth else { return .invalid }
+            return scanArray(depth: depth + 1)
         case 0x22: // "
             return scanString()
         case 0x74: // true
@@ -4363,7 +4539,7 @@ private struct JSONPrefixScanner {
         }
     }
 
-    private mutating func scanObject() -> JSONPrefixState {
+    private mutating func scanObject(depth: Int) -> JSONPrefixState {
         index += 1
         skipWhitespace()
         guard let byte = current else { return .incomplete }
@@ -4382,7 +4558,7 @@ private struct JSONPrefixScanner {
             guard separator == 0x3A else { return .invalid }
             index += 1
             skipWhitespace()
-            let valueState = scanValue()
+            let valueState = scanValue(depth: depth)
             guard valueState == .complete else { return valueState }
             skipWhitespace()
             guard let terminator = current else { return .incomplete }
@@ -4397,7 +4573,7 @@ private struct JSONPrefixScanner {
         }
     }
 
-    private mutating func scanArray() -> JSONPrefixState {
+    private mutating func scanArray(depth: Int) -> JSONPrefixState {
         index += 1
         skipWhitespace()
         guard let byte = current else { return .incomplete }
@@ -4407,7 +4583,7 @@ private struct JSONPrefixScanner {
         }
 
         while true {
-            let valueState = scanValue()
+            let valueState = scanValue(depth: depth)
             guard valueState == .complete else { return valueState }
             skipWhitespace()
             guard let terminator = current else { return .incomplete }
@@ -4655,6 +4831,17 @@ private func isIncompleteJSONLine(_ data: Data) -> Bool {
     return scanner.scan() == .incomplete
 }
 
+private func isCompleteBoundedJSON(_ data: Data) -> Bool {
+    var scanner = JSONPrefixScanner(data)
+    return scanner.scan() == .complete
+}
+
+private struct HistoryDurableGeneration: Equatable {
+    let snapshot: PersistedFileGeneration?
+    let journal: PersistedFileGeneration?
+    let clock: PersistedFileGeneration?
+}
+
 /// A small, minute-coalesced JSON history store.
 ///
 /// Appending samples updates memory on every pass, but disk writes happen at
@@ -4673,6 +4860,11 @@ public actor HistoryStore {
     public static let defaultMaxPersistedWorkloads = 40
     public static let defaultCompactionRecordThreshold = 120
     public static let defaultCompactionByteThreshold = 1 * 1024 * 1024
+    public static let maximumSnapshotFileBytes = 128 * 1024 * 1024
+    public static let maximumJournalFileBytes = 64 * 1024 * 1024
+    public static let maximumJournalLineBytes = 1 * 1024 * 1024
+    public static let maximumClockFileBytes = PersistedDataLimit.clockBytes
+    public static let defaultLockTimeoutSeconds: TimeInterval = 2
 
     public static var defaultFileURL: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -4694,6 +4886,7 @@ public actor HistoryStore {
     public let maxPersistedWorkloads: Int
     public let compactionRecordThreshold: Int
     public let compactionByteThreshold: Int
+    public let lockTimeoutSeconds: TimeInterval
 
     private var records: [MemoryHistoryRecord] = []
     private var hasLoaded = false
@@ -4714,13 +4907,17 @@ public actor HistoryStore {
     /// longer protects any records. Ignore it until the next successful write
     /// so resetting history cannot make the first new sample look expired.
     private var ignorePersistedClockAnchorUntilWrite = false
+    private var durableGeneration: HistoryDurableGeneration?
+    private var fullReloadCount = 0
+    private var generationFastPathCount = 0
 
     public init(
         fileURL: URL = HistoryStore.defaultFileURL,
         retentionInterval: TimeInterval = HistoryStore.defaultRetentionInterval,
         maxPersistedWorkloads: Int = HistoryStore.defaultMaxPersistedWorkloads,
         compactionRecordThreshold: Int = HistoryStore.defaultCompactionRecordThreshold,
-        compactionByteThreshold: Int = HistoryStore.defaultCompactionByteThreshold
+        compactionByteThreshold: Int = HistoryStore.defaultCompactionByteThreshold,
+        lockTimeoutSeconds: TimeInterval = HistoryStore.defaultLockTimeoutSeconds
     ) {
         self.fileURL = fileURL
         self.journalURL = URL(fileURLWithPath: fileURL.path + ".journal")
@@ -4735,6 +4932,9 @@ public actor HistoryStore {
         self.maxPersistedWorkloads = max(maxPersistedWorkloads, 1)
         self.compactionRecordThreshold = max(compactionRecordThreshold, 1)
         self.compactionByteThreshold = max(compactionByteThreshold, 1)
+        self.lockTimeoutSeconds = lockTimeoutSeconds.isFinite && lockTimeoutSeconds >= 0
+            ? lockTimeoutSeconds
+            : Self.defaultLockTimeoutSeconds
     }
 
     private var clockRollbackLimit: TimeInterval {
@@ -4786,7 +4986,10 @@ public actor HistoryStore {
 
     private func persistClockAnchor(at date: Date) throws {
         guard isPersistableDate(date) else { throw HistoryStoreError.invalidData }
-        let previousAnchorData = try? Data(contentsOf: clockURL)
+        let previousAnchorData = try? readBoundedFile(
+            at: clockURL,
+            maximumBytes: Self.maximumClockFileBytes
+        )
         let previousObservedNow = lastObservedNow
         let previousIgnorePersistedAnchor = ignorePersistedClockAnchorUntilWrite
         let observedAt: Date
@@ -4806,6 +5009,9 @@ public actor HistoryStore {
         let data: Data
         do {
             data = try clockAnchorData(for: observedAt)
+            guard data.count <= Self.maximumClockFileBytes else {
+                throw HistoryStoreError.fileTooLarge
+            }
             try prepareDirectory()
             try data.write(to: clockURL, options: [.atomic])
             try FileManager.default.setAttributes(
@@ -4813,6 +5019,19 @@ public actor HistoryStore {
                 ofItemAtPath: clockURL.path
             )
             ignorePersistedClockAnchorUntilWrite = false
+        } catch let error as HistoryStoreError {
+            lastObservedNow = previousObservedNow
+            ignorePersistedClockAnchorUntilWrite = previousIgnorePersistedAnchor
+            if let previousAnchorData {
+                try? previousAnchorData.write(to: clockURL, options: [.atomic])
+                try? FileManager.default.setAttributes(
+                    [.posixPermissions: 0o600],
+                    ofItemAtPath: clockURL.path
+                )
+            } else {
+                try? FileManager.default.removeItem(at: clockURL)
+            }
+            throw error
         } catch {
             lastObservedNow = previousObservedNow
             ignorePersistedClockAnchorUntilWrite = previousIgnorePersistedAnchor
@@ -4834,12 +5053,50 @@ public actor HistoryStore {
         _ body: () throws -> T
     ) throws -> T {
         do {
-            return try withExclusivePersistedFileLock(at: lockURL, body)
+            return try withExclusivePersistedFileLock(
+                at: lockURL,
+                timeoutSeconds: lockTimeoutSeconds
+            ) {
+                try validateFileSize(
+                    at: fileURL,
+                    maximumBytes: Self.maximumSnapshotFileBytes
+                )
+                try validateFileSize(
+                    at: journalURL,
+                    maximumBytes: Self.maximumJournalFileBytes
+                )
+                try validateFileSize(
+                    at: clockURL,
+                    maximumBytes: Self.maximumClockFileBytes
+                )
+                let result = try body()
+                durableGeneration = try currentDurableGeneration()
+                return result
+            }
         } catch let error as HistoryStoreError {
+            durableGeneration = nil
             throw error
+        } catch BoundedFileReadError.tooLarge {
+            durableGeneration = nil
+            throw HistoryStoreError.fileTooLarge
+        } catch PersistedFileLockError.timedOut {
+            durableGeneration = nil
+            throw HistoryStoreError.lockTimedOut
+        } catch PersistedFileLockError.cancelled {
+            durableGeneration = nil
+            throw CancellationError()
         } catch {
+            durableGeneration = nil
             throw failure
         }
+    }
+
+    private func currentDurableGeneration() throws -> HistoryDurableGeneration {
+        HistoryDurableGeneration(
+            snapshot: try persistedFileGeneration(at: fileURL),
+            journal: try persistedFileGeneration(at: journalURL),
+            clock: try persistedFileGeneration(at: clockURL)
+        )
     }
 
     public func diagnostics() -> HistoryStoreDiagnostics {
@@ -4849,7 +5106,9 @@ public actor HistoryStore {
             pendingRecordCount: pendingRecords.count,
             journalRecordCount: journalRecordCount,
             compactionCount: compactionCount,
-            lastCompactionAt: lastCompactionAt
+            lastCompactionAt: lastCompactionAt,
+            fullReloadCount: fullReloadCount,
+            generationFastPathCount: generationFastPathCount
         )
     }
 
@@ -4903,13 +5162,21 @@ public actor HistoryStore {
 
         if hasSnapshot {
             do {
-                snapshotData = try Data(contentsOf: fileURL)
+                snapshotData = try readBoundedFile(
+                    at: fileURL,
+                    maximumBytes: Self.maximumSnapshotFileBytes
+                )
+            } catch BoundedFileReadError.tooLarge {
+                snapshotError = .fileTooLarge
             } catch {
                 snapshotError = .readFailed
             }
 
             if snapshotError == nil {
                 do {
+                    guard isCompleteBoundedJSON(snapshotData) else {
+                        throw HistoryStoreError.invalidData
+                    }
                     let file = try Self.decoder().decode(MemoryHistoryFile.self, from: snapshotData)
                     guard file.version == MemoryHistoryFile.currentVersion else {
                         throw HistoryStoreError.unsupportedVersion(file.version)
@@ -4928,7 +5195,12 @@ public actor HistoryStore {
         var journalError: HistoryStoreError?
         if hasJournal {
             do {
-                journalData = try Data(contentsOf: journalURL)
+                journalData = try readBoundedFile(
+                    at: journalURL,
+                    maximumBytes: Self.maximumJournalFileBytes
+                )
+            } catch BoundedFileReadError.tooLarge {
+                journalError = .fileTooLarge
             } catch {
                 journalError = .readFailed
             }
@@ -4992,6 +5264,12 @@ public actor HistoryStore {
         let canonicalSnapshot: Data
         do {
             canonicalSnapshot = try Self.encoder().encode(MemoryHistoryFile(records: coalescedRecords))
+            guard canonicalSnapshot.count <= Self.maximumSnapshotFileBytes else {
+                throw HistoryStoreError.fileTooLarge
+            }
+        } catch let error as HistoryStoreError {
+            dirty = true
+            throw error
         } catch {
             // Keep the actor retryable if a malformed value somehow made it
             // through decoding. The caller may repair the source and call
@@ -5058,6 +5336,14 @@ public actor HistoryStore {
             _ = try loadLocked(now: now)
             return true
         }
+
+        if let durableGeneration,
+           let currentGeneration = try? currentDurableGeneration(),
+           durableGeneration == currentGeneration {
+            generationFastPathCount += 1
+            return true
+        }
+        fullReloadCount += 1
 
         let preserveLocal = dirty || pendingWriteNeedsRetry || !pendingRecords.isEmpty
         let localRecords = preserveLocal ? records : []
@@ -5421,16 +5707,11 @@ public actor HistoryStore {
     }
 
     private static func encoder() -> JSONEncoder {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.sortedKeys]
-        return encoder
+        persistedJSONEncoder(sortedKeys: true)
     }
 
     private static func decoder() -> JSONDecoder {
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return decoder
+        persistedJSONDecoder()
     }
 
     private struct JournalDecodeResult {
@@ -5461,15 +5742,23 @@ public actor HistoryStore {
                 }
                 continue
             }
+            guard line.count <= Self.maximumJournalLineBytes else {
+                throw HistoryStoreError.fileTooLarge
+            }
+            let lineData = Data(line)
+            var scanner = JSONPrefixScanner(lineData)
+            let prefixState = scanner.scan()
             do {
-                decoded.append(try decoder.decode(MemoryHistoryRecord.self, from: Data(line)))
+                guard prefixState == .complete else {
+                    throw HistoryStoreError.invalidData
+                }
+                decoded.append(try decoder.decode(MemoryHistoryRecord.self, from: lineData))
             } catch {
                 // A process may be terminated while the final line is being
                 // appended. Ignore only that incomplete tail; malformed data
                 // in a complete or middle line still invalidates the store.
                 let isLastLine = lineIndex == lines.count - 1
-                if isLastLine, data.last != 0x0A,
-                   isIncompleteJSONLine(Data(line)) {
+                if isLastLine, data.last != 0x0A, prefixState == .incomplete {
                     ignoredIncompleteTail = true
                     break
                 }
@@ -5501,7 +5790,12 @@ public actor HistoryStore {
         do {
             let encoder = Self.encoder()
             for record in ordered {
-                payload.append(try encoder.encode(record))
+                let encoded = try encoder.encode(record)
+                guard encoded.count <= Self.maximumJournalLineBytes,
+                      payload.count <= Self.maximumJournalFileBytes - encoded.count - 1 else {
+                    throw HistoryStoreError.fileTooLarge
+                }
+                payload.append(encoded)
                 payload.append(0x0A)
             }
 
@@ -5510,13 +5804,20 @@ public actor HistoryStore {
                 let handle = try FileHandle(forWritingTo: journalURL)
                 do {
                     originalJournalSize = try handle.seekToEnd()
+                    guard originalJournalSize <= UInt64(Self.maximumJournalFileBytes),
+                          payload.count <= Self.maximumJournalFileBytes - Int(originalJournalSize) else {
+                        throw HistoryStoreError.fileTooLarge
+                    }
                     journalWriteStarted = true
                     if originalJournalSize > 0,
-                       !fileEndsWithNewline(journalURL) {
+                       !fileEndsWithNewline(at: journalURL) {
                         // The separator is carried by the payload prefix. Do
                         // not write a second newline here: two separators
                         // would decode as an invalid blank journal line.
                         payload.insert(0x0A, at: payload.startIndex)
+                    }
+                    guard payload.count <= Self.maximumJournalFileBytes - Int(originalJournalSize) else {
+                        throw HistoryStoreError.fileTooLarge
                     }
                     try handle.write(contentsOf: payload)
                     try handle.synchronize()
@@ -5540,6 +5841,15 @@ public actor HistoryStore {
             // this write fails, the surrounding rollback removes the journal
             // bytes as well, so a retry remains transactional.
             try persistClockAnchor(at: timestamp)
+        } catch let error as HistoryStoreError {
+            pendingWriteNeedsRetry = true
+            if journalWriteStarted {
+                rollbackJournalWrite(
+                    existed: journalPreviouslyExisted,
+                    originalSize: originalJournalSize
+                )
+            }
+            throw error
         } catch {
             pendingWriteNeedsRetry = true
             if journalWriteStarted {
@@ -5596,6 +5906,9 @@ public actor HistoryStore {
         do {
             try prepareDirectory()
             let data = try Self.encoder().encode(MemoryHistoryFile(records: records))
+            guard data.count <= Self.maximumSnapshotFileBytes else {
+                throw HistoryStoreError.fileTooLarge
+            }
             // Keep the canonical snapshot atomic. If the process stops during
             // this write, the previous snapshot and journal remain readable.
             try data.write(to: fileURL, options: [.atomic])
@@ -5615,6 +5928,8 @@ public actor HistoryStore {
                 )
             }
             try persistClockAnchor(at: timestamp)
+        } catch let error as HistoryStoreError {
+            throw error
         } catch {
             throw HistoryStoreError.writeFailed
         }
@@ -5645,12 +5960,6 @@ public actor HistoryStore {
             return 0
         }
         return max(value.intValue, 0)
-    }
-
-    private func fileEndsWithNewline(_ url: URL) -> Bool {
-        guard let data = try? Data(contentsOf: url) else { return false }
-        guard !data.isEmpty else { return true }
-        return data.last == 0x0A
     }
 
     private static func minuteStart(_ date: Date) -> Date {
@@ -5970,6 +6279,8 @@ public actor HistoryStore {
 public enum ProcessActionAuditStoreError: Error, CustomStringConvertible, LocalizedError, Sendable, Equatable {
     case readFailed
     case writeFailed
+    case fileTooLarge
+    case lockTimedOut
     case invalidData
 
     public var description: String {
@@ -5978,12 +6289,21 @@ public enum ProcessActionAuditStoreError: Error, CustomStringConvertible, Locali
             return "无法读取进程操作记录"
         case .writeFailed:
             return "无法写入进程操作记录"
+        case .fileTooLarge:
+            return "进程操作记录超过安全大小限制"
+        case .lockTimedOut:
+            return "等待进程操作记录文件锁超时"
         case .invalidData:
             return "进程操作记录格式无效或已损坏"
         }
     }
 
     public var errorDescription: String? { description }
+}
+
+private struct AuditDurableGeneration: Equatable {
+    let log: PersistedFileGeneration?
+    let clock: PersistedFileGeneration?
 }
 
 /// Small append-only audit log for explicitly confirmed process actions.
@@ -5994,6 +6314,10 @@ public actor ProcessActionAuditStore {
     public static let defaultMaximumEvents = 200
     public static let maximumFutureSkew: TimeInterval = HistoryStore.maximumFutureSkew
     public static let maximumRetentionInterval: TimeInterval = HistoryStore.maximumRetentionInterval
+    public static let maximumFileBytes = 32 * 1024 * 1024
+    public static let maximumLineBytes = 1 * 1024 * 1024
+    public static let maximumClockFileBytes = PersistedDataLimit.clockBytes
+    public static let defaultLockTimeoutSeconds: TimeInterval = 2
 
     public static var defaultFileURL: URL {
         HistoryStore.defaultFileURL
@@ -6006,17 +6330,20 @@ public actor ProcessActionAuditStore {
     private let lockURL: URL
     public let retentionInterval: TimeInterval
     public let maximumEvents: Int
+    public let lockTimeoutSeconds: TimeInterval
 
     private var events: [ProcessActionAuditEvent] = []
     private var hasLoaded = false
     private var dirty = false
     private var lastObservedNow: Date?
     private var ignorePersistedClockAnchorUntilWrite = false
+    private var durableGeneration: AuditDurableGeneration?
 
     public init(
         fileURL: URL = ProcessActionAuditStore.defaultFileURL,
         retentionInterval: TimeInterval = ProcessActionAuditStore.defaultRetentionInterval,
-        maximumEvents: Int = ProcessActionAuditStore.defaultMaximumEvents
+        maximumEvents: Int = ProcessActionAuditStore.defaultMaximumEvents,
+        lockTimeoutSeconds: TimeInterval = ProcessActionAuditStore.defaultLockTimeoutSeconds
     ) {
         self.fileURL = fileURL
         self.clockURL = URL(fileURLWithPath: fileURL.path + ".clock")
@@ -6025,6 +6352,9 @@ public actor ProcessActionAuditStore {
             ? min(max(retentionInterval, 0), Self.maximumRetentionInterval)
             : Self.defaultRetentionInterval
         self.maximumEvents = max(maximumEvents, 1)
+        self.lockTimeoutSeconds = lockTimeoutSeconds.isFinite && lockTimeoutSeconds >= 0
+            ? lockTimeoutSeconds
+            : Self.defaultLockTimeoutSeconds
     }
 
     private var clockRollbackLimit: TimeInterval {
@@ -6070,7 +6400,10 @@ public actor ProcessActionAuditStore {
 
     private func persistClockAnchor(at date: Date) throws {
         guard isPersistableDate(date) else { throw ProcessActionAuditStoreError.invalidData }
-        let previousAnchorData = try? Data(contentsOf: clockURL)
+        let previousAnchorData = try? readBoundedFile(
+            at: clockURL,
+            maximumBytes: Self.maximumClockFileBytes
+        )
         let previousObservedNow = lastObservedNow
         let previousIgnorePersistedAnchor = ignorePersistedClockAnchorUntilWrite
         let observedAt: Date
@@ -6089,6 +6422,9 @@ public actor ProcessActionAuditStore {
         lastObservedNow = observedAt
         do {
             let data = try clockAnchorData(for: observedAt)
+            guard data.count <= Self.maximumClockFileBytes else {
+                throw ProcessActionAuditStoreError.fileTooLarge
+            }
             try prepareDirectory()
             try data.write(to: clockURL, options: [.atomic])
             try FileManager.default.setAttributes(
@@ -6096,6 +6432,19 @@ public actor ProcessActionAuditStore {
                 ofItemAtPath: clockURL.path
             )
             ignorePersistedClockAnchorUntilWrite = false
+        } catch let error as ProcessActionAuditStoreError {
+            lastObservedNow = previousObservedNow
+            ignorePersistedClockAnchorUntilWrite = previousIgnorePersistedAnchor
+            if let previousAnchorData {
+                try? previousAnchorData.write(to: clockURL, options: [.atomic])
+                try? FileManager.default.setAttributes(
+                    [.posixPermissions: 0o600],
+                    ofItemAtPath: clockURL.path
+                )
+            } else {
+                try? FileManager.default.removeItem(at: clockURL)
+            }
+            throw error
         } catch {
             lastObservedNow = previousObservedNow
             ignorePersistedClockAnchorUntilWrite = previousIgnorePersistedAnchor
@@ -6117,12 +6466,42 @@ public actor ProcessActionAuditStore {
         _ body: () throws -> T
     ) throws -> T {
         do {
-            return try withExclusivePersistedFileLock(at: lockURL, body)
+            return try withExclusivePersistedFileLock(
+                at: lockURL,
+                timeoutSeconds: lockTimeoutSeconds
+            ) {
+                try validateFileSize(at: fileURL, maximumBytes: Self.maximumFileBytes)
+                try validateFileSize(
+                    at: clockURL,
+                    maximumBytes: Self.maximumClockFileBytes
+                )
+                let result = try body()
+                durableGeneration = try currentDurableGeneration()
+                return result
+            }
         } catch let error as ProcessActionAuditStoreError {
+            durableGeneration = nil
             throw error
+        } catch BoundedFileReadError.tooLarge {
+            durableGeneration = nil
+            throw ProcessActionAuditStoreError.fileTooLarge
+        } catch PersistedFileLockError.timedOut {
+            durableGeneration = nil
+            throw ProcessActionAuditStoreError.lockTimedOut
+        } catch PersistedFileLockError.cancelled {
+            durableGeneration = nil
+            throw CancellationError()
         } catch {
+            durableGeneration = nil
             throw failure
         }
+    }
+
+    private func currentDurableGeneration() throws -> AuditDurableGeneration {
+        AuditDurableGeneration(
+            log: try persistedFileGeneration(at: fileURL),
+            clock: try persistedFileGeneration(at: clockURL)
+        )
     }
 
     @discardableResult
@@ -6182,7 +6561,12 @@ public actor ProcessActionAuditStore {
 
         let data: Data
         do {
-            data = try Data(contentsOf: fileURL)
+            data = try readBoundedFile(
+                at: fileURL,
+                maximumBytes: Self.maximumFileBytes
+            )
+        } catch BoundedFileReadError.tooLarge {
+            throw ProcessActionAuditStoreError.fileTooLarge
         } catch {
             throw ProcessActionAuditStoreError.readFailed
         }
@@ -6241,6 +6625,12 @@ public actor ProcessActionAuditStore {
     private func synchronizeDurableViewLocked(now: Date) throws -> Bool {
         guard hasLoaded else {
             _ = try loadLocked(now: now)
+            return true
+        }
+
+        if let durableGeneration,
+           let currentGeneration = try? currentDurableGeneration(),
+           durableGeneration == currentGeneration {
             return true
         }
 
@@ -6400,8 +6790,7 @@ public actor ProcessActionAuditStore {
         guard !data.isEmpty else { return DecodeResult(events: [], validByteCount: 0) }
 
         let lines = data.split(separator: 0x0A, omittingEmptySubsequences: false)
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
+        let decoder = persistedJSONDecoder()
         var decoded: [ProcessActionAuditEvent] = []
         var ignoredIncompleteTail = false
 
@@ -6415,12 +6804,20 @@ public actor ProcessActionAuditStore {
                 }
                 continue
             }
+            guard line.count <= Self.maximumLineBytes else {
+                throw ProcessActionAuditStoreError.fileTooLarge
+            }
+            let lineData = Data(line)
+            var scanner = JSONPrefixScanner(lineData)
+            let prefixState = scanner.scan()
             do {
-                decoded.append(try decoder.decode(ProcessActionAuditEvent.self, from: Data(line)))
+                guard prefixState == .complete else {
+                    throw ProcessActionAuditStoreError.invalidData
+                }
+                decoded.append(try decoder.decode(ProcessActionAuditEvent.self, from: lineData))
             } catch {
                 let isLastLine = lineIndex == lines.count - 1
-                if isLastLine, data.last != 0x0A,
-                   isIncompleteJSONLine(Data(line)) {
+                if isLastLine, data.last != 0x0A, prefixState == .incomplete {
                     ignoredIncompleteTail = true
                     break
                 }
@@ -6446,23 +6843,31 @@ public actor ProcessActionAuditStore {
         var originalSize: UInt64 = 0
         do {
             try prepareDirectory()
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            encoder.outputFormatting = [.sortedKeys]
+            let encoder = persistedJSONEncoder(sortedKeys: true)
             var payload = try encoder.encode(event)
+            guard payload.count <= Self.maximumLineBytes else {
+                throw ProcessActionAuditStoreError.fileTooLarge
+            }
             payload.append(0x0A)
 
             if filePreviouslyExisted {
                 let handle = try FileHandle(forWritingTo: fileURL)
                 do {
                     originalSize = try handle.seekToEnd()
+                    guard originalSize <= UInt64(Self.maximumFileBytes),
+                          payload.count <= Self.maximumFileBytes - Int(originalSize) else {
+                        throw ProcessActionAuditStoreError.fileTooLarge
+                    }
                     writeStarted = true
                     if originalSize > 0,
-                       !fileEndsWithNewline(fileURL) {
+                       !fileEndsWithNewline(at: fileURL) {
                         // The separator is carried by the payload prefix. A
                         // second write would leave an invalid blank JSONL
                         // line between the old and new events.
                         payload.insert(0x0A, at: payload.startIndex)
+                    }
+                    guard payload.count <= Self.maximumFileBytes - Int(originalSize) else {
+                        throw ProcessActionAuditStoreError.fileTooLarge
                     }
                     try handle.write(contentsOf: payload)
                     try handle.synchronize()
@@ -6477,6 +6882,14 @@ public actor ProcessActionAuditStore {
             }
             try setFilePermissionsIfPresent()
             try persistClockAnchor(at: observedAt)
+        } catch let error as ProcessActionAuditStoreError {
+            if writeStarted {
+                rollbackFileWrite(
+                    existed: filePreviouslyExisted,
+                    originalSize: originalSize
+                )
+            }
+            throw error
         } catch {
             if writeStarted {
                 rollbackFileWrite(
@@ -6491,30 +6904,55 @@ public actor ProcessActionAuditStore {
     private func persist(observedAt: Date? = nil) throws {
         let fileManager = FileManager.default
         let filePreviouslyExisted = fileManager.fileExists(atPath: fileURL.path)
-        let previousData = filePreviouslyExisted ? try? Data(contentsOf: fileURL) : nil
-        let previousClockData = try? Data(contentsOf: clockURL)
+        let previousData = filePreviouslyExisted
+            ? try? readBoundedFile(at: fileURL, maximumBytes: Self.maximumFileBytes)
+            : nil
+        let previousClockData = try? readBoundedFile(
+            at: clockURL,
+            maximumBytes: Self.maximumClockFileBytes
+        )
         let anchorDate = observedAt ?? lastObservedNow ?? events.first?.timestamp
         guard let anchorDate, isPersistableDate(anchorDate) else {
             throw ProcessActionAuditStoreError.invalidData
         }
         do {
             try prepareDirectory()
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            encoder.outputFormatting = [.sortedKeys]
+            let encoder = persistedJSONEncoder(sortedKeys: true)
             var payload = Data()
             for event in events {
-                payload.append(try encoder.encode(event))
+                let encoded = try encoder.encode(event)
+                guard encoded.count <= Self.maximumLineBytes,
+                      payload.count <= Self.maximumFileBytes - encoded.count - 1 else {
+                    throw ProcessActionAuditStoreError.fileTooLarge
+                }
+                payload.append(encoded)
                 payload.append(0x0A)
             }
             try payload.write(to: fileURL, options: [.atomic])
             try setFilePermissionsIfPresent()
             try persistClockAnchor(at: anchorDate)
-        } catch {
+        } catch let error as ProcessActionAuditStoreError {
             // `Data.write(.atomic)` normally leaves the old file intact on
             // failure, but permission changes can fail after replacement. A
             // best-effort restore keeps a failed rewrite from exposing a
             // half-applied event set to the next load.
+            if filePreviouslyExisted, let previousData {
+                try? previousData.write(to: fileURL, options: [.atomic])
+                try? setFilePermissionsIfPresent()
+            } else if !filePreviouslyExisted {
+                try? fileManager.removeItem(at: fileURL)
+            }
+            if let previousClockData {
+                try? previousClockData.write(to: clockURL, options: [.atomic])
+                try? FileManager.default.setAttributes(
+                    [.posixPermissions: 0o600],
+                    ofItemAtPath: clockURL.path
+                )
+            } else {
+                try? fileManager.removeItem(at: clockURL)
+            }
+            throw error
+        } catch {
             if filePreviouslyExisted, let previousData {
                 try? previousData.write(to: fileURL, options: [.atomic])
                 try? setFilePermissionsIfPresent()
@@ -6568,12 +7006,6 @@ public actor ProcessActionAuditStore {
             [.posixPermissions: 0o600],
             ofItemAtPath: fileURL.path
         )
-    }
-
-    private func fileEndsWithNewline(_ url: URL) -> Bool {
-        guard let data = try? Data(contentsOf: url) else { return false }
-        guard !data.isEmpty else { return true }
-        return data.last == 0x0A
     }
 
     private static func pruned(
