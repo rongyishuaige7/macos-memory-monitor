@@ -143,6 +143,11 @@ final class LoginLaunchCoordinator: ObservableObject {
     private var operationTask: Task<Void, Never>?
     private var operationToken = UUID()
     private var cancellationRefreshToken: UUID?
+    /// The runtime status observed when the last operation error was
+    /// reported. A passive refresh clears the error only after the system
+    /// state changes, which allows recovery in System Settings without
+    /// hiding an unresolved failure.
+    private var statusAtLastError: LoginLaunchStatus?
 
     init(runtime: (any LoginLaunchRuntime)? = nil) {
         self.runtime = runtime ?? LiveLoginLaunchRuntime()
@@ -159,10 +164,13 @@ final class LoginLaunchCoordinator: ObservableObject {
 
     func refreshStatus() {
         guard !isUpdating else { return }
-        status = runtime.status()
-        // Keep an operation error visible until a subsequent enable/disable
-        // attempt succeeds. A passive status refresh must not make a failed
-        // registration look healthy while the underlying problem remains.
+        let refreshedStatus = runtime.status()
+        status = refreshedStatus
+        if let statusAtLastError,
+           refreshedStatus != statusAtLastError {
+            lastError = nil
+            self.statusAtLastError = nil
+        }
     }
 
     func setEnabled(_ enabled: Bool) {
@@ -197,10 +205,13 @@ final class LoginLaunchCoordinator: ObservableObject {
                 self.status = runtime.status()
                 if enabled, !self.status.isRegistered {
                     self.lastError = "系统没有确认登录启动已注册，请检查登录项设置。"
+                    self.statusAtLastError = self.status
                 } else if !enabled, self.status.isRegistered {
                     self.lastError = "系统没有确认登录启动已关闭，请检查登录项设置。"
+                    self.statusAtLastError = self.status
                 } else {
                     self.lastError = nil
+                    self.statusAtLastError = nil
                 }
             } catch {
                 guard !Task.isCancelled,
@@ -210,6 +221,7 @@ final class LoginLaunchCoordinator: ObservableObject {
                 }
                 self.status = runtime.status()
                 self.lastError = error.localizedDescription
+                self.statusAtLastError = self.status
             }
         }
     }

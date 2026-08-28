@@ -40,6 +40,26 @@ final class AppIntegrationTests: XCTestCase {
         XCTAssertFalse(coordinator.toggleValue)
         XCTAssertEqual(runtime.registerCount, 1)
         XCTAssertTrue(coordinator.lastError?.contains("注册被拒绝") == true)
+
+        coordinator.refreshStatus()
+        XCTAssertTrue(coordinator.lastError?.contains("注册被拒绝") == true)
+    }
+
+    func testLoginCoordinatorClearsFailureAfterExternalStatusRecovery() async {
+        let runtime = FakeLoginLaunchRuntime()
+        runtime.registerError = FakeLoginLaunchRuntimeError.registrationDenied
+        let coordinator = LoginLaunchCoordinator(runtime: runtime)
+
+        coordinator.setEnabled(true)
+        await waitUntil { !coordinator.isUpdating }
+        XCTAssertNotNil(coordinator.lastError)
+
+        runtime.registerError = nil
+        runtime.statusValue = .enabled
+        coordinator.refreshStatus()
+
+        XCTAssertEqual(coordinator.status, .enabled)
+        XCTAssertNil(coordinator.lastError)
     }
 
     func testLoginCoordinatorTreatsApprovalAsRegisteredToggle() async {
