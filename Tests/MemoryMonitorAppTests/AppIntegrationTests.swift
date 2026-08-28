@@ -426,6 +426,169 @@ final class AppIntegrationTests: XCTestCase {
         XCTAssertEqual(persisted.count, 3)
     }
 
+    func testMonitorViewModelShutdownFlushesNewestSameMinuteSample() async throws {
+        let minute = Date(timeIntervalSince1970: 1_699_999_980)
+        let firstAt = minute.addingTimeInterval(10)
+        let newestAt = minute.addingTimeInterval(40)
+        let source = FakeMonitorSamplingSource(snapshots: [
+            makeMonitorSnapshot(
+                timestamp: firstAt,
+                processes: [],
+                groups: [],
+                status: .unavailable(),
+                listedCount: 0,
+                systemOverride: makeSystemSnapshot(timestamp: firstAt, swapUsedBytes: 1),
+                didSampleProcesses: false
+            ),
+            makeMonitorSnapshot(
+                timestamp: newestAt,
+                processes: [],
+                groups: [],
+                status: .unavailable(),
+                listedCount: 0,
+                systemOverride: makeSystemSnapshot(timestamp: newestAt, swapUsedBytes: 9),
+                didSampleProcesses: false
+            )
+        ])
+        let historyPaths = makeTemporaryHistoryURL()
+        let auditPaths = makeTemporaryActionURL()
+        defer {
+            try? FileManager.default.removeItem(at: historyPaths.directory)
+            try? FileManager.default.removeItem(at: auditPaths.directory)
+        }
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: historyPaths.url),
+            processActions: ProcessActionController(
+                auditStore: ProcessActionAuditStore(fileURL: auditPaths.url)
+            ),
+            dateProvider: { newestAt },
+            startRefreshTask: false
+        )
+
+        await model.refreshOnce(at: firstAt)
+        await model.refreshOnce(at: newestAt)
+        await model.shutdown()
+        await model.shutdown()
+
+        let persisted = try await HistoryStore(fileURL: historyPaths.url).load(now: newestAt)
+        XCTAssertEqual(persisted.count, 1)
+        XCTAssertEqual(persisted[0].sourceSampledAt, newestAt)
+        XCTAssertEqual(persisted[0].swapUsedBytes, 9)
+        XCTAssertNil(model.historyError)
+    }
+
+    func testMonitorViewModelShutdownMergesFallbackAfterStoreRecovery() async throws {
+        let timestamp = Date(timeIntervalSince1970: 1_700_010_000)
+        let source = FakeMonitorSamplingSource(snapshots: [
+            makeMonitorSnapshot(
+                timestamp: timestamp,
+                processes: [],
+                groups: [],
+                status: .unavailable(),
+                listedCount: 0,
+                didSampleProcesses: false
+            )
+        ])
+        let historyPaths = makeTemporaryHistoryURL()
+        let auditPaths = makeTemporaryActionURL()
+        defer {
+            try? FileManager.default.removeItem(at: historyPaths.directory)
+            try? FileManager.default.removeItem(at: auditPaths.directory)
+        }
+        try FileManager.default.createDirectory(
+            at: historyPaths.url,
+            withIntermediateDirectories: true
+        )
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: historyPaths.url),
+            processActions: ProcessActionController(
+                auditStore: ProcessActionAuditStore(fileURL: auditPaths.url)
+            ),
+            dateProvider: { timestamp },
+            startRefreshTask: false
+        )
+
+        await model.refreshOnce(at: timestamp)
+        XCTAssertNotNil(model.historyError)
+        try FileManager.default.removeItem(at: historyPaths.url)
+
+        await model.shutdown()
+
+        let persisted = try await HistoryStore(fileURL: historyPaths.url).load(now: timestamp)
+        XCTAssertEqual(persisted.count, 1)
+        XCTAssertEqual(persisted[0].sourceSampledAt, timestamp)
+        XCTAssertNil(model.historyError)
+    }
+
+    func testMonitorViewModelShutdownSurfacesFlushFailureWithoutHanging() async throws {
+        let timestamp = Date(timeIntervalSince1970: 1_700_020_000)
+        let source = FakeMonitorSamplingSource(snapshots: [
+            makeMonitorSnapshot(
+                timestamp: timestamp,
+                processes: [],
+                groups: [],
+                status: .unavailable(),
+                listedCount: 0,
+                didSampleProcesses: false
+            )
+        ])
+        let historyPaths = makeTemporaryHistoryURL()
+        let auditPaths = makeTemporaryActionURL()
+        defer {
+            try? FileManager.default.removeItem(at: historyPaths.directory)
+            try? FileManager.default.removeItem(at: auditPaths.directory)
+        }
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: historyPaths.url),
+            processActions: ProcessActionController(
+                auditStore: ProcessActionAuditStore(fileURL: auditPaths.url)
+            ),
+            dateProvider: { timestamp },
+            startRefreshTask: false
+        )
+        await model.refreshOnce(at: timestamp)
+        try FileManager.default.removeItem(at: historyPaths.url)
+        try FileManager.default.createDirectory(
+            at: historyPaths.url,
+            withIntermediateDirectories: false
+        )
+
+        await model.shutdown()
+
+        XCTAssertNotNil(model.historyError)
+    }
+
+    func testTerminationCoordinatorTimesOutAndRepliesOnlyOnce() async throws {
+        let coordinator = ApplicationTerminationCoordinator(timeoutSeconds: 0.01)
+        var suspendedShutdown: CheckedContinuation<Void, Never>?
+        var replies: [Bool] = []
+
+        coordinator.begin(
+            shutdown: {
+                await withCheckedContinuation { continuation in
+                    suspendedShutdown = continuation
+                }
+            },
+            reply: { replies.append($0) }
+        )
+        coordinator.begin(
+            shutdown: {},
+            reply: { replies.append($0) }
+        )
+        try await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertEqual(replies, [true])
+        XCTAssertTrue(coordinator.hasReplied)
+
+        suspendedShutdown?.resume()
+        suspendedShutdown = nil
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertEqual(replies, [true])
+    }
+
     func testMonitorViewModelRefreshTaskDoesNotRetainModelWhileWaiting() async throws {
         let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
         let process = makeProcess(pid: 9050, name: "lifecycle")
@@ -1399,6 +1562,12 @@ final class AppIntegrationTests: XCTestCase {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("MemoryMonitorViewModel-" + UUID().uuidString, isDirectory: true)
         return (directory.appendingPathComponent("history.json"), directory)
+    }
+
+    private func makeTemporaryActionURL() -> (url: URL, directory: URL) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MemoryMonitorShutdownAudit-" + UUID().uuidString, isDirectory: true)
+        return (directory.appendingPathComponent("actions.jsonl"), directory)
     }
 
     private func makeSystemSnapshot(

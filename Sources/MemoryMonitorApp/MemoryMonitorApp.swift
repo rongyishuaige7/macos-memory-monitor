@@ -23,7 +23,8 @@ extension MonitorSampler: MonitorSamplingSource {
 
 @main
 struct MemoryMonitorApp: App {
-    @StateObject private var model = MonitorViewModel()
+    @NSApplicationDelegateAdaptor(MemoryMonitorApplicationDelegate.self)
+    private var applicationDelegate
 
     init() {
         NSApplication.shared.setActivationPolicy(.accessory)
@@ -31,13 +32,111 @@ struct MemoryMonitorApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            MonitorPopover(model: model, processActions: model.processActions)
-                .onAppear { model.setPanelPresented(true) }
-                .onDisappear { model.setPanelPresented(false) }
+            MonitorPopover(
+                model: applicationDelegate.model,
+                processActions: applicationDelegate.model.processActions
+            )
+                .onAppear { applicationDelegate.model.setPanelPresented(true) }
+                .onDisappear { applicationDelegate.model.setPanelPresented(false) }
         } label: {
-            MenuBarStatus(model: model)
+            MenuBarStatus(model: applicationDelegate.model)
         }
         .menuBarExtraStyle(.window)
+    }
+}
+
+@MainActor
+final class MemoryMonitorApplicationDelegate: NSObject, NSApplicationDelegate {
+    let model: MonitorViewModel
+    private let terminationCoordinator: ApplicationTerminationCoordinator
+
+    override convenience init() {
+        self.init(model: MonitorViewModel())
+    }
+
+    init(
+        model: MonitorViewModel,
+        terminationTimeoutSeconds: TimeInterval = 5
+    ) {
+        self.model = model
+        terminationCoordinator = ApplicationTerminationCoordinator(
+            timeoutSeconds: terminationTimeoutSeconds
+        )
+        super.init()
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if terminationCoordinator.hasReplied {
+            return .terminateNow
+        }
+        terminationCoordinator.begin(
+            shutdown: { [weak model] in
+                await model?.shutdown()
+            },
+            reply: { [weak sender] shouldTerminate in
+                sender?.reply(toApplicationShouldTerminate: shouldTerminate)
+            }
+        )
+        return .terminateLater
+    }
+}
+
+/// Races graceful shutdown against a monotonic timeout without making the
+/// application wait for a child task that ignores cancellation. The first
+/// completion wins and AppKit receives exactly one termination reply.
+@MainActor
+final class ApplicationTerminationCoordinator {
+    private enum State {
+        case idle
+        case waiting
+        case replied
+    }
+
+    private let timeoutSeconds: TimeInterval
+    private var state = State.idle
+    private var shutdownTask: Task<Void, Never>?
+    private var timeoutTask: Task<Void, Never>?
+
+    init(timeoutSeconds: TimeInterval = 5) {
+        self.timeoutSeconds = timeoutSeconds.isFinite && timeoutSeconds > 0
+            ? timeoutSeconds
+            : 5
+    }
+
+    var hasReplied: Bool {
+        state == .replied
+    }
+
+    func begin(
+        shutdown: @escaping @MainActor () async -> Void,
+        reply: @escaping @MainActor (Bool) -> Void
+    ) {
+        guard state == .idle else { return }
+        state = .waiting
+
+        shutdownTask = Task { @MainActor [weak self] in
+            await shutdown()
+            self?.finish(reply: reply)
+        }
+        timeoutTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await Task.sleep(for: .seconds(self.timeoutSeconds))
+            } catch {
+                return
+            }
+            self.finish(reply: reply)
+        }
+    }
+
+    private func finish(reply: @escaping @MainActor (Bool) -> Void) {
+        guard state == .waiting else { return }
+        state = .replied
+        shutdownTask?.cancel()
+        timeoutTask?.cancel()
+        shutdownTask = nil
+        timeoutTask = nil
+        reply(true)
     }
 }
 
@@ -80,6 +179,10 @@ final class MonitorViewModel: ObservableObject {
     let processActions: ProcessActionController
     let loginLaunch: LoginLaunchCoordinator
     private var refreshTask: Task<Void, Never>?
+    private var shutdownTask: Task<Void, Never>?
+    private var shutdownCompleted = false
+    private var isShuttingDown = false
+    private var refreshIdleWaiters: [CheckedContinuation<Void, Never>] = []
     private let sampler: any MonitorSamplingSource
     private let samplingPolicy = AdaptiveSamplingPolicy()
     private let recommendationEngine = RecommendationEngine()
@@ -145,10 +248,11 @@ final class MonitorViewModel: ObservableObject {
         loginLaunchRuntime: (any LoginLaunchRuntime)? = nil,
         sampler: any MonitorSamplingSource = MonitorSampler(),
         historyStore: HistoryStore = HistoryStore(),
+        processActions: ProcessActionController? = nil,
         dateProvider: @escaping @MainActor () -> Date = { Date() },
         startRefreshTask: Bool = true
     ) {
-        processActions = ProcessActionController()
+        self.processActions = processActions ?? ProcessActionController()
         loginLaunch = LoginLaunchCoordinator(runtime: loginLaunchRuntime)
         self.sampler = sampler
         self.historyStore = historyStore
@@ -172,9 +276,6 @@ final class MonitorViewModel: ObservableObject {
                     }
                 }
 
-                // A normal cancellation (for example during deinit) still
-                // gets a best-effort flush while the model is available.
-                await self?.finishRefreshLoop()
             }
         }
     }
@@ -362,7 +463,51 @@ final class MonitorViewModel: ObservableObject {
         )
     }
 
-    private func finishRefreshLoop() async {
+    func shutdown() async {
+        if shutdownCompleted { return }
+        if let shutdownTask {
+            await shutdownTask.value
+            return
+        }
+
+        isShuttingDown = true
+        let activeRefreshTask = refreshTask
+        refreshTask = nil
+        activeRefreshTask?.cancel()
+        await refreshWakeup.signal()
+
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            if let activeRefreshTask {
+                await activeRefreshTask.value
+            }
+            await self.waitForRefreshIdle()
+            await self.flushHistoryForShutdown()
+            await self.processActions.shutdown()
+        }
+        shutdownTask = task
+        await task.value
+        shutdownCompleted = true
+        shutdownTask = nil
+    }
+
+    private func waitForRefreshIdle() async {
+        guard refreshInFlight else { return }
+        await withCheckedContinuation { continuation in
+            refreshIdleWaiters.append(continuation)
+        }
+    }
+
+    private func markRefreshIdle() {
+        refreshInFlight = false
+        let waiters = refreshIdleWaiters
+        refreshIdleWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    private func flushHistoryForShutdown() async {
         let now = dateProvider()
         do {
             // Retry the complete recovery path during shutdown. A transient
@@ -398,6 +543,7 @@ final class MonitorViewModel: ObservableObject {
     }
 
     private func refreshOnce(at timestamp: Date, usesLiveClock: Bool) async {
+        guard !isShuttingDown else { return }
         guard timestamp.timeIntervalSince1970.isFinite else {
             lastError = "采样时间无效"
             return
@@ -435,7 +581,8 @@ final class MonitorViewModel: ObservableObject {
         while !queuedRefreshes.isEmpty {
             let queued = queuedRefreshes
             queuedRefreshes.removeAll(keepingCapacity: true)
-            if let latest = queued.max(by: Self.refreshRequestPrecedes) {
+            if !isShuttingDown,
+               let latest = queued.max(by: Self.refreshRequestPrecedes) {
                 await performRefresh(
                     at: latest.timestamp,
                     usesLiveClock: latest.usesLiveClock,
@@ -447,7 +594,7 @@ final class MonitorViewModel: ObservableObject {
                 waiter.continuation.resume()
             }
         }
-        refreshInFlight = false
+        markRefreshIdle()
     }
 
     private func performRefresh(
@@ -500,6 +647,7 @@ final class MonitorViewModel: ObservableObject {
         epoch: UInt64,
         requestSequence: UInt64
     ) async {
+        guard !isShuttingDown else { return }
         let token = UUID()
         await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in

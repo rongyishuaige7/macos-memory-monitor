@@ -534,6 +534,34 @@ final class ProcessActionControllerTests: XCTestCase {
         }
     }
 
+    func testShutdownDrainsBackgroundAuditAndIsIdempotent() async throws {
+        let process = makeProcess(pid: 4199, name: "self-target")
+        let runtime = FakeProcessActionRuntime()
+        let paths = makeActionPaths()
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let store = ProcessActionAuditStore(fileURL: paths.file)
+        let controller = ProcessActionController(
+            currentUserID: process.userID,
+            monitorPID: process.identity.pid,
+            runtime: runtime,
+            auditStore: store
+        )
+
+        controller.requestGracefulExit(for: process)
+        await controller.shutdown()
+        await controller.shutdown()
+
+        let events = try await store.load(now: runtime.wallClockNow())
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(events[0].action, .gracefulExit)
+        XCTAssertEqual(events[0].outcome, .denied)
+        XCTAssertNil(controller.auditError)
+
+        controller.requestGracefulExit(for: process)
+        let reloadedEvents = try await store.load(now: runtime.wallClockNow())
+        XCTAssertEqual(reloadedEvents.count, 1)
+    }
+
     private func waitUntil(
         _ condition: @escaping @MainActor () -> Bool,
         file: StaticString = #filePath,

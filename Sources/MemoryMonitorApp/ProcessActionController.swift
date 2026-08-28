@@ -197,6 +197,11 @@ final class ProcessActionController: ObservableObject {
     private var actionTask: Task<Void, Never>?
     private var timeoutReconciliationTask: Task<Void, Never>?
     private var timeoutReconciliationToken: UUID?
+    private var initialAuditLoadTask: Task<Void, Never>?
+    private var backgroundAuditTasks: [UUID: Task<Void, Never>] = [:]
+    private var shutdownTask: Task<Void, Never>?
+    private var shutdownCompleted = false
+    private var isShuttingDown = false
     private var operationToken = UUID()
     /// Every audit request gets a publication generation. A slower append or
     /// initial load must never put an older result back over a newer list.
@@ -229,7 +234,7 @@ final class ProcessActionController: ObservableObject {
             0.5
         )
 
-        Task { [weak self] in
+        initialAuditLoadTask = Task { [weak self] in
             await self?.loadAuditEvents()
         }
     }
@@ -237,6 +242,11 @@ final class ProcessActionController: ObservableObject {
     deinit {
         actionTask?.cancel()
         timeoutReconciliationTask?.cancel()
+        initialAuditLoadTask?.cancel()
+        shutdownTask?.cancel()
+        for task in backgroundAuditTasks.values {
+            task.cancel()
+        }
     }
 
     var isBusy: Bool {
@@ -320,21 +330,19 @@ final class ProcessActionController: ObservableObject {
     }
 
     func requestGracefulExit(for process: ProcessSnapshot) {
-        guard !isBusy else { return }
+        guard !isShuttingDown, !isBusy else { return }
         cancelCurrentTask()
 
         let validation = eligibility(for: process)
         guard validation.allowed else {
             targetProcess = process
             state = .denied(process.identity, validation.message)
-            Task { [weak self] in
-                await self?.appendAudit(
-                    action: .gracefulExit,
-                    outcome: .denied,
-                    process: process,
-                    detail: validation.message
-                )
-            }
+            launchAudit(
+                action: .gracefulExit,
+                outcome: .denied,
+                process: process,
+                detail: validation.message
+            )
             return
         }
 
@@ -348,6 +356,7 @@ final class ProcessActionController: ObservableObject {
     }
 
     func requestForceTerminate(for process: ProcessSnapshot) {
+        guard !isShuttingDown else { return }
         guard canForceTerminate(for: process.identity),
               let expected = targetProcess,
               expected.identity == process.identity else {
@@ -360,14 +369,12 @@ final class ProcessActionController: ObservableObject {
             } else {
                 state = .denied(process.identity, message)
             }
-            Task { [weak self] in
-                await self?.appendAudit(
-                    action: .forceTerminate,
-                    outcome: .denied,
-                    process: process,
-                    detail: message
-                )
-            }
+            launchAudit(
+                action: .forceTerminate,
+                outcome: .denied,
+                process: process,
+                detail: message
+            )
             return
         }
 
@@ -377,14 +384,12 @@ final class ProcessActionController: ObservableObject {
         let preflight = policy.validate(expected: expected, current: process)
         guard preflight.allowed else {
             state = .denied(process.identity, preflight.message)
-            Task { [weak self] in
-                await self?.appendAudit(
-                    action: .forceTerminate,
-                    outcome: .denied,
-                    process: expected,
-                    detail: preflight.message
-                )
-            }
+            launchAudit(
+                action: .forceTerminate,
+                outcome: .denied,
+                process: expected,
+                detail: preflight.message
+            )
             return
         }
 
@@ -399,6 +404,7 @@ final class ProcessActionController: ObservableObject {
     }
 
     func cancel(for identity: ProcessIdentity) {
+        guard !isShuttingDown else { return }
         guard stateIdentity == identity,
               let action = cancellableAction else { return }
         let previousTarget = targetProcess
@@ -406,14 +412,12 @@ final class ProcessActionController: ObservableObject {
         cancelCurrentTask()
         state = .cancelled(identity, cancellationMessage)
         if let previousTarget {
-            Task { [weak self] in
-                await self?.appendAudit(
-                    action: action,
-                    outcome: .cancelled,
-                    process: previousTarget,
-                    detail: cancellationMessage
-                )
-            }
+            launchAudit(
+                action: action,
+                outcome: .cancelled,
+                process: previousTarget,
+                detail: cancellationMessage
+            )
         }
     }
 
@@ -760,6 +764,82 @@ final class ProcessActionController: ObservableObject {
             process: process,
             detail: detail
         )
+    }
+
+    func shutdown() async {
+        if shutdownCompleted { return }
+        if let shutdownTask {
+            await shutdownTask.value
+            return
+        }
+
+        isShuttingDown = true
+        let interruptedAction = cancellableAction
+        let interruptedProcess = targetProcess
+        let interruptedMessage = cancellationMessage(for: state)
+        if let identity = stateIdentity, interruptedAction != nil {
+            state = .cancelled(identity, interruptedMessage)
+        }
+        cancelCurrentTask()
+
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            if let interruptedAction, let interruptedProcess {
+                await self.appendAudit(
+                    action: interruptedAction,
+                    outcome: .cancelled,
+                    process: interruptedProcess,
+                    detail: interruptedMessage
+                )
+            }
+            if let initialAuditLoadTask = self.initialAuditLoadTask {
+                await initialAuditLoadTask.value
+                self.initialAuditLoadTask = nil
+            }
+            await self.drainBackgroundAuditTasks()
+
+            do {
+                let now = self.runtime.wallClockNow()
+                try await self.auditStore.flush(now: now)
+                self.recentEvents = try await self.auditStore.load(now: now)
+                self.auditError = nil
+            } catch {
+                self.auditError = error.localizedDescription
+            }
+        }
+        shutdownTask = task
+        await task.value
+        shutdownCompleted = true
+        shutdownTask = nil
+    }
+
+    private func launchAudit(
+        action: ProcessActionKind,
+        outcome: ProcessActionOutcome,
+        process: ProcessSnapshot,
+        detail: String
+    ) {
+        guard !isShuttingDown else { return }
+        let id = UUID()
+        backgroundAuditTasks[id] = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.appendAudit(
+                action: action,
+                outcome: outcome,
+                process: process,
+                detail: detail
+            )
+            self.backgroundAuditTasks[id] = nil
+        }
+    }
+
+    private func drainBackgroundAuditTasks() async {
+        while !backgroundAuditTasks.isEmpty {
+            let tasks = Array(backgroundAuditTasks.values)
+            for task in tasks {
+                await task.value
+            }
+        }
     }
 
     private func appendAudit(
