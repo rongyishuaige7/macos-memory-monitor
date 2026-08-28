@@ -548,6 +548,89 @@ final class AppIntegrationTests: XCTestCase {
         XCTAssertTrue(model.history.contains { $0.workloadsSampledAt == secondSampleAt })
     }
 
+    func testMonitorViewModelPersistsSampleAfterEightHourClockJump() async throws {
+        let base = Date(timeIntervalSince1970: 1_700_050_000)
+        let jumped = base.addingTimeInterval(8 * 60 * 60)
+        let source = FakeMonitorSamplingSource(snapshots: [
+            makeMonitorSnapshot(
+                timestamp: base,
+                processes: [],
+                groups: [],
+                status: .unavailable(),
+                listedCount: 0,
+                didSampleProcesses: false
+            ),
+            makeMonitorSnapshot(
+                timestamp: jumped,
+                processes: [],
+                groups: [],
+                status: .unavailable(),
+                listedCount: 0,
+                didSampleProcesses: false
+            )
+        ])
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: url),
+            startRefreshTask: false
+        )
+
+        await model.refreshOnce(at: base)
+        await model.refreshOnce(at: jumped)
+
+        XCTAssertNil(model.historyError)
+        XCTAssertTrue(model.history.contains { $0.sourceSampledAt == base })
+        XCTAssertTrue(model.history.contains { $0.sourceSampledAt == jumped })
+    }
+
+    func testMonitorViewModelImmediatelyPersistsSamplesAfterLargeClockRollbacks() async throws {
+        let rollbackIntervals: [TimeInterval] = [
+            25 * 60 * 60,
+            7 * 24 * 60 * 60
+        ]
+
+        for (index, rollbackInterval) in rollbackIntervals.enumerated() {
+            let base = Date(timeIntervalSince1970: 1_700_060_000 + Double(index) * 1_000)
+            let rolledBack = base.addingTimeInterval(-rollbackInterval)
+            let source = FakeMonitorSamplingSource(snapshots: [
+                makeMonitorSnapshot(
+                    timestamp: base,
+                    processes: [],
+                    groups: [],
+                    status: .unavailable(),
+                    listedCount: 0,
+                    didSampleProcesses: false
+                ),
+                makeMonitorSnapshot(
+                    timestamp: rolledBack,
+                    processes: [],
+                    groups: [],
+                    status: .unavailable(),
+                    listedCount: 0,
+                    didSampleProcesses: false
+                )
+            ])
+            let (url, directory) = makeTemporaryHistoryURL()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let model = MonitorViewModel(
+                sampler: source,
+                historyStore: HistoryStore(fileURL: url),
+                startRefreshTask: false
+            )
+
+            await model.refreshOnce(at: base)
+            await model.refreshOnce(at: rolledBack)
+
+            XCTAssertNil(model.historyError)
+            XCTAssertTrue(
+                model.history.contains { $0.sourceSampledAt == rolledBack },
+                "rollback interval: \(rollbackInterval)"
+            )
+        }
+    }
+
     func testMonitorViewModelCoalescesConcurrentRefreshesToLatestRequest() async throws {
         let base = Date(timeIntervalSince1970: 1_700_100_000)
         let firstProcess = makeProcess(pid: 9020, name: "first")
@@ -596,6 +679,51 @@ final class AppIntegrationTests: XCTestCase {
         XCTAssertEqual(source.requestedTimestamps, [base, latestTimestamp])
         XCTAssertEqual(model.processes, [latestProcess])
         XCTAssertEqual(model.updatedAt, latestTimestamp)
+    }
+
+    func testMonitorViewModelQueuedLiveRefreshReadsClockAgainBeforeSampling() async throws {
+        let base = Date(timeIntervalSince1970: 1_700_105_000)
+        let delayed = base.addingTimeInterval(301)
+        let clock = MutableDateProvider(now: base)
+        let source = BlockingMonitorSamplingSource(snapshots: [
+            makeMonitorSnapshot(
+                timestamp: base,
+                processes: [],
+                groups: [],
+                status: .unavailable(),
+                listedCount: 0,
+                didSampleProcesses: false
+            ),
+            makeMonitorSnapshot(
+                timestamp: delayed,
+                processes: [],
+                groups: [],
+                status: .unavailable(),
+                listedCount: 0,
+                didSampleProcesses: false
+            )
+        ])
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: url),
+            dateProvider: { clock.now },
+            startRefreshTask: false
+        )
+
+        let firstTask = Task { await model.refreshOnce() }
+        await waitUntil { source.requestedTimestamps.count == 1 }
+        let queuedTask = Task { await model.refreshOnce() }
+        for _ in 0..<20 { await Task.yield() }
+        clock.now = delayed
+        source.releaseFirst()
+
+        await firstTask.value
+        await queuedTask.value
+
+        XCTAssertEqual(source.requestedTimestamps, [base, delayed])
+        XCTAssertEqual(model.updatedAt, delayed)
     }
 
     func testMonitorViewModelRejectsLateSnapshotWithoutCorruptingBaselines() async throws {
@@ -1089,6 +1217,87 @@ final class AppIntegrationTests: XCTestCase {
         XCTAssertEqual(model.recommendation?.id, "recovery-swap")
     }
 
+    func testMonitorViewModelSystemFailureInterruptsPendingPressureTransition() async throws {
+        let base = Date(timeIntervalSince1970: 1_700_710_000)
+        let pendingAt = base.addingTimeInterval(20)
+        let failedAt = base.addingTimeInterval(40)
+        let retriedAt = base.addingTimeInterval(50)
+        let critical = makePressureSystemSnapshot(
+            timestamp: base,
+            availableFraction: 0.05,
+            swapUsedBytes: 5 * 1024 * 1024 * 1024
+        )
+        let normalPending = makePressureSystemSnapshot(
+            timestamp: pendingAt,
+            availableFraction: 0.30,
+            swapUsedBytes: 0
+        )
+        let normalRetry = makePressureSystemSnapshot(
+            timestamp: retriedAt,
+            availableFraction: 0.30,
+            swapUsedBytes: 0
+        )
+        let source = FakeMonitorSamplingSource(snapshots: [
+            makeMonitorSnapshot(
+                timestamp: base,
+                processes: [],
+                groups: [],
+                status: .unavailable(),
+                listedCount: 0,
+                systemOverride: critical,
+                didSampleProcesses: false
+            ),
+            makeMonitorSnapshot(
+                timestamp: pendingAt,
+                processes: [],
+                groups: [],
+                status: .unavailable(),
+                listedCount: 0,
+                systemOverride: normalPending,
+                didSampleProcesses: false
+            ),
+            MonitorSnapshot(
+                timestamp: failedAt,
+                system: nil,
+                systemStatus: .error("provider failed"),
+                cpuTime: nil,
+                cpuStatus: .unavailable(),
+                gpuUsageFraction: nil,
+                gpuStatus: .unavailable(),
+                processes: [],
+                processStatus: .unavailable(),
+                listedProcessCount: 0,
+                sampledProcessCount: 0,
+                groups: [],
+                samplingMode: .background
+            ),
+            makeMonitorSnapshot(
+                timestamp: retriedAt,
+                processes: [],
+                groups: [],
+                status: .unavailable(),
+                listedCount: 0,
+                systemOverride: normalRetry,
+                didSampleProcesses: false
+            )
+        ])
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: url),
+            startRefreshTask: false
+        )
+
+        await model.refreshOnce(at: base)
+        await model.refreshOnce(at: pendingAt)
+        XCTAssertEqual(model.pressureLevel, .critical)
+        await model.refreshOnce(at: failedAt)
+        await model.refreshOnce(at: retriedAt)
+
+        XCTAssertEqual(model.pressureLevel, .critical)
+    }
+
     func testAuditFilteringSearchesSanitizedFieldsAndSortsNewestFirst() {
         let now = Date(timeIntervalSince1970: 2_000)
         let completed = ProcessActionAuditEvent(
@@ -1315,6 +1524,15 @@ final class AppIntegrationTests: XCTestCase {
                 listedProcessCount: listedCount
             )
         )
+    }
+}
+
+@MainActor
+private final class MutableDateProvider {
+    var now: Date
+
+    init(now: Date) {
+        self.now = now
     }
 }
 

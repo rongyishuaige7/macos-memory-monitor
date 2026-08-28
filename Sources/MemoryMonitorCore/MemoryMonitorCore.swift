@@ -3304,17 +3304,30 @@ public enum MemoryPressureLevel: String, Codable, Sendable, Equatable {
 /// current level, which prevents one noisy sample from changing the UI state.
 public struct MemoryPressureEvaluator: Sendable, Equatable {
     public static let defaultTransitionIntervalSeconds: TimeInterval = 30
+    public static let defaultMaximumObservationGapSeconds: TimeInterval = 60
 
     public let transitionIntervalSeconds: TimeInterval
+    public let maximumObservationGapSeconds: TimeInterval
     public private(set) var stableLevel: MemoryPressureLevel?
     public private(set) var pendingLevel: MemoryPressureLevel?
 
     private var pendingSince: Date?
+    private var pendingElapsedSeconds: TimeInterval = 0
+    private var lastObservationAt: Date?
 
     public init(
-        transitionIntervalSeconds: TimeInterval = MemoryPressureEvaluator.defaultTransitionIntervalSeconds
+        transitionIntervalSeconds: TimeInterval = MemoryPressureEvaluator.defaultTransitionIntervalSeconds,
+        maximumObservationGapSeconds: TimeInterval? = nil
     ) {
         self.transitionIntervalSeconds = Self.validatedInterval(transitionIntervalSeconds)
+        let defaultGap = max(
+            Self.defaultMaximumObservationGapSeconds,
+            self.transitionIntervalSeconds * 2
+        )
+        self.maximumObservationGapSeconds = Self.validatedObservationGap(
+            maximumObservationGapSeconds ?? defaultGap,
+            fallback: defaultGap
+        )
     }
 
     public var pressureActiveForSampling: Bool {
@@ -3322,65 +3335,108 @@ public struct MemoryPressureEvaluator: Sendable, Equatable {
     }
 
     public mutating func update(snapshot: SystemMemorySnapshot) -> MemoryPressureLevel {
-        // Keep debounce state unchanged when a caller bypasses the normal
-        // MonitorSnapshot validation path. Returning the conservative level
-        // preserves the non-optional API while preventing a malformed sample
-        // from becoming a durable/stable state.
+        // Invalid data interrupts continuity but does not replace the last
+        // stable level.
         guard snapshot.isStructurallyValid else {
+            interruptPendingTransition()
             return stableLevel ?? .critical
         }
         return update(observed: Self.observedLevel(for: snapshot), at: snapshot.timestamp)
     }
 
+    public mutating func update(
+        snapshot: SystemMemorySnapshot,
+        elapsedSincePrevious: TimeInterval?
+    ) -> MemoryPressureLevel {
+        guard snapshot.isStructurallyValid else {
+            interruptPendingTransition()
+            return stableLevel ?? .critical
+        }
+        return update(
+            observed: Self.observedLevel(for: snapshot),
+            at: snapshot.timestamp,
+            elapsedSincePrevious: elapsedSincePrevious
+        )
+    }
+
     @discardableResult
     public mutating func update(
         observed: MemoryPressureLevel,
-        at timestamp: Date
+        at timestamp: Date,
+        elapsedSincePrevious suppliedElapsed: TimeInterval? = nil
     ) -> MemoryPressureLevel {
-        // A non-finite wall-clock value cannot establish freshness. Return the
-        // existing stable level (or the observation for an uninitialized
-        // evaluator) without mutating debounce state.
+        // A non-finite timestamp cannot establish continuous evidence.
         guard timestamp.timeIntervalSince1970.isFinite else {
+            interruptPendingTransition()
             return stableLevel ?? observed
         }
 
+        let elapsed: TimeInterval?
+        if let suppliedElapsed {
+            guard suppliedElapsed.isFinite, suppliedElapsed >= 0 else {
+                interruptPendingTransition()
+                return stableLevel ?? observed
+            }
+            elapsed = suppliedElapsed
+        } else if let lastObservationAt {
+            let wallElapsed = timestamp.timeIntervalSince(lastObservationAt)
+            if wallElapsed.isFinite, wallElapsed >= 0 {
+                elapsed = wallElapsed
+            } else {
+                clearPendingLevel()
+                elapsed = nil
+            }
+        } else {
+            elapsed = nil
+        }
+        lastObservationAt = timestamp
+
         guard let stableLevel else {
             self.stableLevel = observed
-            pendingLevel = nil
-            pendingSince = nil
+            clearPendingLevel()
             return observed
         }
 
         guard observed != stableLevel else {
-            pendingLevel = nil
-            pendingSince = nil
+            clearPendingLevel()
             return stableLevel
         }
 
         if pendingLevel != observed {
             pendingLevel = observed
             pendingSince = timestamp
+            pendingElapsedSeconds = 0
             if transitionIntervalSeconds == 0 {
                 return commitPendingLevel()
             }
             return stableLevel
         }
 
-        guard let pendingSince else {
+        guard pendingSince != nil else {
             self.pendingSince = timestamp
+            pendingElapsedSeconds = 0
             return stableLevel
         }
 
-        // A wall-clock adjustment should not make a candidate wait forever.
-        if timestamp < pendingSince {
+        guard let elapsed, elapsed <= maximumObservationGapSeconds else {
+            // Failure gaps, sleep, and delayed providers begin a new evidence
+            // window instead of committing a candidate from two isolated
+            // observations.
             self.pendingSince = timestamp
+            pendingElapsedSeconds = 0
             return stableLevel
         }
 
-        if timestamp.timeIntervalSince(pendingSince) >= transitionIntervalSeconds {
+        pendingElapsedSeconds += elapsed
+        if pendingElapsedSeconds >= transitionIntervalSeconds {
             return commitPendingLevel()
         }
         return stableLevel
+    }
+
+    public mutating func interruptPendingTransition() {
+        clearPendingLevel()
+        lastObservationAt = nil
     }
 
     public static func observedLevel(for snapshot: SystemMemorySnapshot) -> MemoryPressureLevel {
@@ -3407,14 +3463,27 @@ public struct MemoryPressureEvaluator: Sendable, Equatable {
     private mutating func commitPendingLevel() -> MemoryPressureLevel {
         let committed = pendingLevel ?? stableLevel ?? .normal
         stableLevel = committed
+        clearPendingLevel()
+        return committed
+    }
+
+    private mutating func clearPendingLevel() {
         pendingLevel = nil
         pendingSince = nil
-        return committed
+        pendingElapsedSeconds = 0
     }
 
     private static func validatedInterval(_ value: TimeInterval) -> TimeInterval {
         guard value.isFinite else { return defaultTransitionIntervalSeconds }
         return max(value, 0)
+    }
+
+    private static func validatedObservationGap(
+        _ value: TimeInterval,
+        fallback: TimeInterval
+    ) -> TimeInterval {
+        guard value.isFinite, value >= 0 else { return fallback }
+        return value
     }
 
     private func isElevated(_ level: MemoryPressureLevel?) -> Bool {

@@ -2808,6 +2808,87 @@ final class MemoryMonitorCoreTests: XCTestCase {
         )
     }
 
+    func testMemoryPressureEvaluatorInterruptRequiresFreshContinuousEvidence() {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        var evaluator = MemoryPressureEvaluator(transitionIntervalSeconds: 30)
+
+        XCTAssertEqual(evaluator.update(observed: .normal, at: start), .normal)
+        XCTAssertEqual(
+            evaluator.update(observed: .critical, at: start.addingTimeInterval(10)),
+            .normal
+        )
+        XCTAssertEqual(evaluator.pendingLevel, .critical)
+
+        evaluator.interruptPendingTransition()
+
+        XCTAssertEqual(
+            evaluator.update(observed: .critical, at: start.addingTimeInterval(40)),
+            .normal
+        )
+        XCTAssertEqual(evaluator.pendingLevel, .critical)
+        XCTAssertEqual(
+            evaluator.update(observed: .critical, at: start.addingTimeInterval(70)),
+            .critical
+        )
+    }
+
+    func testMemoryPressureEvaluatorRestartsPendingWindowAfterLongObservationGap() {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        var evaluator = MemoryPressureEvaluator(
+            transitionIntervalSeconds: 30,
+            maximumObservationGapSeconds: 60
+        )
+
+        XCTAssertEqual(evaluator.update(observed: .normal, at: start), .normal)
+        XCTAssertEqual(
+            evaluator.update(observed: .attention, at: start.addingTimeInterval(1)),
+            .normal
+        )
+        XCTAssertEqual(
+            evaluator.update(observed: .attention, at: start.addingTimeInterval(301)),
+            .normal
+        )
+        XCTAssertEqual(evaluator.pendingLevel, .attention)
+        XCTAssertEqual(
+            evaluator.update(observed: .attention, at: start.addingTimeInterval(331)),
+            .attention
+        )
+    }
+
+    func testMemoryPressureEvaluatorUsesSuppliedElapsedAcrossWallClockJumps() {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        var evaluator = MemoryPressureEvaluator(transitionIntervalSeconds: 30)
+
+        XCTAssertEqual(
+            evaluator.update(observed: .normal, at: start, elapsedSincePrevious: nil),
+            .normal
+        )
+        XCTAssertEqual(
+            evaluator.update(
+                observed: .critical,
+                at: start.addingTimeInterval(8 * 60 * 60),
+                elapsedSincePrevious: 5
+            ),
+            .normal
+        )
+        XCTAssertEqual(
+            evaluator.update(
+                observed: .critical,
+                at: start.addingTimeInterval(16 * 60 * 60),
+                elapsedSincePrevious: 5
+            ),
+            .normal
+        )
+        XCTAssertEqual(
+            evaluator.update(
+                observed: .critical,
+                at: start.addingTimeInterval(24 * 60 * 60),
+                elapsedSincePrevious: 25
+            ),
+            .critical
+        )
+    }
+
     func testMemoryPressureEvaluatorIgnoresNonFiniteTimestamps() {
         let invalidDates = [
             Date(timeIntervalSince1970: .nan),

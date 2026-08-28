@@ -93,16 +93,14 @@ final class MonitorViewModel: ObservableObject {
     /// They are merged into the actor before the store is marked recovered.
     private var fallbackHistory: [MemoryHistoryRecord] = []
     private let historyRetentionInterval = HistoryStore.defaultRetentionInterval
-    /// Retention must not widen when the wall clock moves backwards. Keep the
-    /// latest finite persistence instant observed by this model and use it as
-    /// the lower bound for subsequent pruning/recovery attempts.
-    private var latestHistoryNow: Date?
     private var historyRetryAfter: Date?
     private var historyRetryAttempt = 0
     private let historyRetryBaseInterval: TimeInterval = 30
     private let historyRetryMaxInterval: TimeInterval = 5 * 60
     private var refreshInFlight = false
     private let refreshClock = ContinuousClock()
+    private let dateProvider: @MainActor () -> Date
+    private var lastPressureObservationInstant: ContinuousClock.Instant?
     private let clockRollbackTolerance: TimeInterval = 1
     private var refreshEpoch: UInt64 = 0
     private var lastObservedRefreshRequest: (
@@ -114,6 +112,7 @@ final class MonitorViewModel: ObservableObject {
     /// completed, so a health refresh cannot report success prematurely.
     private struct QueuedRefresh {
         let timestamp: Date
+        let usesLiveClock: Bool
         let epoch: UInt64
         let requestSequence: UInt64
         let token: UUID
@@ -146,12 +145,14 @@ final class MonitorViewModel: ObservableObject {
         loginLaunchRuntime: (any LoginLaunchRuntime)? = nil,
         sampler: any MonitorSamplingSource = MonitorSampler(),
         historyStore: HistoryStore = HistoryStore(),
+        dateProvider: @escaping @MainActor () -> Date = { Date() },
         startRefreshTask: Bool = true
     ) {
         processActions = ProcessActionController()
         loginLaunch = LoginLaunchCoordinator(runtime: loginLaunchRuntime)
         self.sampler = sampler
         self.historyStore = historyStore
+        self.dateProvider = dateProvider
         if startRefreshTask {
             refreshTask = Task { [weak self] in
                 while !Task.isCancelled {
@@ -335,10 +336,10 @@ final class MonitorViewModel: ObservableObject {
         // a manually requested pass cannot race a background sample.
         Task { [weak self] in
             guard let self else { return }
-            await self.refreshOnce(at: Date())
+            await self.refreshOnce()
             // Publish the check marker only after the requested sampling pass
             // (including any queued/latest-request coalescing) has finished.
-            self.healthCheckedAt = Date()
+            self.healthCheckedAt = self.dateProvider()
         }
     }
 
@@ -351,7 +352,7 @@ final class MonitorViewModel: ObservableObject {
     /// Keeping this finite is important: the task can release its temporary
     /// strong reference to `self` before entering the next wait.
     private func refreshPass() async -> RefreshWaitConfiguration {
-        await refreshOnce(at: Date())
+        await refreshOnce()
         return RefreshWaitConfiguration(
             interval: samplingPolicy.intervalSeconds(
                 panelPresented: isPanelPresented,
@@ -362,7 +363,7 @@ final class MonitorViewModel: ObservableObject {
     }
 
     private func finishRefreshLoop() async {
-        let now = effectiveHistoryNow(Date())
+        let now = dateProvider()
         do {
             // Retry the complete recovery path during shutdown. A transient
             // write failure may have left samples in `fallbackHistory`; a
@@ -388,7 +389,15 @@ final class MonitorViewModel: ObservableObject {
         historyDiagnostics = await historyStore.diagnostics()
     }
 
-    func refreshOnce(at timestamp: Date = Date()) async {
+    func refreshOnce() async {
+        await refreshOnce(at: dateProvider(), usesLiveClock: true)
+    }
+
+    func refreshOnce(at timestamp: Date) async {
+        await refreshOnce(at: timestamp, usesLiveClock: false)
+    }
+
+    private func refreshOnce(at timestamp: Date, usesLiveClock: Bool) async {
         guard timestamp.timeIntervalSince1970.isFinite else {
             lastError = "采样时间无效"
             return
@@ -404,6 +413,7 @@ final class MonitorViewModel: ObservableObject {
         if refreshInFlight {
             await enqueueRefresh(
                 at: timestamp,
+                usesLiveClock: usesLiveClock,
                 epoch: epoch,
                 requestSequence: requestSequence
             )
@@ -413,6 +423,7 @@ final class MonitorViewModel: ObservableObject {
         refreshInFlight = true
         await performRefresh(
             at: timestamp,
+            usesLiveClock: usesLiveClock,
             epoch: epoch,
             requestSequence: requestSequence
         )
@@ -427,6 +438,7 @@ final class MonitorViewModel: ObservableObject {
             if let latest = queued.max(by: Self.refreshRequestPrecedes) {
                 await performRefresh(
                     at: latest.timestamp,
+                    usesLiveClock: latest.usesLiveClock,
                     epoch: latest.epoch,
                     requestSequence: latest.requestSequence
                 )
@@ -440,6 +452,7 @@ final class MonitorViewModel: ObservableObject {
 
     private func performRefresh(
         at timestamp: Date,
+        usesLiveClock: Bool,
         epoch: UInt64,
         requestSequence: UInt64
     ) async {
@@ -454,22 +467,28 @@ final class MonitorViewModel: ObservableObject {
         ) else {
             return
         }
-        let persistenceNow = effectiveHistoryNow(timestamp)
-        await loadHistoryIfNeeded(at: persistenceNow)
+        let historyLoadNow = usesLiveClock ? dateProvider() : timestamp
+        await loadHistoryIfNeeded(at: historyLoadNow)
+        let samplingTimestamp = usesLiveClock ? dateProvider() : timestamp
+        guard samplingTimestamp.timeIntervalSince1970.isFinite else {
+            lastError = "采样时间无效"
+            return
+        }
         let mode = samplingPolicy.samplingMode(
             panelPresented: isPanelPresented,
             pressureActive: pressureEvaluator.pressureActiveForSampling,
-            now: timestamp,
+            now: samplingTimestamp,
             lastProcessSampleAt: lastUsableProcessSampleAt
         )
-        let snapshot = await sampler.sample(mode: mode, at: timestamp)
+        let snapshot = await sampler.sample(mode: mode, at: samplingTimestamp)
         guard snapshot.timestamp.timeIntervalSince1970.isFinite else {
             lastError = "采样源返回了无效时间"
             return
         }
         await apply(
             snapshot: snapshot,
-            persistenceNow: effectiveHistoryNow(snapshot.timestamp),
+            persistenceNow: snapshot.timestamp,
+            usesLiveClock: usesLiveClock,
             epoch: epoch,
             requestSequence: requestSequence
         )
@@ -477,6 +496,7 @@ final class MonitorViewModel: ObservableObject {
 
     private func enqueueRefresh(
         at timestamp: Date,
+        usesLiveClock: Bool,
         epoch: UInt64,
         requestSequence: UInt64
     ) async {
@@ -490,6 +510,7 @@ final class MonitorViewModel: ObservableObject {
                 queuedRefreshes.append(
                     QueuedRefresh(
                         timestamp: timestamp,
+                        usesLiveClock: usesLiveClock,
                         epoch: epoch,
                         requestSequence: requestSequence,
                         token: token,
@@ -558,6 +579,7 @@ final class MonitorViewModel: ObservableObject {
     private func apply(
         snapshot: MonitorSnapshot,
         persistenceNow: Date,
+        usesLiveClock: Bool,
         epoch: UInt64,
         requestSequence: UInt64
     ) async {
@@ -610,7 +632,23 @@ final class MonitorViewModel: ObservableObject {
         }
 
         if let systemSnapshot = snapshot.validatedSystemSample {
-            pressureLevel = pressureEvaluator.update(snapshot: systemSnapshot)
+            if usesLiveClock {
+                let observationInstant = refreshClock.now
+                let elapsed = lastPressureObservationInstant.map {
+                    Self.elapsedSeconds(from: $0, to: observationInstant)
+                }
+                if lastPressureObservationInstant == nil {
+                    pressureEvaluator.interruptPendingTransition()
+                }
+                pressureLevel = pressureEvaluator.update(
+                    snapshot: systemSnapshot,
+                    elapsedSincePrevious: elapsed
+                )
+                lastPressureObservationInstant = observationInstant
+            } else {
+                lastPressureObservationInstant = nil
+                pressureLevel = pressureEvaluator.update(snapshot: systemSnapshot)
+            }
             let historyGroups = processSampleUsable ? snapshot.groups : []
             if historyStoreAvailable {
                 do {
@@ -651,6 +689,9 @@ final class MonitorViewModel: ObservableObject {
                 )
             }
             system = systemSnapshot
+        } else {
+            pressureEvaluator.interruptPendingTransition()
+            lastPressureObservationInstant = nil
         }
 
         let recommendationContext = RecommendationContext(
@@ -727,6 +768,16 @@ final class MonitorViewModel: ObservableObject {
         return lhs.requestSequence < rhs.requestSequence
     }
 
+    private static func elapsedSeconds(
+        from start: ContinuousClock.Instant,
+        to end: ContinuousClock.Instant
+    ) -> TimeInterval {
+        guard end >= start else { return 0 }
+        let components = start.duration(to: end).components
+        return Double(components.seconds)
+            + Double(components.attoseconds) / 1_000_000_000_000_000_000
+    }
+
     private func refreshEpochForRequest(
         at timestamp: Date,
         observedAt instant: ContinuousClock.Instant
@@ -764,8 +815,10 @@ final class MonitorViewModel: ObservableObject {
         previousRecommendationProcessInventoryIsComplete = false
         previousRecommendationPressureLevel = nil
         pressureEvaluator = MemoryPressureEvaluator(
-            transitionIntervalSeconds: pressureEvaluator.transitionIntervalSeconds
+            transitionIntervalSeconds: pressureEvaluator.transitionIntervalSeconds,
+            maximumObservationGapSeconds: pressureEvaluator.maximumObservationGapSeconds
         )
+        lastPressureObservationInstant = nil
         pressureLevel = nil
         systemDataIsUsable = false
         recommendation = nil
@@ -828,35 +881,6 @@ final class MonitorViewModel: ObservableObject {
         let delay = min(historyRetryBaseInterval * multiplier, historyRetryMaxInterval)
         historyRetryAfter = timestamp.addingTimeInterval(delay)
         historyRetryAttempt = min(historyRetryAttempt + 1, 5)
-    }
-
-    private func effectiveHistoryNow(_ candidate: Date) -> Date {
-        let seconds = candidate.timeIntervalSince1970
-        guard seconds.isFinite,
-              seconds >= -62_135_596_800,
-              seconds <= 253_402_300_799 else {
-            return candidate
-        }
-        guard let latestHistoryNow else {
-            self.latestHistoryNow = candidate
-            return candidate
-        }
-        if latestHistoryNow >= candidate {
-            return latestHistoryNow
-        }
-
-        // A wall-clock jump can otherwise move the pruning anchor years into
-        // the future. Advance at a bounded rate so a bad clock cannot cause a
-        // permanent destructive retention decision. Normal monitor samples
-        // are much closer than this bound; a real clock catch-up converges over
-        // subsequent passes.
-        let maximumForwardStep: TimeInterval = 15 * 60
-        let latestSeconds = latestHistoryNow.timeIntervalSince1970
-        let boundedSeconds = min(seconds, latestSeconds + maximumForwardStep)
-        guard boundedSeconds.isFinite else { return latestHistoryNow }
-        let bounded = Date(timeIntervalSince1970: boundedSeconds)
-        self.latestHistoryNow = bounded
-        return bounded
     }
 
     /// Keeps the already loaded 24-hour history visible when the disk store
