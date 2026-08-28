@@ -2160,10 +2160,27 @@ private struct ProcessDetailView: View {
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Label("进程不在当前快照中，因此没有可执行操作。", systemImage: "lock.shield")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            if let status = actions.status(for: identity) {
+                ProcessActionStatusRow(status: status)
+            }
+            if actions.canCancel(for: identity) {
+                Button {
+                    actions.cancel(for: identity)
+                } label: {
+                    Label("停止跟踪", systemImage: "stop.circle")
+                }
+                .buttonStyle(.bordered)
+                .help("停止等待当前进程操作，不发送新的信号")
+                Text("当前快照无法确认目标状态，只能停止跟踪；不会提供强制结束入口。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Label("进程不在当前快照中，因此没有新的退出或强制结束操作。", systemImage: "lock.shield")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
