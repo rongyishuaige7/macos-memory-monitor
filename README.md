@@ -606,3 +606,11 @@ open "$HOME/Library/Application Support/MemoryMonitor/dist/MemoryMonitor.app"
 - 设计与验证记录见 [`docs/reliability-hardening-v1.0.1.md`](docs/reliability-hardening-v1.0.1.md)。
 
 当前实现已通过核心与应用测试、Debug/Release 严格并发构建、Release probe 和 app bundle 签名验证；本阶段未自动提交或推送 Git 改动。
+
+### Phase 11 completed：v1.0.3e 状态收口验收（2026-08-28）
+
+- freshness marker 只用于时间可信且完整的 workload 观测；写入/合并拒绝远离所属分钟桶的 marker，历史分析跳过旧文件中的异常 marker，并拒绝跨越过大的记录间隔。
+- `swift test --parallel`：223/223 通过；新增 marker 相对偏差、记录间隔和亚秒观测回归测试。
+- `swift build --configuration debug -Xswiftc -strict-concurrency=complete` 和 `swift build --configuration release -Xswiftc -strict-concurrency=complete`：通过。
+- Release `memory-monitor-probe`：成功完成本机只读采样，进程覆盖率受系统权限限制时明确显示为部分可用。
+- `scripts/build-app.sh`：成功生成 arm64 Release `MemoryMonitor.app`；`CFBundleShortVersionString=1.0.3`、`CFBundleVersion=13`，ad-hoc 签名及 `codesign --verify --deep --strict` 通过。
