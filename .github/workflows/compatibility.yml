@@ -1,0 +1,75 @@
+name: Compatibility Matrix
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/compatibility.yml
+      - Package.swift
+      - Resources/**
+      - Sources/**
+      - Tests/**
+      - scripts/**
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/workflows/compatibility.yml
+      - Package.swift
+      - Resources/**
+      - Sources/**
+      - Tests/**
+      - scripts/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compatibility-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compatibility:
+    name: macOS ${{ matrix.os_major }} arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            os_major: 14
+          - runner: macos-15
+            os_major: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Record runner environment
+        run: |
+          sw_vers
+          uname -m
+          swift --version
+
+      - name: Prepare report directory
+        run: mkdir -p "$GITHUB_WORKSPACE/compatibility-artifacts"
+
+      - name: Verify compatibility
+        env:
+          EXPECTED_MACOS_MAJOR: ${{ matrix.os_major }}
+          EXPECTED_ARCHITECTURE: arm64
+        run: >-
+          ./scripts/verify-compatibility.sh
+          "$GITHUB_WORKSPACE/compatibility-artifacts/macos-${{ matrix.os_major }}-arm64.json"
+
+      - name: Upload redacted compatibility report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compatibility-macos-${{ matrix.os_major }}-arm64
+          path: compatibility-artifacts/macos-${{ matrix.os_major }}-arm64.json
+          if-no-files-found: ignore
+          retention-days: 14
