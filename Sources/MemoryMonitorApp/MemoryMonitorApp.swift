@@ -21,7 +21,6 @@ extension MonitorSampler: MonitorSamplingSource {
     }
 }
 
-@main
 struct MemoryMonitorApp: App {
     @NSApplicationDelegateAdaptor(MemoryMonitorApplicationDelegate.self)
     private var applicationDelegate
