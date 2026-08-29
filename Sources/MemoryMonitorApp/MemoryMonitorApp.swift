@@ -588,7 +588,9 @@ final class MonitorViewModel: ObservableObject {
             let queued = queuedRefreshes
             queuedRefreshes.removeAll(keepingCapacity: true)
             if !isShuttingDown,
-               let latest = queued.max(by: Self.refreshRequestPrecedes) {
+               let latest = queued.max(by: { lhs, rhs in
+                   Self.refreshRequestPrecedes(lhs, rhs)
+               }) {
                 await performRefresh(
                     at: latest.timestamp,
                     usesLiveClock: latest.usesLiveClock,
@@ -1715,7 +1717,9 @@ private struct MonitorPopover: View {
             case .user: return !process.isSystem
             case .system: return process.isSystem
             }
-        }.filter(matchesSearch)
+        }.filter { process in
+            matchesSearch(process)
+        }
 
         switch processSortMode {
         case .footprint:
@@ -1797,7 +1801,9 @@ private struct MonitorPopover: View {
             guard scopeMatches, !normalizedSearchText.isEmpty else { return scopeMatches }
             let groupFieldsMatch = [group.title, group.id, group.representativeProcess]
                 .contains { $0.lowercased().contains(normalizedSearchText) }
-            return groupFieldsMatch || model.processes(in: group).contains(where: matchesSearch)
+            return groupFieldsMatch || model.processes(in: group).contains { process in
+                matchesSearch(process)
+            }
         }.sorted {
             let leftValue: UInt64
             let rightValue: UInt64

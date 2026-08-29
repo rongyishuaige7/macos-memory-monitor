@@ -1,5 +1,5 @@
 import Combine
-import Darwin
+@preconcurrency import Darwin
 import Foundation
 import MemoryMonitorCore
 
