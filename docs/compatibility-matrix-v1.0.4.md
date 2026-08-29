@@ -12,20 +12,28 @@
 
 ## 当前矩阵
 
-| 日期 | 来源 | 产品 | 源码 | macOS | 架构 | 系统 | CPU | GPU | 进程采样 | 手工权限/登录项/audit-token |
+| 日期 | 来源 | 产品 | 源码 | macOS | 架构 | 系统 | CPU | GPU | 进程采样 | 手工权限 / 登录项注册流程 / audit-token |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 2026-08-29 | 本机桌面 | 1.0.3 (13) | `30571b8`, clean | 26.5.1 | arm64 | 部分可用且数据有效 | 可用 | 可用 | 406/636，63.84%，部分可用且数据有效 | 未执行 / 未执行 / 未执行 |
+| 2026-08-29 | 本机桌面（v1.0.4c3b） | 1.0.3 (13) | `bb57ff6`, clean | 26.5.1 | arm64 | 部分可用且数据有效 | 可用 | 可用 | 424/671，63.19%，estimated 且可用 | 未执行 / 未执行（状态 `not_found`） / `passed`（专用子进程） |
+| 2026-08-29 | 本机桌面（v1.0.4b 历史） | 1.0.3 (13) | `30571b8`, clean | 26.5.1 | arm64 | 部分可用且数据有效 | 可用 | 可用 | 406/636，63.84%，部分可用且数据有效 | 未执行 / 未执行 / 未执行 |
 | 2026-08-29 | GitHub 托管 CI，[run 33254292547](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/33254292547) | 1.0.3 (13) | `18e7e5f`, clean | 14.8.7 | arm64 | 部分可用且数据有效 | 可用 | 不可用 | 205/402，51.00%，部分可用且数据有效 | 未执行 / 未执行 / 未执行 |
 | 2026-08-29 | GitHub 托管 CI，[run 33254292547](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/33254292547) | 1.0.3 (13) | `18e7e5f`, clean | 15.7.7 | arm64 | 部分可用且数据有效 | 可用 | 不可用 | 261/490，53.27%，部分可用且数据有效 | 未执行 / 未执行 / 未执行 |
 
 ## 当前主机证据
 
-- 报告 schema：`1`；源码 revision：`30571b873659f287a2bc6694e9e704a92b2d7271`；工作区状态：`clean`。
-- 完整采样总耗时约 `45.7 ms`，其中进程扫描约 `44.0 ms`。
-- 系统内存使用率按可回收内存估算，因此质量为 `estimated`，结构化数据有效。
-- CPU 与 GPU 本轮均返回有效值。
-- 进程覆盖率为 `406/636`；230 个条目在扫描期间退出、身份变化或受系统权限限制。覆盖率高于当前可用阈值，但不能视为完整枚举。
-- 报告限制项为 `login_item_registration_not_run`、`audit_token_signal_not_run` 和 `system_permissions_not_changed`。
+- c3b 桌面报告 schema：`1`；源码 revision：`bb57ff6fa04af48d253751b56cde4f3e1d40d175`；工作区状态：`clean`；产品为 `1.0.3 (build 13)`，运行于 macOS `26.5.1` / `arm64`。
+- 两份报告观测时间为 `2026-08-29T14:01:38Z`，进程覆盖率为 `424/671`（`0.6318926975`，约 `63.19%`）；247 个条目在扫描期间退出、身份变化或受系统权限限制。结果高于当前可用阈值，但不能视为完整枚举。
+- 系统内存质量为 `estimated`，进程报告 `usable=true` 且 `samplingPerformed=true`；本轮 CPU 与 GPU 数据均有效（来自同一构建的发布验收采样）。
+- 只读基线的 audit-token 为 `not_run`；显式 opt-in 报告为 `passed`，目标固定为 `dedicated_child`，信号固定为 `SIGKILL`，专用子进程已回收。
+- 两份报告的登录项状态均为 `not_found`。`scripts/verify-desktop-integration.sh` 因该状态未能完成登录项验收而返回 `1`，但按设计保留 `0600` 报告；这不是隐藏失败。
+- 本机未执行登录项注册/系统批准、重新登录自动启动或 TCC/隐私权限前后对照。打开 bundle 时还观察到 `LSMultipleInstancesProhibited=true` 将请求路由到已有实例，未创建第二个进程。
+- c3b 报告文件位于 `/Users/rongyi/Applications/MemoryMonitor-c3b/desktop-baseline.json` 和 `/Users/rongyi/Applications/MemoryMonitor-c3b/desktop-audit.json`，只作为本机复核材料，不提交到仓库。
+
+## 历史 v1.0.4b 本机证据
+
+- 当时报告 schema 为 `1`；源码 revision：`30571b873659f287a2bc6694e9e704a92b2d7271`；工作区状态：`clean`。
+- 完整采样总耗时约 `45.7 ms`，其中进程扫描约 `44.0 ms`；进程覆盖率为 `406/636`，230 个条目在扫描期间退出、身份变化或受系统权限限制。
+- 系统内存使用率按可回收内存估算，CPU 与 GPU 数据有效；登录项注册、audit-token 信号和系统权限变化均未执行。
 
 ## macOS 14/15 CI 证据
 

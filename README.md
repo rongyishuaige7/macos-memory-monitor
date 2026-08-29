@@ -6,7 +6,7 @@
 - 物理内存基线：16 GiB
 - 首版形态：菜单栏常驻 + 点击弹出详细面板
 - 首版范围（历史基线）：只监视、分析和给出建议，不执行进程退出或强制结束
-- 当前 App bundle：v1.0.3（build 13）；源码开发阶段：v1.0.4c 兼容性矩阵
+- 当前 App bundle：v1.0.3（build 13）；源码开发阶段：v1.0.4c3b 桌面集成验证
 - 当前本地 App bundle 使用 ad-hoc 签名；Developer ID、notarization 和沙盒策略尚未启用
 - 文档状态：设计基线，可作为后续实现的验收依据
 
@@ -628,7 +628,7 @@ open "$HOME/Library/Application Support/MemoryMonitor/dist/MemoryMonitor.app"
 - `memory-monitor-probe --compatibility-json` 输出带 schema 版本的脱敏 JSON，只包含产品、平台、采集源质量、耗时和进程覆盖率，不包含 PID、进程名、路径、用户或设备标识。
 - `scripts/collect-compatibility-report.sh` 注入 `Info.plist` 版本、Git revision 和源码状态，校验结构后把 JSON 写到标准输出；脚本不修改登录项、系统权限或进程状态。
 - 发布验收脚本现在同时验证人类可读 probe 和结构化报告，并要求 arm64、完整进程扫描及三项明确的未执行限制。
-- 当前干净源码基线 `30571b8` 在 arm64 macOS 26.5.1 的一次采样中读取 406/636 个进程；系统、CPU、GPU 数据有效，权限受限条目仍按部分可用呈现。
+- 当时的干净源码基线 `30571b8` 在 arm64 macOS 26.5.1 的一次采样中读取 406/636 个进程；系统、CPU、GPU 数据有效，权限受限条目仍按部分可用呈现。后续桌面集成证据见 Phase 15。
 - 当前矩阵和缺失环境见 [`docs/compatibility-matrix-v1.0.4.md`](docs/compatibility-matrix-v1.0.4.md)。
 
 ### Phase 14 completed：v1.0.4c1/c2 自动兼容性矩阵
@@ -638,3 +638,13 @@ open "$HOME/Library/Application Support/MemoryMonitor/dist/MemoryMonitor.app"
 - [run 33254292547](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/33254292547) 两个 job 均通过：macOS 14.8.7 采样 `205/402`，macOS 15.7.7 采样 `261/490`；系统与 CPU 数据可用，托管虚拟环境没有可读 GPU 利用率。
 - 矩阵运行推动修复了 Swift 6.0/6.1 的 Optional 匹配、actor 文件锁隔离、同步闭包隔离和旧 Darwin SDK 导入差异；本机 Swift 6.3.3 回归保持通过。
 - 本阶段不验证真实 GUI 会话中的登录项、TCC 权限切换或 audit-token 发信号；这些工作保留给 v1.0.4c3，并只允许使用专用测试进程。
+
+### Phase 15 completed：v1.0.4c3b 桌面集成诊断（2026-08-29）
+
+- 新增严格参数路由的桌面诊断入口：`--desktop-integration-json` 只读采集登录项状态和进程覆盖率；未知参数在构造 GUI 之前以非零状态退出。
+- 新增显式双重 opt-in 的专用子进程 audit-token 检查。检查器固定创建 `/bin/sleep` 子进程，只通过生产 `sendForce` 发送绑定的 `SIGKILL`，并在成功或失败后回收子进程；普通 `swift test` 不触发真实信号。
+- `swift test --parallel`：233/233 通过；Debug/Release 严格并发构建、`scripts/verify-release.sh`、arm64 App bundle 签名和桌面诊断结构校验均完成。桌面验证脚本的整体退出码因登录项 `not_found` 保持为 `1`，报告已保留供人工步骤复核。
+- 本机 c3b bundle 在 macOS 26.5.1 arm64 上生成 schema 1 报告，源码 revision 为 `bb57ff6fa04af48d253751b56cde4f3e1d40d175`、checkout 为 `clean`；进程采样 `424/671`（63.19%），质量为 `estimated` 且可用。
+- 只读基线的 audit-token 为 `not_run`；显式专用子进程报告为 `passed`，目标和信号分别固定为 `dedicated_child` / `SIGKILL`。两份报告的 `SMAppService.mainApp` 状态均为 `not_found`。
+- `scripts/verify-desktop-integration.sh` 对当前登录项状态按设计返回非零并保留 `0600` 报告；这表示登录项服务尚未被当前 bundle 注册或发现，不是被隐藏的“通过”。本阶段未执行登录项注册/系统批准、重新登录自动启动或 TCC 权限前后对照，也未修改系统状态。
+- 详细边界、原始报告位置和待人工步骤见 [`docs/desktop-integration-validation-v1.0.4.md`](docs/desktop-integration-validation-v1.0.4.md)；本机证据已同步到 [`docs/compatibility-matrix-v1.0.4.md`](docs/compatibility-matrix-v1.0.4.md)。

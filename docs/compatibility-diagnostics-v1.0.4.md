@@ -31,6 +31,14 @@ v1.0.4c 使用 GitHub 托管的 macOS arm64 runner 补齐最低系统版本附�
 
 v1.0.4c3 把真实桌面验证拆成默认只读的状态采集、显式 opt-in 的专用子进程 audit-token 检查，以及只能由用户完成的登录项/TCC 状态变化。具体安全边界、报告结构和人工步骤见 [`desktop-integration-validation-v1.0.4.md`](desktop-integration-validation-v1.0.4.md)。
 
+### v1.0.4c3b 本机证据（2026-08-29）
+
+在 macOS `26.5.1` / `arm64` 的真实登录桌面中，使用源码 revision `bb57ff6fa04af48d253751b56cde4f3e1d40d175`（`clean` checkout）和 `1.0.3 (build 13)` arm64 bundle 生成两份 schema `1` 脱敏报告。进程采样为 `424/671`（覆盖率约 `63.19%`），质量为 `estimated`、结果可用；报告明确说明 247 个条目在扫描期间退出、身份变化或受权限限制。
+
+默认只读报告的 audit-token 状态为 `not_run`；在 `MEMORY_MONITOR_ALLOW_AUDIT_TOKEN_TEST=1` 和固定参数双重 opt-in 下，专用 `/bin/sleep` 子进程检查结果为 `passed`，目标/信号固定为 `dedicated_child` / `SIGKILL`，子进程已回收。两份报告读取到的 `SMAppService.mainApp` 状态均为 `not_found`，所以桌面验证脚本按设计返回 `1` 并保留 `0600` 报告，不能将其解释为登录项已注册或获批。
+
+本机尚未执行登录项注册与系统批准、重新登录自动启动，以及 TCC/隐私权限变化前后对照；没有因为采样或 audit-token 成功而补写这些结论。尝试通过 Launch Services 打开 bundle 时受到 `LSMultipleInstancesProhibited=true` 的单实例配置影响，请求被已有实例接收，未创建第二个进程，这同样不构成重新登录证据。详细报告路径和人工步骤见 [`desktop-integration-validation-v1.0.4.md`](desktop-integration-validation-v1.0.4.md)。
+
 ## 风险
 
 - 编译架构反映当前二进制，不代表用户是否安装了另一份架构的 App；文案必须使用“当前进程架构”和“发布目标”而非绝对兼容承诺；
@@ -62,7 +70,7 @@ v1.0.4c3 把真实桌面验证拆成默认只读的状态采集、显式 opt-in 
 2. **v1.0.4b**：结构化脱敏报告、可重复采集脚本和当前主机基线。
 3. **v1.0.4c1（已完成）**：建立 macOS 14/15 arm64 的只读自动门禁和脱敏 artifact，不提前写入兼容结论。
 4. **v1.0.4c2（已完成）**：复核实际 workflow 报告，把 runner 来源、run 和真实采样摘要写入矩阵。
-5. **v1.0.4c3a**：定义真实桌面证据、安全门和人工验证边界。
-6. **v1.0.4c3b**：实现脱敏桌面报告和只针对专用子进程的 audit-token 验证入口。
-7. **v1.0.4c3c**：采集本机证据；登录项批准、重新登录和权限前后对照只记录用户实际完成的步骤。
+5. **v1.0.4c3a（已完成）**：定义真实桌面证据、安全门和人工验证边界。
+6. **v1.0.4c3b（已完成）**：实现脱敏桌面报告和只针对专用子进程的 audit-token 验证入口，并完成本机只读/audit-token 证据采集。
+7. **v1.0.4c3c（待人工）**：登录项批准、重新登录和权限前后对照只记录用户实际完成的步骤。
 8. **后续发布阶段**：根据矩阵决定是否扩大架构支持或调整发布声明。

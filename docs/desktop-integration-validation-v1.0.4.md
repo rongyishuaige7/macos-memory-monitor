@@ -30,6 +30,18 @@
 
 `scripts/verify-desktop-integration.sh` 负责校验显式 `.app` 路径、bundle identifier、签名、架构和 JSON 结构。脚本要求显式报告输出路径，不安装应用、不改变登录项或权限；带 audit-token 参数时再次检查 opt-in 环境变量。报告只属于所传入的那个 bundle 和当时桌面会话。
 
+## c3b 本机证据（2026-08-29）
+
+本次使用同一份 arm64 构建和同一路径完成两次采集：`/Users/rongyi/Applications/MemoryMonitor-c3b/MemoryMonitor.app`。bundle 版本为 `1.0.3 (build 13)`，源码 revision 为 `bb57ff6fa04af48d253751b56cde4f3e1d40d175`，checkout 状态为 `clean`，运行环境为 macOS `26.5.1` / `arm64`。报告写入本机 `0600` 文件，未纳入仓库：
+
+- 只读基线：`/Users/rongyi/Applications/MemoryMonitor-c3b/desktop-baseline.json`；schema `1`，观测时间 `2026-08-29T14:01:38Z`，进程采样 `424/671`（`0.6318926975`，约 `63.19%`），质量为 `estimated`，`usable=true`、`samplingPerformed=true`。扫描期间有 247 个条目退出、身份变化或受权限限制。
+- 显式 audit-token 检查：`/Users/rongyi/Applications/MemoryMonitor-c3b/desktop-audit.json`；除上述采样结果外，`auditToken.result=passed`，目标固定为 `dedicated_child`，信号固定为 `SIGKILL`。专用 `/bin/sleep` 子进程已成功终止并回收。
+- 两份报告的 `loginItem.state` 都是 `not_found`。因此验证脚本按设计返回非零并保留报告，不能把“读取到状态”解释为登录项注册或批准成功。
+- 本次没有执行登录项注册/系统批准、关闭并重新登录后的自动启动验证，也没有改变 TCC/隐私权限或采集权限变化前后对照；对应限制项继续保留在报告和矩阵中。
+- 尝试以 Finder/Launch Services 打开该 bundle 时，`LSMultipleInstancesProhibited=true` 使请求路由到已有的 `MemoryMonitor.app` 实例，未创建第二个进程。该行为记录为单实例配置的桌面观察，不作为登录后自动启动证据。
+
+上述两份报告的只读字段和限制项均通过 `scripts/verify-desktop-integration.sh` 的结构校验；登录项未发现导致的退出码 `1` 是待人工步骤的明确信号，不是脚本成功状态被吞掉。
+
 ## 人工验证流程
 
 1. 从当前源码构建并签名固定路径下的 `MemoryMonitor.app`，记录只读基线报告。
@@ -65,7 +77,7 @@
 
 ## 分阶段交付
 
-1. **v1.0.4c3a**：定义桌面证据、安全门和人工验证边界。
-2. **v1.0.4c3b**：实现脱敏桌面报告、严格参数路由、验证脚本和专用子进程 audit-token 检查。
-3. **v1.0.4c3c**：在当前真实桌面采集只读基线和 audit-token 证据；登录项批准、重新登录及 TCC 前后对照只按用户实际完成情况记录。
+1. **v1.0.4c3a（已完成）**：定义桌面证据、安全门和人工验证边界。
+2. **v1.0.4c3b（已完成）**：实现脱敏桌面报告、严格参数路由、验证脚本和专用子进程 audit-token 检查，并采集本机只读基线及专用子进程证据。
+3. **v1.0.4c3c（待人工）**：由用户完成登录项注册/批准、重新登录自动启动和 TCC 权限前后对照；工具只记录实际完成的步骤。
 4. **后续发布阶段**：在 macOS 14/15 真实设备复用同一流程，再决定最低版本和权限声明。
