@@ -1442,6 +1442,93 @@ private enum ProcessSortMode: String, CaseIterable, Identifiable {
     }
 }
 
+/// Explains why a filtered list currently has no visible rows. Keeping this
+/// decision outside the view body prevents an empty result from being shown as
+/// an initial loading state after a search or scope change.
+enum MonitorListEmptyState: Equatable, Sendable {
+    case loading
+    case background
+    case noMatches
+    case failed(String)
+    case noRows
+    case stale
+
+    static func resolve(
+        visibleItemCount: Int,
+        hasActiveFilter: Bool,
+        samplingPerformed: Bool,
+        retainedItemCount: Int,
+        quality: SampleQuality,
+        message: String?
+    ) -> MonitorListEmptyState? {
+        guard visibleItemCount <= 0 else { return nil }
+        if hasActiveFilter {
+            return .noMatches
+        }
+        if !samplingPerformed {
+            return retainedItemCount > 0 ? .background : .loading
+        }
+        switch quality {
+        case .error:
+            return .failed(message ?? "无法读取进程列表")
+        case .unavailable:
+            return retainedItemCount > 0 ? .stale : .loading
+        case .available, .estimated:
+            return .noRows
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .loading: return "正在读取进程数据..."
+        case .background: return "等待下一次进程采样"
+        case .noMatches: return "没有匹配条目"
+        case .failed: return "进程采样失败"
+        case .noRows: return "本轮没有可展示条目"
+        case .stale: return "暂时没有新进程数据"
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .loading:
+            return "完成首次扫描后，进程和工作组会显示在这里。"
+        case .background:
+            return "后台采样暂未刷新进程排行，下一次扫描后会更新。"
+        case .noMatches:
+            return "尝试清除搜索或切换显示范围。"
+        case .failed(let detail):
+            return detail + "；请稍后重试或打开运行健康诊断。"
+        case .noRows:
+            return "进程可能在扫描期间退出，或受到 macOS 权限限制。"
+        case .stale:
+            return "最近一次列表未能更新；请稍后重试或打开运行健康诊断。"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .loading: return "hourglass"
+        case .background: return "clock.arrow.circlepath"
+        case .noMatches: return "magnifyingglass"
+        case .failed: return "exclamationmark.triangle"
+        case .noRows: return "list.bullet.rectangle"
+        case .stale: return "arrow.clockwise"
+        }
+    }
+
+    var shortStatus: String {
+        switch self {
+        case .loading: return "等待首次采样"
+        case .background: return "后台未刷新"
+        case .noMatches: return "无匹配"
+        case .failed: return "采样失败"
+        case .noRows: return "无可展示条目"
+        case .stale: return "上次数据"
+        }
+    }
+}
+
 private enum MonitorDetailSelection: Identifiable {
     case process(ProcessIdentity)
     case group(String)
@@ -1744,6 +1831,24 @@ private struct MonitorPopover: View {
         searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
+    private var hasActiveListFilter: Bool {
+        !normalizedSearchText.isEmpty || processScope != .all
+    }
+
+    private func emptyState(
+        visibleItemCount: Int,
+        retainedItemCount: Int
+    ) -> MonitorListEmptyState? {
+        MonitorListEmptyState.resolve(
+            visibleItemCount: visibleItemCount,
+            hasActiveFilter: hasActiveListFilter,
+            samplingPerformed: model.samplingDiagnostics.processSamplingPerformed,
+            retainedItemCount: retainedItemCount,
+            quality: model.processStatus.quality,
+            message: model.processStatus.message
+        )
+    }
+
     private var sortSummary: String {
         switch (listMode, processSortMode) {
         case (.processes, .footprint): return "footprint 降序"
@@ -1792,6 +1897,12 @@ private struct MonitorPopover: View {
     }
 
     private var processStatusText: String {
+        if let state = emptyState(
+            visibleItemCount: sortedProcesses.count,
+            retainedItemCount: model.processes.count
+        ) {
+            return state.shortStatus
+        }
         if !model.samplingDiagnostics.processSamplingPerformed {
             return sortedProcesses.isEmpty ? "等待首次进程采样" : "上次采样"
         }
@@ -1817,12 +1928,12 @@ private struct MonitorPopover: View {
                     .foregroundStyle(.secondary)
             }
 
-            if sortedProcesses.isEmpty {
-                Text("正在读取进程数据...")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .frame(height: 150, alignment: .topLeading)
+            if let state = emptyState(
+                visibleItemCount: sortedProcesses.count,
+                retainedItemCount: model.processes.count
+            ) {
+                MonitorListEmptyStateView(state: state)
+                    .frame(maxWidth: .infinity, minHeight: 112, maxHeight: 150, alignment: .topLeading)
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
@@ -1839,7 +1950,7 @@ private struct MonitorPopover: View {
                         }
                     }
                 }
-                .frame(height: 230)
+                .frame(minHeight: 112, maxHeight: 230)
             }
         }
     }
@@ -1884,17 +1995,23 @@ private struct MonitorPopover: View {
 
     private var groupRanking: some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text("已采集本机所有可枚举进程；组内数值为 footprint/RSS 相加的归因总量，当前按 \(processSortMode == .footprint ? "footprint" : "RSS") 降序，包含共享映射，不能相加当作整机实际占用。")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            if sortedGroups.isEmpty {
-                Text("暂无工作组数据")
-                    .font(.caption)
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("组内数值为 footprint/RSS 相加的归因总量，当前按 \(processSortMode == .footprint ? "footprint" : "RSS") 降序。")
+                    .font(.caption2)
                     .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .frame(height: 150, alignment: .topLeading)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 4)
+                Text(groupStatusText)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            if let state = emptyState(
+                visibleItemCount: sortedGroups.count,
+                retainedItemCount: model.groups.count
+            ) {
+                MonitorListEmptyStateView(state: state)
+                    .frame(maxWidth: .infinity, minHeight: 112, maxHeight: 150, alignment: .topLeading)
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 8) {
@@ -1908,35 +2025,94 @@ private struct MonitorPopover: View {
                         }
                     }
                 }
-                .frame(height: 230)
+                .frame(minHeight: 112, maxHeight: 230)
             }
         }
     }
 
+    private var groupStatusText: String {
+        if let state = emptyState(
+            visibleItemCount: sortedGroups.count,
+            retainedItemCount: model.groups.count
+        ) {
+            return state.shortStatus
+        }
+        switch model.processStatus.quality {
+        case .available:
+            return "共 \(sortedGroups.count) 组"
+        case .estimated:
+            return "共 \(sortedGroups.count) 组 · 部分可用"
+        case .unavailable, .error:
+            return "上次数据"
+        }
+    }
+
     private var footer: some View {
-        HStack(alignment: .center, spacing: 8) {
-            VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
                 Text("本地监视 · 操作需确认 · \(model.samplingCadenceDescription)")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 4)
+                Text("Apple Silicon")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+
+            HStack(spacing: 6) {
                 Text(model.samplingDiagnosticsDescription)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 4)
+                Button(role: .destructive) {
+                    terminationAction()
+                } label: {
+                    Label("退出", systemImage: "power")
+                }
+                .buttonStyle(.borderless)
+                .help("退出 Memory Monitor")
+                .accessibilityLabel("退出 Memory Monitor")
             }
-            Spacer()
-            Text("Apple Silicon")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            Button(role: .destructive) {
-                terminationAction()
-            } label: {
-                Label("退出", systemImage: "power")
-            }
-            .buttonStyle(.borderless)
-            .help("退出 Memory Monitor")
-            .accessibilityLabel("退出 Memory Monitor")
         }
+    }
+}
+
+private struct MonitorListEmptyStateView: View {
+    let state: MonitorListEmptyState
+
+    private var iconColor: Color {
+        switch state {
+        case .failed:
+            return .red
+        case .noMatches:
+            return .orange
+        case .loading, .background, .noRows, .stale:
+            return .secondary
+        }
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: state.systemImage)
+                .foregroundStyle(iconColor)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(state.title)
+                    .font(.caption.weight(.medium))
+                Text(state.message)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -2746,11 +2922,12 @@ private struct HistoryPanel: View {
                         historyFooter
                     }
                 }
+                .frame(minHeight: 360, maxHeight: 540, alignment: .top)
             } else {
                 emptyState
+                    .frame(minHeight: 180, maxHeight: 260, alignment: .top)
             }
         }
-        .frame(height: 540, alignment: .top)
     }
 
     private var historyHeader: some View {

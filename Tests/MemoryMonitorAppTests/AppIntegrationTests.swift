@@ -1825,6 +1825,85 @@ final class AppIntegrationTests: XCTestCase {
         XCTAssertEqual(all.map(\.id), ["failed", "completed"])
     }
 
+    func testMonitorListEmptyStateSeparatesFilteringFromSamplingStatus() {
+        XCTAssertNil(
+            MonitorListEmptyState.resolve(
+                visibleItemCount: 1,
+                hasActiveFilter: true,
+                samplingPerformed: true,
+                retainedItemCount: 1,
+                quality: .available,
+                message: nil
+            )
+        )
+        XCTAssertEqual(
+            MonitorListEmptyState.resolve(
+                visibleItemCount: 0,
+                hasActiveFilter: true,
+                samplingPerformed: true,
+                retainedItemCount: 20,
+                quality: .error,
+                message: "扫描失败"
+            ),
+            .noMatches
+        )
+        XCTAssertEqual(
+            MonitorListEmptyState.resolve(
+                visibleItemCount: 0,
+                hasActiveFilter: false,
+                samplingPerformed: false,
+                retainedItemCount: 0,
+                quality: .unavailable,
+                message: nil
+            ),
+            .loading
+        )
+        XCTAssertEqual(
+            MonitorListEmptyState.resolve(
+                visibleItemCount: 0,
+                hasActiveFilter: false,
+                samplingPerformed: false,
+                retainedItemCount: 3,
+                quality: .unavailable,
+                message: nil
+            ),
+            .background
+        )
+        XCTAssertEqual(
+            MonitorListEmptyState.resolve(
+                visibleItemCount: 0,
+                hasActiveFilter: false,
+                samplingPerformed: true,
+                retainedItemCount: 3,
+                quality: .unavailable,
+                message: nil
+            ),
+            .stale
+        )
+        XCTAssertEqual(
+            MonitorListEmptyState.resolve(
+                visibleItemCount: 0,
+                hasActiveFilter: false,
+                samplingPerformed: true,
+                retainedItemCount: 0,
+                quality: .error,
+                message: "扫描失败"
+            ),
+            .failed("扫描失败")
+        )
+        XCTAssertEqual(
+            MonitorListEmptyState.resolve(
+                visibleItemCount: 0,
+                hasActiveFilter: false,
+                samplingPerformed: true,
+                retainedItemCount: 0,
+                quality: .available,
+                message: nil
+            ),
+            .noRows
+        )
+    }
+
     private func makeHealthInput(
         systemStatus: SampleStatus = .estimated(
             at: Date(timeIntervalSince1970: 100),
