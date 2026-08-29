@@ -6,7 +6,7 @@
 - 物理内存基线：16 GiB
 - 首版形态：菜单栏常驻 + 点击弹出详细面板
 - 首版范围（历史基线）：只监视、分析和给出建议，不执行进程退出或强制结束
-- 当前版本：v1.0.3（build 13），支持运行健康诊断、可选登录启动、只读操作审计总览和可靠性加固
+- 当前 App bundle：v1.0.3（build 13）；源码开发阶段：v1.0.4b 兼容性报告
 - 当前本地 App bundle 使用 ad-hoc 签名；Developer ID、notarization 和沙盒策略尚未启用
 - 文档状态：设计基线，可作为后续实现的验收依据
 
@@ -622,3 +622,11 @@ open "$HOME/Library/Application Support/MemoryMonitor/dist/MemoryMonitor.app"
 - macOS 低于 14.0 标记为需要处理；非 arm64 仅标记为部分可用，不宣称绝对不兼容。
 - 环境信息只在内存中参与诊断，不写入历史或操作审计；跨版本实机回归仍需在对应系统上单独执行。
 - 设计和验收标准见 [`docs/compatibility-diagnostics-v1.0.4.md`](docs/compatibility-diagnostics-v1.0.4.md)。
+
+### Phase 13 completed：v1.0.4b 结构化兼容性报告
+
+- `memory-monitor-probe --compatibility-json` 输出带 schema 版本的脱敏 JSON，只包含产品、平台、采集源质量、耗时和进程覆盖率，不包含 PID、进程名、路径、用户或设备标识。
+- `scripts/collect-compatibility-report.sh` 注入 `Info.plist` 版本、Git revision 和源码状态，校验结构后把 JSON 写到标准输出；脚本不修改登录项、系统权限或进程状态。
+- 发布验收脚本现在同时验证人类可读 probe 和结构化报告，并要求 arm64、完整进程扫描及三项明确的未执行限制。
+- 当前干净源码基线 `30571b8` 在 arm64 macOS 26.5.1 的一次采样中读取 406/636 个进程；系统、CPU、GPU 数据有效，权限受限条目仍按部分可用呈现。
+- 当前矩阵和缺失环境见 [`docs/compatibility-matrix-v1.0.4.md`](docs/compatibility-matrix-v1.0.4.md)。
