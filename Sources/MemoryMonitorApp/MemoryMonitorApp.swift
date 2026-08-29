@@ -21,6 +21,24 @@ extension MonitorSampler: MonitorSamplingSource {
     }
 }
 
+/// The single user-facing exit action. AppKit routes the termination request
+/// through `applicationShouldTerminate`, where the existing coordinator waits
+/// for graceful model shutdown before replying.
+@MainActor
+struct ApplicationTerminationAction {
+    private let handler: @MainActor () -> Void
+
+    init(handler: @escaping @MainActor () -> Void = {
+        NSApplication.shared.terminate(nil)
+    }) {
+        self.handler = handler
+    }
+
+    func callAsFunction() {
+        handler()
+    }
+}
+
 struct MemoryMonitorApp: App {
     @NSApplicationDelegateAdaptor(MemoryMonitorApplicationDelegate.self)
     private var applicationDelegate
@@ -33,12 +51,16 @@ struct MemoryMonitorApp: App {
         MenuBarExtra {
             MonitorPopover(
                 model: applicationDelegate.model,
-                processActions: applicationDelegate.model.processActions
+                processActions: applicationDelegate.model.processActions,
+                terminationAction: applicationDelegate.terminationAction
             )
                 .onAppear { applicationDelegate.model.setPanelPresented(true) }
                 .onDisappear { applicationDelegate.model.setPanelPresented(false) }
         } label: {
-            MenuBarStatus(model: applicationDelegate.model)
+            MenuBarStatus(
+                model: applicationDelegate.model,
+                terminationAction: applicationDelegate.terminationAction
+            )
         }
         .menuBarExtraStyle(.window)
     }
@@ -47,6 +69,7 @@ struct MemoryMonitorApp: App {
 @MainActor
 final class MemoryMonitorApplicationDelegate: NSObject, NSApplicationDelegate {
     let model: MonitorViewModel
+    let terminationAction = ApplicationTerminationAction()
     private let terminationCoordinator: ApplicationTerminationCoordinator
 
     override convenience init() {
@@ -1344,6 +1367,7 @@ enum PressureState: String {
 
 private struct MenuBarStatus: View {
     @ObservedObject var model: MonitorViewModel
+    let terminationAction: ApplicationTerminationAction
 
     var body: some View {
         HStack(spacing: 4) {
@@ -1357,6 +1381,20 @@ private struct MenuBarStatus: View {
             )
                 .font(.system(size: 12, weight: .medium, design: .rounded))
         }
+        .contextMenu {
+            Button(role: .destructive) {
+                terminationAction()
+            } label: {
+                Label("退出 Memory Monitor", systemImage: "power")
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Memory Monitor 状态")
+        .accessibilityValue(
+            model.systemDataIsUsable
+                ? (model.system.map { "内存使用率 \(Int($0.usedFraction * 100))%" } ?? "内存数据不可用")
+                : "内存数据不可用"
+        )
     }
 }
 
@@ -1438,6 +1476,7 @@ private struct MonitorPopover: View {
     /// the controller here so audit failures immediately affect the health
     /// indicator in the popover.
     @ObservedObject var processActions: ProcessActionController
+    let terminationAction: ApplicationTerminationAction
     @State private var listMode: MonitorListMode = .processes
     @State private var viewMode: MonitorViewMode = .live
     @State private var processScope: ProcessScope = .all
@@ -1528,6 +1567,7 @@ private struct MonitorPopover: View {
                 }
                 .buttonStyle(.borderless)
                 .help("运行健康与权限诊断")
+                .accessibilityLabel("运行健康与权限诊断")
 
                 Button {
                     showAuditPanel = true
@@ -1536,6 +1576,20 @@ private struct MonitorPopover: View {
                 }
                 .buttonStyle(.borderless)
                 .help("查看操作审计")
+                .accessibilityLabel("查看操作审计")
+
+                Menu {
+                    Button(role: .destructive) {
+                        terminationAction()
+                    } label: {
+                        Label("退出 Memory Monitor", systemImage: "power")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
+                .menuStyle(.borderlessButton)
+                .help("更多操作")
+                .accessibilityLabel("更多操作")
 
                 if let updatedAt = model.updatedAt {
                     Text(updatedAt, style: .time)
@@ -1656,6 +1710,7 @@ private struct MonitorPopover: View {
                 }
                 .menuStyle(.borderlessButton)
                 .help("筛选与排序")
+                .accessibilityLabel("筛选与排序")
             }
 
             switch listMode {
@@ -1859,9 +1914,9 @@ private struct MonitorPopover: View {
     }
 
     private var footer: some View {
-        HStack {
+        HStack(alignment: .center, spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
-            Text("本地监视 · 操作需确认 · \(model.samplingCadenceDescription)")
+                Text("本地监视 · 操作需确认 · \(model.samplingCadenceDescription)")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                 Text(model.samplingDiagnosticsDescription)
@@ -1873,6 +1928,14 @@ private struct MonitorPopover: View {
             Text("Apple Silicon")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+            Button(role: .destructive) {
+                terminationAction()
+            } label: {
+                Label("退出", systemImage: "power")
+            }
+            .buttonStyle(.borderless)
+            .help("退出 Memory Monitor")
+            .accessibilityLabel("退出 Memory Monitor")
         }
     }
 }
@@ -1902,6 +1965,7 @@ private struct ProcessDetailView: View {
                     Image(systemName: "xmark")
                 }
                 .help("关闭")
+                .accessibilityLabel("关闭进程详情")
             }
         }
     }
@@ -2279,6 +2343,7 @@ private struct WorkloadGroupDetailView: View {
                     Image(systemName: "xmark")
                 }
                 .help("关闭")
+                .accessibilityLabel("关闭工作组详情")
             }
         }
     }

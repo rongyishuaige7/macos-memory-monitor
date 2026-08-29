@@ -661,6 +661,18 @@ final class AppIntegrationTests: XCTestCase {
         XCTAssertEqual(replies, [true])
     }
 
+    func testApplicationTerminationActionInvokesInjectedHandler() {
+        var invocationCount = 0
+        let action = ApplicationTerminationAction {
+            invocationCount += 1
+        }
+
+        action()
+        action()
+
+        XCTAssertEqual(invocationCount, 2)
+    }
+
     func testMonitorViewModelRefreshTaskDoesNotRetainModelWhileWaiting() async throws {
         let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
         let process = makeProcess(pid: 9050, name: "lifecycle")
