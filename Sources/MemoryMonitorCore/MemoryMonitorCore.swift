@@ -219,11 +219,10 @@ private func fileEndsWithNewline(at url: URL) -> Bool {
 /// Serializes read-modify-write transactions for stores that may be opened by
 /// multiple actors or processes. Actor isolation alone only protects one
 /// instance, so every durable operation must also hold this path-level lock.
-private func withExclusivePersistedFileLock<T>(
+private func acquireExclusivePersistedFileLock(
     at url: URL,
-    timeoutSeconds: TimeInterval = 2,
-    _ body: () throws -> T
-) throws -> T {
+    timeoutSeconds: TimeInterval = 2
+) throws -> Int32 {
     let fileManager = FileManager.default
     let directory = url.deletingLastPathComponent()
     do {
@@ -238,7 +237,13 @@ private func withExclusivePersistedFileLock<T>(
     guard descriptor >= 0 else {
         throw PersistedFileLockError.openFailed
     }
-    defer { close(descriptor) }
+    var releaseOnFailure = true
+    defer {
+        if releaseOnFailure {
+            _ = flock(descriptor, LOCK_UN)
+            close(descriptor)
+        }
+    }
 
     let clock = ContinuousClock()
     let timeout = timeoutSeconds.isFinite && timeoutSeconds >= 0
@@ -261,8 +266,6 @@ private func withExclusivePersistedFileLock<T>(
         }
         usleep(10_000)
     }
-    defer { _ = flock(descriptor, LOCK_UN) }
-
     // A custom path may already contain a lock file created with broad
     // permissions. Tighten it while holding the lock before any data access.
     do {
@@ -273,7 +276,13 @@ private func withExclusivePersistedFileLock<T>(
     } catch {
         throw PersistedFileLockError.lockFailed
     }
-    return try body()
+    releaseOnFailure = false
+    return descriptor
+}
+
+private func releaseExclusivePersistedFileLock(_ descriptor: Int32) {
+    _ = flock(descriptor, LOCK_UN)
+    close(descriptor)
 }
 
 public enum MemoryMonitorError: Error, CustomStringConvertible, LocalizedError, Sendable {
@@ -5271,26 +5280,26 @@ public actor HistoryStore {
         _ body: () throws -> T
     ) throws -> T {
         do {
-            return try withExclusivePersistedFileLock(
+            let lockDescriptor = try acquireExclusivePersistedFileLock(
                 at: lockURL,
                 timeoutSeconds: lockTimeoutSeconds
-            ) {
-                try validateFileSize(
-                    at: fileURL,
-                    maximumBytes: Self.maximumSnapshotFileBytes
-                )
-                try validateFileSize(
-                    at: journalURL,
-                    maximumBytes: Self.maximumJournalFileBytes
-                )
-                try validateFileSize(
-                    at: clockURL,
-                    maximumBytes: Self.maximumClockFileBytes
-                )
-                let result = try body()
-                durableGeneration = try currentDurableGeneration()
-                return result
-            }
+            )
+            defer { releaseExclusivePersistedFileLock(lockDescriptor) }
+            try validateFileSize(
+                at: fileURL,
+                maximumBytes: Self.maximumSnapshotFileBytes
+            )
+            try validateFileSize(
+                at: journalURL,
+                maximumBytes: Self.maximumJournalFileBytes
+            )
+            try validateFileSize(
+                at: clockURL,
+                maximumBytes: Self.maximumClockFileBytes
+            )
+            let result = try body()
+            durableGeneration = try currentDurableGeneration()
+            return result
         } catch let error as HistoryStoreError {
             durableGeneration = nil
             throw error
@@ -6733,19 +6742,19 @@ public actor ProcessActionAuditStore {
         _ body: () throws -> T
     ) throws -> T {
         do {
-            return try withExclusivePersistedFileLock(
+            let lockDescriptor = try acquireExclusivePersistedFileLock(
                 at: lockURL,
                 timeoutSeconds: lockTimeoutSeconds
-            ) {
-                try validateFileSize(at: fileURL, maximumBytes: Self.maximumFileBytes)
-                try validateFileSize(
-                    at: clockURL,
-                    maximumBytes: Self.maximumClockFileBytes
-                )
-                let result = try body()
-                durableGeneration = try currentDurableGeneration()
-                return result
-            }
+            )
+            defer { releaseExclusivePersistedFileLock(lockDescriptor) }
+            try validateFileSize(at: fileURL, maximumBytes: Self.maximumFileBytes)
+            try validateFileSize(
+                at: clockURL,
+                maximumBytes: Self.maximumClockFileBytes
+            )
+            let result = try body()
+            durableGeneration = try currentDurableGeneration()
+            return result
         } catch let error as ProcessActionAuditStoreError {
             durableGeneration = nil
             throw error
