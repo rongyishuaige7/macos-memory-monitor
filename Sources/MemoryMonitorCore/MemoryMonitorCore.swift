@@ -6348,9 +6348,9 @@ public actor HistoryStore {
 
     private nonisolated static func workloadCompletenessRank(_ value: Bool?) -> Int {
         switch value {
-        case true: return 2
-        case false: return 1
-        case nil: return 0
+        case .some(true): return 2
+        case .some(false): return 1
+        case .none: return 0
         }
     }
 

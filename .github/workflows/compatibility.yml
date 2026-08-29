@@ -35,23 +35,28 @@ jobs:
     name: macOS ${{ matrix.os_major }} arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: ${{ matrix.developer_dir }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: macos-14
             os_major: 14
+            developer_dir: /Applications/Xcode_16.2.app/Contents/Developer
           - runner: macos-15
             os_major: 15
+            developer_dir: /Applications/Xcode_16.4.app/Contents/Developer
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Record runner environment
         run: |
           sw_vers
           uname -m
+          xcodebuild -version
           swift --version
 
       - name: Prepare report directory
@@ -67,7 +72,7 @@ jobs:
 
       - name: Upload redacted compatibility report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: compatibility-macos-${{ matrix.os_major }}-arm64
           path: compatibility-artifacts/macos-${{ matrix.os_major }}-arm64.json
