@@ -6,7 +6,7 @@
 - 物理内存基线：16 GiB
 - 首版形态：菜单栏常驻 + 点击弹出详细面板
 - 首版范围（历史基线）：只监视、分析和给出建议，不执行进程退出或强制结束
-- 当前 App bundle：v1.0.3（build 13）；源码开发阶段：v1.0.4b 兼容性报告
+- 当前 App bundle：v1.0.3（build 13）；源码开发阶段：v1.0.4c 兼容性矩阵
 - 当前本地 App bundle 使用 ad-hoc 签名；Developer ID、notarization 和沙盒策略尚未启用
 - 文档状态：设计基线，可作为后续实现的验收依据
 
@@ -536,7 +536,7 @@ open "$HOME/Library/Application Support/MemoryMonitor/dist/MemoryMonitor.app"
 
 - 工作组识别仍是可解释的名称/父链/目录 basename 启发式；目录不可读、项目目录同名或运行时不属于 Node/Python 时仍可能需要人工区分；
 - 已提供本地 `.app` bundle 构建脚本；Developer ID 发布签名、登录启动和沙盒策略仍待单独确定；
-- `libproc` 属于 macOS 私有接口，已在本机 arm64 macOS 验证，其他系统版本需要单独回归；
+- `libproc` 属于 macOS 私有接口，已在本机 macOS 26 和 GitHub 托管的 macOS 14/15 arm64 环境完成只读采样；真实桌面、不同权限和精确最低次版本仍需单独回归；
 - 事件时间线基于分钟记录推导，不能替代进程生命周期审计；过期或被压缩出 Top 排行的工作组可能只显示为排行变化；
 - 进程信号优先绑定 audit token，并在取 token 后再次校验 `(PID, 启动时间, 用户, 父 PID, 可执行路径)`；无法取得 token 时，优雅退出可在最终复核后降级，强制结束会拒绝发送，因此仅降级的优雅退出仍保留固有 TOCTOU 窗口；
 - 进程操作的等待窗口已使用单调时钟，但 macOS 仍可能在信号发送后短暂延迟回收 PID；界面会保守地等待下一次身份采样，不把权限受限误报为已退出；
@@ -630,3 +630,11 @@ open "$HOME/Library/Application Support/MemoryMonitor/dist/MemoryMonitor.app"
 - 发布验收脚本现在同时验证人类可读 probe 和结构化报告，并要求 arm64、完整进程扫描及三项明确的未执行限制。
 - 当前干净源码基线 `30571b8` 在 arm64 macOS 26.5.1 的一次采样中读取 406/636 个进程；系统、CPU、GPU 数据有效，权限受限条目仍按部分可用呈现。
 - 当前矩阵和缺失环境见 [`docs/compatibility-matrix-v1.0.4.md`](docs/compatibility-matrix-v1.0.4.md)。
+
+### Phase 14 completed：v1.0.4c1/c2 自动兼容性矩阵
+
+- 新增 `scripts/verify-compatibility.sh`，要求显式输出路径和预期平台，运行 228 项测试、Debug/Release 严格并发构建、Release probe 与结构化采集，并校验只读限制项。
+- GitHub Actions 使用 arm64 `macos-14`/`macos-15` runner，分别固定 Xcode 16.2 / Swift 6.0.3 和 Xcode 16.4 / Swift 6.1.2；仓库权限仅为 `contents: read`，脱敏报告 artifact 保留 14 天。
+- [run 33254292547](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/33254292547) 两个 job 均通过：macOS 14.8.7 采样 `205/402`，macOS 15.7.7 采样 `261/490`；系统与 CPU 数据可用，托管虚拟环境没有可读 GPU 利用率。
+- 矩阵运行推动修复了 Swift 6.0/6.1 的 Optional 匹配、actor 文件锁隔离、同步闭包隔离和旧 Darwin SDK 导入差异；本机 Swift 6.3.3 回归保持通过。
+- 本阶段不验证真实 GUI 会话中的登录项、TCC 权限切换或 audit-token 发信号；这些工作保留给 v1.0.4c3，并只允许使用专用测试进程。
