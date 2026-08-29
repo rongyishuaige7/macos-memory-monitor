@@ -44,3 +44,11 @@
 - x86_64：当前发布脚本只生成 arm64 bundle，是否扩展架构支持必须先单独决策。
 
 在这些环境产生真实报告之前，矩阵只包含当前一行，不宣称完整跨版本兼容。
+
+## v1.0.4c 自动采集计划
+
+- GitHub Actions 使用明确的 `macos-14` 和 `macos-15` arm64 标签，不使用会随时间迁移的 `macos-latest`；
+- 每个环境运行测试、严格并发构建、Release probe 和 `scripts/collect-compatibility-report.sh`，并校验报告中的实际系统主版本和架构；
+- 报告以短期 artifact 保存，只有 workflow 实际完成并复核 JSON 后，才把结果追加到“当前矩阵”；
+- runner 证据会明确标为“GitHub 托管 CI”，不用于判断真实桌面登录项、TCC 权限切换、GPU 可用性或 audit-token 发信号；
+- `macos-14` runner 已进入弃用期并计划在 2026-11-02 退役；退役后的 macOS 14 回归必须转移到自托管或其他真实主机。
