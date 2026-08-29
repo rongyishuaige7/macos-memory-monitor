@@ -2305,6 +2305,113 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertNil(snapshot.diagnostics.processDurationMilliseconds)
     }
 
+    func testCompatibilityReportIsStructuredAndOmitsProcessIdentity() throws {
+        let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let system = makeSystemSnapshot(timestamp: timestamp, compressed: 0, swap: 0)
+        let process = makeProcess(
+            pid: 4_242,
+            name: "private-worker-name",
+            parentPID: 4_241,
+            footprint: 100,
+            userID: 777,
+            executablePath: "/private/project/private-worker-name"
+        )
+        let baseSnapshot = makeMonitorSnapshot(
+            timestamp: timestamp,
+            system: system,
+            groups: [],
+            processes: [process],
+            processStatus: .estimated(
+                at: timestamp,
+                message: "permission\nlimited"
+            ),
+            listedCount: 2
+        )
+        let snapshot = MonitorSnapshot(
+            timestamp: baseSnapshot.timestamp,
+            system: baseSnapshot.system,
+            systemStatus: baseSnapshot.systemStatus,
+            cpuTime: baseSnapshot.cpuTime,
+            cpuStatus: baseSnapshot.cpuStatus,
+            gpuUsageFraction: .nan,
+            gpuStatus: .available(at: timestamp),
+            processes: baseSnapshot.processes,
+            processStatus: baseSnapshot.processStatus,
+            listedProcessCount: baseSnapshot.listedProcessCount,
+            sampledProcessCount: baseSnapshot.sampledProcessCount,
+            groups: baseSnapshot.groups,
+            samplingMode: baseSnapshot.samplingMode,
+            diagnostics: baseSnapshot.diagnostics
+        )
+        let report = CompatibilityProbeReport(
+            snapshot: snapshot,
+            productVersion: " 1.0.4\n",
+            buildNumber: "14",
+            sourceRevision: "abc\tdef",
+            checkoutState: .modified,
+            osMajor: 14,
+            osMinor: 6,
+            osPatch: 1,
+            architecture: "arm64\n"
+        )
+
+        XCTAssertEqual(report.schemaVersion, 1)
+        XCTAssertEqual(report.product.version, "1.0.4")
+        XCTAssertEqual(report.product.sourceRevision, "abcdef")
+        XCTAssertEqual(report.product.checkoutState, .modified)
+        XCTAssertEqual(report.platform.osMajor, 14)
+        XCTAssertEqual(report.platform.architecture, "arm64")
+        XCTAssertEqual(report.sampling.processes.sampledCount, 1)
+        XCTAssertEqual(report.sampling.processes.listedCount, 2)
+        XCTAssertEqual(report.sampling.processes.coverageFraction, 0.5)
+        XCTAssertEqual(report.sampling.processes.message, "permissionlimited")
+        XCTAssertFalse(report.sampling.gpu.usable)
+        XCTAssertEqual(
+            report.limitations,
+            CompatibilityProbeReport.automatedLimitations
+        )
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(report)
+        let json = String(decoding: data, as: UTF8.self)
+
+        XCTAssertFalse(json.contains("private-worker-name"))
+        XCTAssertFalse(json.contains("/private/project"))
+        XCTAssertFalse(json.contains("4242"))
+        XCTAssertFalse(json.contains("4241"))
+        XCTAssertFalse(json.contains("777"))
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        XCTAssertEqual(try decoder.decode(CompatibilityProbeReport.self, from: data), report)
+    }
+
+    func testCompatibilityReportNormalizesInvalidPlatformAndTimestamp() {
+        let invalidTimestamp = Date(timeIntervalSince1970: .nan)
+        let snapshot = makeMonitorSnapshot(
+            timestamp: invalidTimestamp,
+            system: nil,
+            groups: [],
+            didSampleProcesses: false
+        )
+        let report = CompatibilityProbeReport(
+            snapshot: snapshot,
+            osMajor: -1,
+            osMinor: -2,
+            osPatch: -3,
+            architecture: "\n\t"
+        )
+
+        XCTAssertEqual(report.observedAt, Date(timeIntervalSince1970: 0))
+        XCTAssertEqual(report.platform.osMajor, 0)
+        XCTAssertEqual(report.platform.osMinor, 0)
+        XCTAssertEqual(report.platform.osPatch, 0)
+        XCTAssertEqual(report.platform.architecture, "unknown")
+        XCTAssertFalse(report.sampling.processes.samplingPerformed)
+        XCTAssertNil(report.sampling.processes.coverageFraction)
+    }
+
     func testRecommendationEngineReportsGrowthWithSwapEvidence() {
         let timestamp = Date(timeIntervalSince1970: 1_700_000_060)
         let previousTimestamp = timestamp.addingTimeInterval(-60)

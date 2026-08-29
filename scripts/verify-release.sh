@@ -52,6 +52,26 @@ swift run \
 grep -q '^Memory Monitor Probe$' "$probe_log"
 grep -q '^Processes:[[:space:]]' "$probe_log"
 
+compatibility_report="$verification_root/compatibility.json"
+compatibility_plist="$verification_root/compatibility.plist"
+print "Collecting structured compatibility report..."
+"$project_root/scripts/collect-compatibility-report.sh" >"$compatibility_report"
+plutil -convert xml1 -o "$compatibility_plist" -- "$compatibility_report"
+compatibility_schema="$(plutil -extract schemaVersion raw -o - "$compatibility_plist")"
+compatibility_architecture="$(plutil -extract platform.architecture raw -o - "$compatibility_plist")"
+compatibility_os_major="$(plutil -extract platform.osMajor raw -o - "$compatibility_plist")"
+compatibility_os_minor="$(plutil -extract platform.osMinor raw -o - "$compatibility_plist")"
+compatibility_os_patch="$(plutil -extract platform.osPatch raw -o - "$compatibility_plist")"
+compatibility_limitations="$(plutil -extract limitations raw -o - "$compatibility_plist")"
+compatibility_process_scan="$(plutil -extract sampling.processes.samplingPerformed raw -o - "$compatibility_plist")"
+if [[ "$compatibility_schema" != "1" || \
+	"$compatibility_architecture" != "arm64" || \
+	"$compatibility_limitations" != "3" || \
+	"$compatibility_process_scan" != "true" ]]; then
+	print -u2 "Structured compatibility report failed release validation"
+	exit 1
+fi
+
 artifact_root="$verification_root/dist"
 build_log="$verification_root/build.log"
 print "Building and signing default App bundle..."
@@ -87,4 +107,5 @@ probe_processes="$(awk '/^Processes:/{sub(/^Processes:[[:space:]]*/, ""); print;
 print "Release verification passed"
 print "Version: $bundle_version (build $bundle_build)"
 print "Probe: sampling=$probe_sampling; processes=$probe_processes"
+print "Compatibility: schema=$compatibility_schema; macOS=$compatibility_os_major.$compatibility_os_minor.$compatibility_os_patch; architecture=$compatibility_architecture"
 print "Artifact: $app_path"
