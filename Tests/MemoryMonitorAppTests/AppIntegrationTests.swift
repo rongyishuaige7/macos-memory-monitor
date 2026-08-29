@@ -1904,6 +1904,146 @@ final class AppIntegrationTests: XCTestCase {
         )
     }
 
+    func testMonitorDetailDataStatusDistinguishesCurrentPartialAndLoading() {
+        let observedAt = Date(timeIntervalSince1970: 10_000)
+        let completeDiagnostics = makeDetailDiagnostics(
+            performed: true,
+            sampled: 800,
+            listed: 800
+        )
+        let current = MonitorDetailDataStatus.resolve(
+            processStatus: .available(at: observedAt),
+            samplingDiagnostics: completeDiagnostics,
+            retainedItemCount: 800,
+            observedAt: observedAt
+        )
+
+        XCTAssertEqual(current.kind, .current)
+        XCTAssertEqual(current.sampledAt, observedAt)
+        XCTAssertEqual(current.sampleAge, 0)
+        XCTAssertEqual(current.coverageFraction, 1)
+
+        let partial = MonitorDetailDataStatus.resolve(
+            processStatus: .estimated(at: observedAt, message: "部分条目受权限限制"),
+            samplingDiagnostics: makeDetailDiagnostics(
+                performed: true,
+                sampled: 600,
+                listed: 800
+            ),
+            retainedItemCount: 600,
+            observedAt: observedAt
+        )
+
+        XCTAssertEqual(partial.kind, .partial)
+        XCTAssertEqual(partial.retentionReason, nil)
+        XCTAssertEqual(partial.sampledItemCount, 600)
+        XCTAssertEqual(partial.listedItemCount, 800)
+
+        let loading = MonitorDetailDataStatus.resolve(
+            processStatus: .unavailable(message: "等待首次进程采样"),
+            samplingDiagnostics: makeDetailDiagnostics(
+                performed: false,
+                sampled: 0,
+                listed: 0
+            ),
+            retainedItemCount: 0,
+            observedAt: nil
+        )
+
+        XCTAssertEqual(loading.kind, .loading)
+        XCTAssertFalse(loading.hasRetainedData)
+        XCTAssertNil(loading.sampledAt)
+    }
+
+    func testMonitorDetailDataStatusLabelsRetainedBackgroundAndLowCoverageData() {
+        let previousSampleAt = Date(timeIntervalSince1970: 10_000)
+        let observedAt = previousSampleAt.addingTimeInterval(75)
+
+        let background = MonitorDetailDataStatus.resolve(
+            processStatus: .available(at: previousSampleAt),
+            samplingDiagnostics: makeDetailDiagnostics(
+                performed: false,
+                sampled: 0,
+                listed: 0
+            ),
+            retainedItemCount: 24,
+            observedAt: observedAt,
+            lastSuccessfulSampledAt: previousSampleAt
+        )
+
+        XCTAssertEqual(background.kind, .retained)
+        XCTAssertEqual(background.retentionReason, .background)
+        XCTAssertEqual(background.sampleAge, 75)
+
+        let lowCoverage = MonitorDetailDataStatus.resolve(
+            processStatus: .estimated(at: observedAt),
+            samplingDiagnostics: makeDetailDiagnostics(
+                performed: true,
+                sampled: 1,
+                listed: 100
+            ),
+            retainedItemCount: 24,
+            observedAt: observedAt,
+            lastSuccessfulSampledAt: previousSampleAt
+        )
+
+        XCTAssertEqual(lowCoverage.kind, .retained)
+        XCTAssertEqual(lowCoverage.retentionReason, .insufficientCoverage)
+        XCTAssertEqual(lowCoverage.sampledAt, previousSampleAt)
+    }
+
+    func testMonitorDetailDataStatusSeparatesFailureUnavailableAndInvalidTime() {
+        let observedAt = Date(timeIntervalSince1970: 20_000)
+        let previousSampleAt = observedAt.addingTimeInterval(-30)
+
+        let failed = MonitorDetailDataStatus.resolve(
+            processStatus: .error("进程读取失败"),
+            samplingDiagnostics: makeDetailDiagnostics(
+                performed: true,
+                sampled: 0,
+                listed: 0
+            ),
+            retainedItemCount: 24,
+            observedAt: observedAt,
+            lastSuccessfulSampledAt: previousSampleAt
+        )
+
+        XCTAssertEqual(failed.kind, .failed)
+        XCTAssertTrue(failed.hasRetainedData)
+        XCTAssertEqual(failed.sampledAt, previousSampleAt)
+        XCTAssertEqual(failed.message, "进程读取失败")
+
+        let unavailable = MonitorDetailDataStatus.resolve(
+            processStatus: .unavailable(message: "本轮没有可用进程采样"),
+            samplingDiagnostics: makeDetailDiagnostics(
+                performed: true,
+                sampled: 0,
+                listed: 0
+            ),
+            retainedItemCount: 0,
+            observedAt: observedAt
+        )
+        XCTAssertEqual(unavailable.kind, .unavailable)
+        XCTAssertFalse(unavailable.hasRetainedData)
+
+        let invalidDate = Date(timeIntervalSince1970: .nan)
+        let invalid = MonitorDetailDataStatus.resolve(
+            processStatus: .available(at: invalidDate),
+            samplingDiagnostics: makeDetailDiagnostics(
+                performed: true,
+                sampled: 800,
+                listed: 800
+            ),
+            retainedItemCount: 24,
+            observedAt: observedAt,
+            lastSuccessfulSampledAt: previousSampleAt
+        )
+
+        XCTAssertEqual(invalid.kind, .retained)
+        XCTAssertEqual(invalid.retentionReason, .invalidTimestamp)
+        XCTAssertEqual(invalid.sampledAt, previousSampleAt)
+    }
+
     private func makeHealthInput(
         systemStatus: SampleStatus = .estimated(
             at: Date(timeIntervalSince1970: 100),
@@ -1954,6 +2094,21 @@ final class AppIntegrationTests: XCTestCase {
             runtimeEnvironment: runtimeEnvironment,
             checkedAt: Date(timeIntervalSince1970: 100),
             now: now
+        )
+    }
+
+    private func makeDetailDiagnostics(
+        performed: Bool,
+        sampled: Int,
+        listed: Int
+    ) -> SamplingDiagnostics {
+        SamplingDiagnostics(
+            mode: performed ? .panel : .background,
+            totalDurationMilliseconds: 10,
+            processDurationMilliseconds: performed ? 8 : nil,
+            processSamplingPerformed: performed,
+            processCount: sampled,
+            listedProcessCount: listed
         )
     }
 

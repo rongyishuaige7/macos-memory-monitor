@@ -418,6 +418,16 @@ final class MonitorViewModel: ObservableObject {
         }
     }
 
+    func detailDataStatus(retainedItemCount: Int) -> MonitorDetailDataStatus {
+        MonitorDetailDataStatus.resolve(
+            processStatus: processStatus,
+            samplingDiagnostics: samplingDiagnostics,
+            retainedItemCount: retainedItemCount,
+            observedAt: updatedAt,
+            lastSuccessfulSampledAt: lastUsableProcessSampleAt
+        )
+    }
+
     func processes(in group: WorkloadGroupSnapshot) -> [ProcessSnapshot] {
         let identities = Set(group.memberProcessIdentities)
         return processes
@@ -2116,6 +2126,141 @@ private struct MonitorListEmptyStateView: View {
     }
 }
 
+private struct MonitorDetailDataStatusView: View {
+    let status: MonitorDetailDataStatus
+
+    private var color: Color {
+        switch status.kind {
+        case .loading, .unavailable:
+            return .secondary
+        case .current:
+            return .green
+        case .partial, .retained:
+            return .orange
+        case .failed:
+            return .red
+        }
+    }
+
+    private var iconName: String {
+        switch status.kind {
+        case .loading:
+            return "hourglass"
+        case .current:
+            return "checkmark.circle"
+        case .partial:
+            return "exclamationmark.triangle"
+        case .retained:
+            return "clock.arrow.circlepath"
+        case .failed:
+            return "xmark.octagon"
+        case .unavailable:
+            return "questionmark.circle"
+        }
+    }
+
+    private var title: String {
+        switch status.kind {
+        case .loading:
+            return "等待首次进程采样"
+        case .current:
+            return "当前进程采样"
+        case .partial:
+            return "当前采样部分可用"
+        case .retained:
+            return "显示上次成功采样"
+        case .failed:
+            return "本轮进程采样失败"
+        case .unavailable:
+            return "暂无可用进程快照"
+        }
+    }
+
+    private var detail: String {
+        switch status.kind {
+        case .loading:
+            return "详情数据会在首次进程扫描完成后显示。"
+        case .current:
+            return "本轮读取 \(coverageText) · 采样于 \(sampledAtText)"
+        case .partial:
+            return "本轮读取 \(coverageText)；部分条目未能读取，详情仅反映成功读取的进程。采样于 \(sampledAtText)"
+        case .retained:
+            let reason: String
+            switch status.retentionReason {
+            case .background:
+                reason = "本轮后台采样未刷新进程"
+            case .insufficientCoverage:
+                reason = "本轮扫描覆盖不足"
+            case .expired:
+                reason = "当前采样已过期"
+            case .invalidTimestamp, .none:
+                reason = "当前采样时间无法确认"
+            }
+            return "\(reason)；显示上次成功快照\(ageText)，仅供观察，不代表此刻进程状态。"
+        case .failed:
+            let failure = status.message?.isEmpty == false
+                ? status.message!
+                : "无法读取进程列表"
+            if status.hasRetainedData {
+                return "\(failure)；仍显示上次成功快照\(ageText)，仅供观察。"
+            }
+            return "\(failure)；当前没有可用进程快照。"
+        case .unavailable:
+            let unavailable = status.message?.isEmpty == false
+                ? status.message!
+                : "本轮没有可用进程数据"
+            if status.hasRetainedData {
+                return "\(unavailable)；显示上次成功快照\(ageText)，仅供观察。"
+            }
+            return unavailable + "。"
+        }
+    }
+
+    private var coverageText: String {
+        guard status.listedItemCount > 0 else {
+            return "尚未读取进程条目"
+        }
+        return "\(status.sampledItemCount)/\(status.listedItemCount) 个进程"
+    }
+
+    private var sampledAtText: String {
+        status.sampledAt.map(detailDateLabel) ?? "时间未知"
+    }
+
+    private var ageText: String {
+        guard let age = status.sampleAge else {
+            return "（采样时间未知）"
+        }
+        if age < 60 {
+            return "（约 \(Int(age.rounded())) 秒前）"
+        }
+        if age < 3_600 {
+            return "（约 \(Int((age / 60).rounded())) 分钟前）"
+        }
+        return "（约 \(String(format: "%.1f", age / 3_600)) 小时前）"
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: iconName)
+                .foregroundStyle(color)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.caption.weight(.semibold))
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(color.opacity(0.10), in: RoundedRectangle(cornerRadius: 7))
+        .accessibilityElement(children: .combine)
+    }
+}
+
 private struct ProcessDetailView: View {
     @ObservedObject var model: MonitorViewModel
     @ObservedObject var actions: ProcessActionController
@@ -2123,6 +2268,10 @@ private struct ProcessDetailView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var showGracefulConfirmation = false
     @State private var showForceConfirmation = false
+
+    private var dataStatus: MonitorDetailDataStatus {
+        model.detailDataStatus(retainedItemCount: model.processes.count)
+    }
 
     var body: some View {
         Group {
@@ -2150,6 +2299,7 @@ private struct ProcessDetailView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 processHeader(process)
+                MonitorDetailDataStatusView(status: dataStatus)
                 processMetrics(process)
                 identitySection(process)
                 groupSection(process)
@@ -2400,6 +2550,7 @@ private struct ProcessDetailView: View {
 
     private var processGoneContent: some View {
         VStack(alignment: .leading, spacing: 12) {
+            MonitorDetailDataStatusView(status: dataStatus)
             Image(systemName: "clock.arrow.circlepath")
                 .font(.system(size: 28))
                 .foregroundStyle(.secondary)
@@ -2440,6 +2591,10 @@ private struct WorkloadGroupDetailView: View {
     @ObservedObject var model: MonitorViewModel
     let groupID: String
     @Environment(\.dismiss) private var dismiss
+
+    private var dataStatus: MonitorDetailDataStatus {
+        model.detailDataStatus(retainedItemCount: model.groups.count)
+    }
 
     private var group: WorkloadGroupSnapshot? {
         model.group(for: groupID)
@@ -2497,6 +2652,7 @@ private struct WorkloadGroupDetailView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 groupHeader
+                MonitorDetailDataStatusView(status: dataStatus)
                 if let group {
                     groupMetrics(group)
                     attributionSection(group)
