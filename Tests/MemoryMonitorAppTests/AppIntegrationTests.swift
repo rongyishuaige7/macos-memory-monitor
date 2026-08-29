@@ -152,6 +152,58 @@ final class AppIntegrationTests: XCTestCase {
         XCTAssertEqual(snapshot.items.first(where: { $0.id == "login" })?.level, .healthy)
     }
 
+    func testHealthEvaluatorReportsSupportedRuntimeEnvironment() {
+        let input = makeHealthInput(
+            runtimeEnvironment: RuntimeEnvironmentStatus(
+                osMajor: 14,
+                osMinor: 5,
+                osPatch: 1,
+                architecture: "arm64"
+            )
+        )
+
+        let snapshot = MonitorHealthEvaluator.evaluate(input)
+        let environment = snapshot.items.first { $0.id == "environment" }
+
+        XCTAssertEqual(environment?.status, "支持")
+        XCTAssertEqual(environment?.level, .healthy)
+        XCTAssertTrue(environment?.detail.contains("14.5.1") == true)
+        XCTAssertTrue(environment?.detail.contains("arm64") == true)
+    }
+
+    func testHealthEvaluatorFlagsUnsupportedRuntimeOS() {
+        let input = makeHealthInput(
+            runtimeEnvironment: RuntimeEnvironmentStatus(
+                osMajor: 13,
+                osMinor: 6,
+                architecture: "arm64"
+            )
+        )
+
+        let snapshot = MonitorHealthEvaluator.evaluate(input)
+        let environment = snapshot.items.first { $0.id == "environment" }
+
+        XCTAssertEqual(environment?.status, "不支持")
+        XCTAssertEqual(environment?.level, .attention)
+        XCTAssertTrue(environment?.detail.contains("最低要求 macOS 14.0") == true)
+    }
+
+    func testHealthEvaluatorMarksNonReleaseArchitectureAsLimited() {
+        let input = makeHealthInput(
+            runtimeEnvironment: RuntimeEnvironmentStatus(
+                osMajor: 14,
+                architecture: "x86_64"
+            )
+        )
+
+        let snapshot = MonitorHealthEvaluator.evaluate(input)
+        let environment = snapshot.items.first { $0.id == "environment" }
+
+        XCTAssertEqual(environment?.status, "非当前发布目标")
+        XCTAssertEqual(environment?.level, .degraded)
+        XCTAssertTrue(environment?.detail.contains("x86_64") == true)
+    }
+
     func testHealthEvaluatorEscalatesUnavailableRequiredSources() {
         let input = makeHealthInput(
             systemStatus: .error("系统内存读取失败"),
@@ -1775,6 +1827,7 @@ final class AppIntegrationTests: XCTestCase {
         historyError: String? = nil,
         auditError: String? = nil,
         loginStatus: LoginLaunchStatus = .notRegistered,
+        runtimeEnvironment: RuntimeEnvironmentStatus? = nil,
         samplingDurationMilliseconds: Double = 90,
         processDurationMilliseconds: Double? = 80,
         now: Date? = nil
@@ -1807,6 +1860,7 @@ final class AppIntegrationTests: XCTestCase {
             auditError: auditError,
             loginStatus: loginStatus,
             loginError: nil,
+            runtimeEnvironment: runtimeEnvironment,
             checkedAt: Date(timeIntervalSince1970: 100),
             now: now
         )

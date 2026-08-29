@@ -261,6 +261,88 @@ final class LoginLaunchCoordinator: ObservableObject {
     }
 }
 
+/// Describes the platform on which the current app process is running. This
+/// is diagnostic-only: it does not attempt to change architecture or install
+/// compatibility components, and it is never persisted with monitor data.
+struct RuntimeEnvironmentStatus: Equatable, Sendable {
+    static let minimumOSMajor = 14
+    static let minimumOSMinor = 0
+
+    let osMajor: Int
+    let osMinor: Int
+    let osPatch: Int
+    let architecture: String
+
+    init(
+        osMajor: Int,
+        osMinor: Int = 0,
+        osPatch: Int = 0,
+        architecture: String
+    ) {
+        self.osMajor = max(osMajor, 0)
+        self.osMinor = max(osMinor, 0)
+        self.osPatch = max(osPatch, 0)
+
+        let scalars = architecture.unicodeScalars.filter { scalar in
+            let value = scalar.value
+            return value >= 0x20 && !(0x7F...0x9F).contains(value)
+        }
+        let sanitized = String(String.UnicodeScalarView(scalars))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        self.architecture = sanitized.isEmpty ? "未知" : String(sanitized.prefix(32))
+    }
+
+    static func current() -> RuntimeEnvironmentStatus {
+        let version = ProcessInfo.processInfo.operatingSystemVersion
+        #if arch(arm64)
+        let architecture = "arm64"
+        #elseif arch(x86_64)
+        let architecture = "x86_64"
+        #else
+        let architecture = "未知"
+        #endif
+        return RuntimeEnvironmentStatus(
+            osMajor: version.majorVersion,
+            osMinor: version.minorVersion,
+            osPatch: version.patchVersion,
+            architecture: architecture
+        )
+    }
+
+    var versionDescription: String {
+        "\(osMajor).\(osMinor).\(osPatch)"
+    }
+
+    var meetsMinimumOS: Bool {
+        osMajor > Self.minimumOSMajor
+            || (osMajor == Self.minimumOSMajor && osMinor >= Self.minimumOSMinor)
+    }
+
+    var matchesReleaseArchitecture: Bool {
+        architecture == "arm64"
+    }
+
+    var healthLevel: MonitorHealthLevel {
+        if !meetsMinimumOS { return .attention }
+        return matchesReleaseArchitecture ? .healthy : .degraded
+    }
+
+    var status: String {
+        if !meetsMinimumOS { return "不支持" }
+        return matchesReleaseArchitecture ? "支持" : "非当前发布目标"
+    }
+
+    var detail: String {
+        if !meetsMinimumOS {
+            return "当前 macOS \(versionDescription) 低于最低要求 macOS \(Self.minimumOSMajor).\(Self.minimumOSMinor)"
+        }
+        if !matchesReleaseArchitecture {
+            return "当前进程架构 \(architecture)；当前 App bundle 发布目标为 arm64，部分原生行为未验证"
+        }
+        return "macOS \(versionDescription) · \(architecture)；满足当前发布前置条件"
+    }
+}
+
 enum MonitorHealthLevel: Int, CaseIterable, Comparable, Equatable, Sendable {
     case healthy = 0
     case degraded = 1
@@ -315,6 +397,7 @@ struct MonitorHealthInput: Equatable, Sendable {
     let auditError: String?
     let loginStatus: LoginLaunchStatus
     let loginError: String?
+    let runtimeEnvironment: RuntimeEnvironmentStatus?
     let checkedAt: Date
     /// Optional payload validation supplied by the live monitor. A nil value
     /// skips only payload consistency validation; usable statuses still need a
@@ -339,6 +422,7 @@ struct MonitorHealthInput: Equatable, Sendable {
         auditError: String?,
         loginStatus: LoginLaunchStatus,
         loginError: String?,
+        runtimeEnvironment: RuntimeEnvironmentStatus? = nil,
         checkedAt: Date,
         systemDataIsUsable: Bool? = nil,
         now: Date? = nil
@@ -356,6 +440,7 @@ struct MonitorHealthInput: Equatable, Sendable {
         self.auditError = auditError
         self.loginStatus = loginStatus
         self.loginError = loginError
+        self.runtimeEnvironment = runtimeEnvironment
         self.checkedAt = checkedAt
         self.systemDataIsUsable = systemDataIsUsable
         self.now = now ?? checkedAt
@@ -370,6 +455,9 @@ enum MonitorHealthEvaluator {
 
     static func evaluate(_ input: MonitorHealthInput) -> MonitorHealthSnapshot {
         var items: [MonitorHealthItem] = []
+        if let runtimeEnvironment = input.runtimeEnvironment {
+            items.append(environmentItem(runtimeEnvironment))
+        }
         items.append(metricItem(
             id: "system",
             title: "系统内存",
@@ -401,6 +489,18 @@ enum MonitorHealthEvaluator {
             checkedAt: input.checkedAt,
             overall: overall,
             items: items
+        )
+    }
+
+    private static func environmentItem(
+        _ environment: RuntimeEnvironmentStatus
+    ) -> MonitorHealthItem {
+        MonitorHealthItem(
+            id: "environment",
+            title: "运行环境",
+            status: environment.status,
+            detail: environment.detail,
+            level: environment.healthLevel
         )
     }
 

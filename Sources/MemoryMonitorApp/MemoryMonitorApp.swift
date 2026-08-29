@@ -370,6 +370,7 @@ final class MonitorViewModel: ObservableObject {
                 auditError: processActions.auditError,
                 loginStatus: loginLaunch.status,
                 loginError: loginLaunch.lastError,
+                runtimeEnvironment: .current(),
                 checkedAt: healthCheckedAt,
                 systemDataIsUsable: systemDataIsUsable,
                 now: Date()

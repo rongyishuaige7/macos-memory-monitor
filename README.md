@@ -615,3 +615,10 @@ open "$HOME/Library/Application Support/MemoryMonitor/dist/MemoryMonitor.app"
 - `swift build --configuration debug -Xswiftc -strict-concurrency=complete` 和 `swift build --configuration release -Xswiftc -strict-concurrency=complete`：通过。
 - Release `memory-monitor-probe`：成功完成本机只读采样，进程覆盖率受系统权限限制时明确显示为部分可用。
 - `scripts/build-app.sh`：成功生成 arm64 Release `MemoryMonitor.app`；`CFBundleShortVersionString=1.0.3`、`CFBundleVersion=13`，ad-hoc 签名及 `codesign --verify --deep --strict` 通过。
+
+### Phase 12 completed：v1.0.4a 兼容性诊断
+
+- 运行健康面板新增“运行环境”条目，显示当前 macOS 版本、进程架构和发布支持级别。
+- macOS 低于 14.0 标记为需要处理；非 arm64 仅标记为部分可用，不宣称绝对不兼容。
+- 环境信息只在内存中参与诊断，不写入历史或操作审计；跨版本实机回归仍需在对应系统上单独执行。
+- 设计和验收标准见 [`docs/compatibility-diagnostics-v1.0.4.md`](docs/compatibility-diagnostics-v1.0.4.md)。
