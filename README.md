@@ -6,7 +6,8 @@
 - 物理内存基线：16 GiB
 - 首版形态：菜单栏常驻 + 点击弹出详细面板
 - 首版范围（历史基线）：只监视、分析和给出建议，不执行进程退出或强制结束
-- 当前版本：v1.0.1，支持运行健康诊断、可选登录启动、只读操作审计总览和可靠性加固
+- 当前版本：v1.0.3（build 13），支持运行健康诊断、可选登录启动、只读操作审计总览和可靠性加固
+- 当前本地 App bundle 使用 ad-hoc 签名；Developer ID、notarization 和沙盒策略尚未启用
 - 文档状态：设计基线，可作为后续实现的验收依据
 
 ## 1. 产品定位
@@ -458,7 +459,7 @@ open "$HOME/Library/Application Support/MemoryMonitor/dist/MemoryMonitor.app"
 
 也可以通过 `OUTPUT_DIR` 指定其他本机目录；脚本会拒绝 iCloud Drive 或其他 File Provider 路径，因为这些位置可能在签名后重新写入 `com.apple.FinderInfo`。脚本只生成本地产物，不会自动安装、注册登录启动项或修改系统 LaunchAgents。Developer ID 签名、沙盒策略和登录启动开关留到单独阶段决定。
 
-构建脚本支持以下环境变量：`CONFIGURATION=debug|release`、`APP_VERSION`、`BUILD_NUMBER`、`CODE_SIGN_IDENTITY` 和 `SKIP_SIGNING=1`。默认签名身份为本地 ad-hoc（`-`）。
+构建脚本默认从 [`Resources/Info.plist`](Resources/Info.plist) 读取 `1.0.3 / 13`，也支持以下环境变量覆盖：`CONFIGURATION=debug|release`、`APP_VERSION`、`BUILD_NUMBER`、`CODE_SIGN_IDENTITY` 和 `SKIP_SIGNING=1`。默认签名身份为本地 ad-hoc（`-`）。发布基线和验收要求见 [`docs/release-readiness-v1.0.3.md`](docs/release-readiness-v1.0.3.md)。
 
 ### Phase 2 completed
 

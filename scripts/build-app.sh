@@ -15,10 +15,6 @@ else
 	# the signature after the build completes.
 	output_root="$HOME/Library/Application Support/MemoryMonitor/dist"
 fi
-app_version="${APP_VERSION:-1.0.1}"
-build_number="${BUILD_NUMBER:-11}"
-signing_identity="${CODE_SIGN_IDENTITY:--}"
-skip_signing="${SKIP_SIGNING:-0}"
 binary_name="memory-monitor-app"
 app_name="MemoryMonitor.app"
 info_plist="$project_root/Resources/Info.plist"
@@ -45,6 +41,21 @@ for command_name in swift plutil file install codesign xattr ditto mktemp; do
 		exit 2
 	fi
 done
+
+plutil -lint "$info_plist" >/dev/null
+
+# Keep the bundle's default version in one source of truth. Release tooling
+# can still override either value explicitly without modifying the source plist.
+if ! default_app_version="$(plutil -extract CFBundleShortVersionString raw -o - "$info_plist" 2>/dev/null)" ||
+	! default_build_number="$(plutil -extract CFBundleVersion raw -o - "$info_plist" 2>/dev/null)" ||
+	[[ -z "$default_app_version" || -z "$default_build_number" ]]; then
+	print -u2 "Info.plist is missing a bundle version"
+	exit 2
+fi
+app_version="${APP_VERSION:-$default_app_version}"
+build_number="${BUILD_NUMBER:-$default_build_number}"
+signing_identity="${CODE_SIGN_IDENTITY:--}"
+skip_signing="${SKIP_SIGNING:-0}"
 
 if [[ -z "$output_root" ]]; then
 	print -u2 "Refusing to use an empty OUTPUT_DIR"
@@ -97,8 +108,6 @@ if [[ -n "$file_provider_ancestor" ]]; then
 	print -u2 "  OUTPUT_DIR=\"$HOME/Library/Application Support/MemoryMonitor/dist\" ./scripts/build-app.sh"
 	exit 2
 fi
-
-plutil -lint "$info_plist" >/dev/null
 
 swift build \
 	--package-path "$project_root" \
