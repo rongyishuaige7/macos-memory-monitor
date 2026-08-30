@@ -19,17 +19,20 @@ struct AdaptiveDetailScrollView<Content: View>: View {
             ScrollView(.vertical) {
                 content()
                     .frame(width: contentWidth, alignment: .leading)
-                    .padding(20)
+                    .padding(.horizontal, CGFloat(DetailLayoutPolicy.detailHorizontalPadding))
+                    .padding(.vertical, 20)
             }
             .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
         }
     }
 
     private func resolvedContentWidth(_ viewportWidth: CGFloat) -> CGFloat {
-        guard viewportWidth.isFinite, viewportWidth > 0 else {
-            return max(minimumContentWidth, 0)
-        }
-        return max(minimumContentWidth, viewportWidth - 40)
+        CGFloat(
+            DetailLayoutPolicy.contentWidth(
+                viewportWidth: Double(viewportWidth),
+                minimumContentWidth: Double(minimumContentWidth)
+            )
+        )
     }
 }
 
@@ -42,6 +45,8 @@ enum DetailRowLayoutMode: String, Equatable, Sendable {
 /// Keeping the thresholds here prevents each row from inventing a different
 /// definition of "too narrow".
 enum DetailLayoutPolicy {
+    static let detailHorizontalPadding: Double = 20
+    static let detailHorizontalInset: Double = detailHorizontalPadding * 2
     static let defaultInfoLabelWidth: Double = 78
     static let infoRowSpacing: Double = 10
     static let minimumInfoValueWidth: Double = 150
@@ -51,6 +56,19 @@ enum DetailLayoutPolicy {
     static let minimumActionButtonWidth: Double = 112
     static let metricMinimumColumnWidth: Double = 180
     static let metricSpacing: Double = 10
+
+    static func contentWidth(
+        viewportWidth: Double,
+        minimumContentWidth: Double,
+        horizontalInset: Double = detailHorizontalInset
+    ) -> Double {
+        let minimum = finiteNonNegative(minimumContentWidth)
+        let inset = finiteNonNegative(horizontalInset)
+        guard viewportWidth.isFinite, viewportWidth > 0 else {
+            return minimum
+        }
+        return max(minimum, viewportWidth - inset)
+    }
 
     static func infoRowMode(
         availableWidth: Double,
@@ -87,12 +105,47 @@ enum DetailLayoutPolicy {
         spacing: Double = actionSpacing
     ) -> DetailRowLayoutMode {
         guard buttonCount > 0 else { return .inline }
-        let count = Double(buttonCount)
         return modeForRequiredWidth(
             availableWidth: availableWidth,
-            requiredWidth: count * max(minimumButtonWidth, 0)
-                + max(count - 1, 0) * max(spacing, 0)
+            requiredWidth: actionRequiredWidth(
+                buttonCount: buttonCount,
+                minimumButtonWidth: minimumButtonWidth,
+                spacing: spacing
+            )
         )
+    }
+
+    static func actionRequiredWidth(
+        buttonCount: Int,
+        minimumButtonWidth: Double = minimumActionButtonWidth,
+        spacing: Double = actionSpacing
+    ) -> Double {
+        guard buttonCount > 0 else { return 0 }
+        let count = Double(buttonCount)
+        let minimum = finiteNonNegative(minimumButtonWidth)
+        let gap = finiteNonNegative(spacing)
+        return count * minimum + max(count - 1, 0) * gap
+    }
+
+    static func actionRequiredWidth(
+        buttonWidths: [Double],
+        minimumButtonWidth: Double = minimumActionButtonWidth,
+        spacing: Double = actionSpacing
+    ) -> Double {
+        guard !buttonWidths.isEmpty else { return 0 }
+        let minimum = finiteNonNegative(minimumButtonWidth)
+        let gap = finiteNonNegative(spacing)
+        let width = buttonWidths.reduce(0) { total, candidate in
+            if candidate == .infinity {
+                return .infinity
+            }
+            let safeCandidate = candidate.isFinite
+                ? max(candidate, minimum)
+                : minimum
+            return total + safeCandidate
+        }
+        guard width.isFinite else { return .infinity }
+        return width + max(Double(buttonWidths.count - 1), 0) * gap
     }
 
     static func metricColumnCount(
@@ -105,12 +158,32 @@ enum DetailLayoutPolicy {
         guard availableWidth.isFinite else {
             return availableWidth == .infinity ? maximumColumns : 1
         }
-        guard availableWidth > 0, minimumColumnWidth > 0 else {
+        guard availableWidth > 0,
+              minimumColumnWidth.isFinite,
+              minimumColumnWidth > 0,
+              spacing.isFinite else {
             return 1
         }
-        let count = Int(floor((availableWidth + max(spacing, 0))
-            / (minimumColumnWidth + max(spacing, 0))))
-        return min(max(count, 1), maximumColumns)
+        let gap = max(spacing, 0)
+        let denominator = minimumColumnWidth + gap
+        guard denominator.isFinite, denominator > 0 else {
+            return 1
+        }
+        let numerator = availableWidth + gap
+        guard numerator.isFinite else {
+            return maximumColumns
+        }
+        let rawCount = floor(numerator / denominator)
+        guard rawCount.isFinite else {
+            return maximumColumns
+        }
+        // Clamp before converting to Int. A very large finite ratio can be
+        // outside Int's representable range even though the final policy is
+        // capped by maximumColumns.
+        guard rawCount < Double(maximumColumns) else {
+            return maximumColumns
+        }
+        return max(Int(rawCount), 1)
     }
 
     static func modeForRequiredWidth(
@@ -127,6 +200,11 @@ enum DetailLayoutPolicy {
         return availableWidth + 0.5 >= max(requiredWidth, 0)
             ? .inline
             : .stacked
+    }
+
+    private static func finiteNonNegative(_ value: Double) -> Double {
+        guard value.isFinite else { return 0 }
+        return max(value, 0)
     }
 }
 
@@ -274,8 +352,12 @@ private struct AdaptiveDetailActionFlowLayout: Layout {
 
         let idealSizes = subviews.map { sanitizedSize($0.sizeThatFits(.unspecified)) }
         let width = resolvedWidth(proposal.width, idealSizes: idealSizes)
-        let requiredWidth = idealSizes.reduce(0) { $0 + max($1.width, minimumButtonWidth) }
-            + spacing * CGFloat(max(subviews.count - 1, 0))
+        let buttonWidths = idealSizes.map { Double($0.width) }
+        let requiredWidth = CGFloat(DetailLayoutPolicy.actionRequiredWidth(
+            buttonWidths: buttonWidths,
+            minimumButtonWidth: Double(minimumButtonWidth),
+            spacing: Double(spacing)
+        ))
         let mode = DetailLayoutPolicy.modeForRequiredWidth(
             availableWidth: Double(width),
             requiredWidth: Double(requiredWidth)
@@ -309,8 +391,12 @@ private struct AdaptiveDetailActionFlowLayout: Layout {
 
         let idealSizes = subviews.map { sanitizedSize($0.sizeThatFits(.unspecified)) }
         let width = resolvedWidth(bounds.width, idealSizes: idealSizes)
-        let requiredWidth = idealSizes.reduce(0) { $0 + max($1.width, minimumButtonWidth) }
-            + spacing * CGFloat(max(subviews.count - 1, 0))
+        let buttonWidths = idealSizes.map { Double($0.width) }
+        let requiredWidth = CGFloat(DetailLayoutPolicy.actionRequiredWidth(
+            buttonWidths: buttonWidths,
+            minimumButtonWidth: Double(minimumButtonWidth),
+            spacing: Double(spacing)
+        ))
         let mode = DetailLayoutPolicy.modeForRequiredWidth(
             availableWidth: Double(width),
             requiredWidth: Double(requiredWidth)
@@ -346,8 +432,12 @@ private struct AdaptiveDetailActionFlowLayout: Layout {
         if let proposedWidth, proposedWidth.isFinite {
             return max(proposedWidth, 0)
         }
-        return idealSizes.reduce(0) { $0 + max(finiteNonNegative($1.width), minimumButtonWidth) }
-            + spacing * CGFloat(max(idealSizes.count - 1, 0))
+        let buttonWidths = idealSizes.map { Double($0.width) }
+        return CGFloat(DetailLayoutPolicy.actionRequiredWidth(
+            buttonWidths: buttonWidths,
+            minimumButtonWidth: Double(minimumButtonWidth),
+            spacing: Double(spacing)
+        ))
     }
 }
 
@@ -422,7 +512,9 @@ private struct AdaptiveDetailMetricGridLayout: Layout {
         idealSizes: [CGSize],
         subviews: Subviews
     ) -> Measurement {
-        let safeWidth = finiteNonNegative(width)
+        let safeWidth = width == .infinity
+            ? resolvedWidth(nil, idealSizes: idealSizes)
+            : finiteNonNegative(width)
         let columns = max(
             1,
             min(
