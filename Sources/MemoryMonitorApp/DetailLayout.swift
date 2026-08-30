@@ -15,23 +15,39 @@ struct AdaptiveDetailScrollView<Content: View>: View {
 
     var body: some View {
         GeometryReader { proxy in
-            let contentWidth = resolvedContentWidth(proxy.size.width)
+            let horizontalPadding = resolvedHorizontalPadding(proxy.size.width)
+            let contentWidth = resolvedContentWidth(
+                proxy.size.width,
+                horizontalInset: horizontalPadding * 2
+            )
             ScrollView(.vertical) {
                 content()
                     .frame(width: contentWidth, alignment: .leading)
-                    .padding(.horizontal, CGFloat(DetailLayoutPolicy.detailHorizontalPadding))
+                    .padding(.horizontal, horizontalPadding)
                     .padding(.vertical, 20)
             }
             .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
         }
     }
 
-    private func resolvedContentWidth(_ viewportWidth: CGFloat) -> CGFloat {
+    private func resolvedContentWidth(
+        _ viewportWidth: CGFloat,
+        horizontalInset: CGFloat
+    ) -> CGFloat {
         CGFloat(
             DetailLayoutPolicy.contentWidth(
                 viewportWidth: Double(viewportWidth),
-                minimumContentWidth: Double(minimumContentWidth)
+                minimumContentWidth: Double(minimumContentWidth),
+                horizontalInset: Double(horizontalInset)
             )
+        )
+    }
+
+    private func resolvedHorizontalPadding(_ viewportWidth: CGFloat) -> CGFloat {
+        guard viewportWidth.isFinite, viewportWidth > 0 else { return 0 }
+        return min(
+            CGFloat(DetailLayoutPolicy.detailHorizontalPadding),
+            viewportWidth / 2
         )
     }
 }
@@ -112,7 +128,10 @@ enum DetailLayoutPolicy {
         guard viewportWidth.isFinite, viewportWidth > 0 else {
             return minimum
         }
-        return max(minimum, viewportWidth - inset)
+        // A finite viewport is authoritative. Once it is narrower than the
+        // production minimum, shrinking the content keeps the vertical-only
+        // scroll view from creating an unreachable horizontal overflow.
+        return max(viewportWidth - inset, 0)
     }
 
     static func infoRowMode(

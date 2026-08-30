@@ -18,7 +18,15 @@ final class DetailLayoutContractTests: XCTestCase {
         )
         XCTAssertEqual(
             DetailLayoutPolicy.contentWidth(viewportWidth: 300, minimumContentWidth: 460),
-            460
+            260
+        )
+        XCTAssertEqual(
+            DetailLayoutPolicy.contentWidth(
+                viewportWidth: 20,
+                minimumContentWidth: 460,
+                horizontalInset: 20
+            ),
+            0
         )
         XCTAssertEqual(
             DetailLayoutPolicy.contentWidth(viewportWidth: .infinity, minimumContentWidth: 460),
