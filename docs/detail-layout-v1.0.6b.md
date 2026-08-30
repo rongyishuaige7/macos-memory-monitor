@@ -35,9 +35,9 @@
 ## 架构
 
 - 新增纯值布局策略，使用可用宽度、标签最小宽度、尾部值宽度和控件数量判断何时从横向切换为纵向；策略不依赖 AppKit 窗口状态，可单元测试。
-- 详情行使用 `ViewThatFits(in: .horizontal)`：优先保留紧凑横向排列，无法容纳时切换为标签在上、值在下的纵向排列；纵向值允许自然换行。
-- 带尾部值的关系/成员/审计行保留相同信息顺序，横向候选不适配时使用两行结构，确保 PID、状态和时间仍可见。
-- 操作按钮在横向候选不适配时改为纵向按钮列，按钮动作和禁用条件保持不变。
+- 信息行使用自定义 `Layout` 根据提案宽度选择横向或纵向排列；纵向值允许自然换行。
+- 带尾部值的关系/成员/审计行使用 `ViewThatFits(in: .horizontal)`：横向候选不适配时回退为两行结构，确保 PID、状态和时间仍可见。
+- 操作按钮使用自定义流式 `Layout`，横向候选不适配时改为纵向按钮列；按钮动作和禁用条件保持不变。
 - 指标网格使用自适应最小列宽，在更窄内容区域自动降为单列。
 
 ## 风险
@@ -58,7 +58,36 @@
 
 ## 分阶段交付
 
-1. **文档审计**：记录现状、风险、策略和验收标准。
-2. **自适应布局**：新增布局策略与详情控件回退，补充纯值测试。
-3. **验证交付**：完成全量测试、构建、独立 UI-check，更新本记录并提交推送。
+1. **文档审计（已完成）**：记录现状、风险、策略和验收标准。
+2. **自适应布局（已完成）**：新增布局策略与详情控件回退，补充纯值测试。
+3. **验证交付（已完成）**：全量测试、构建和独立 UI-check 已完成，并按源码/测试与文档两批提交推送。
 
+## 实施结果
+
+- 新增 `Sources/MemoryMonitorApp/DetailLayout.swift`，集中提供详情滚动容器、信息行、关系/成员/审计行、操作组和指标网格的自适应布局；没有引入第三方依赖。
+- `ProcessDetailView` 和 `WorkloadGroupDetailView` 接入自适应滚动容器。进程详情正文最小内容宽度为 `460pt`（窗口最小宽度 `500pt`），工作组详情正文最小内容宽度为 `500pt`（窗口最小宽度 `540pt`）。
+- 指标网格保持最多两列；内容宽度不足 `359pt` 时降为一列。信息值、父链、成员、审计记录和操作按钮都有纵向回退，不再依赖单行 `Spacer` 抢占空间。
+- 长值保留中间截断和最多三行显示，并提供 hover 帮助和合并后的辅助功能标签；原有信号确认、身份校验和只读限制未改变。
+
+## 最终验证记录（2026-08-30）
+
+- `git diff --check`：通过。
+- `swift test --package-path . --parallel`：`241/241` 通过。
+- `swift build --package-path . --configuration debug -Xswiftc -strict-concurrency=complete`：通过。
+- `swift build --package-path . --configuration release -Xswiftc -strict-concurrency=complete`：通过。
+- `./scripts/verify-release.sh`：通过；包含测试、严格并发 Debug/Release 构建、Release probe、结构化兼容性报告、arm64 App bundle 和 `codesign --verify --deep --strict`。本次 probe 读取 `436/663` 个进程（部分可用），兼容性报告为 schema `1`、macOS `26.5.1`、arm64。
+- 独立 UI-check bundle `/Users/rongyi/Applications/MemoryMonitor-ui-check/MemoryMonitor.app` 使用临时 bundle ID `com.rongyi.MemoryMonitorUICheck`，运行于同一 macOS `26.5.1` arm64 登录桌面；正式实例和 c3c 实例未被替换或操作。
+- 进程详情实机检查：sheet 约 `500x622pt`，指标保持两列；滚动条设置到末端后，AX 树仍包含“请求优雅退出”“最近操作记录”和“关闭进程详情”，长值和采样状态提示可读。未点击任何退出或强制结束动作。
+- 工作组详情实机检查：sheet 约 `540x662pt`，成员列表和两列指标可见；滚动到末端后，AX 树仍包含约 `500x170pt` 的趋势图、“相关历史事件”、只读说明和“关闭工作组详情”。
+- UI 证据截图保存在临时目录 `/tmp/memory-monitor-process-ghostty-v106b.png` 和 `/tmp/memory-monitor-group-detail-v106b.png`，未纳入仓库；临时实例收尾时只关闭本阶段启动的 UI-check 进程。
+
+## 已知边界
+
+- 当前 UI-check 覆盖了窗口最小尺寸、滚动末端、辅助功能标签和真实长值，但没有为了制造三按钮状态而向真实用户进程发送信号；三按钮阈值由纯值策略和布局单元测试覆盖。
+- `ViewThatFits` 和系统辅助功能树的具体测量会随 macOS 版本、字体设置和 Dynamic Type 变化；本记录的像素尺寸是 macOS `26.5.1` 的实机证据，不外推为所有系统版本的像素保证。
+- AX 报告中的滚动区域宽度包含系统滚动条附加区域（比 sheet 约多 `17pt`）；截图中未观察到正文横向遮挡。详情窗口当前最小宽度足以容纳定义的最小内容宽度。
+
+## 提交记录
+
+- 源码与测试批次：`94ef35e`，已推送至 `origin/main`。
+- 文档批次：本记录随本阶段第二批提交推送；两个 `ScratchProbe` 文件保持未跟踪，不纳入任何提交。
