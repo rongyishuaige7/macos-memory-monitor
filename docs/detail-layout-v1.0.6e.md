@@ -25,6 +25,12 @@
 4. 独立桌面检查仍由人工/AX 只读步骤完成。测试证据记录 bundle、隔离目录、窗口尺寸、关键标签和收尾状态；截图只保存到临时目录，不进入仓库。
 5. 成员行和审计行先完成风险审计。只有在能用确定性契约证明长文本或大字号会越界时才改生产布局，并为改动增加对应 smoke/纯值测试。
 
+### 独立启动器约定
+
+`scripts/launch-ui-check.sh` 只接受 `--output-dir` 显式参数。目标必须是 `TMPDIR` 或 `/tmp` 下的空目录（可由 `mktemp -d` 预先创建）；脚本拒绝工作区路径、根目录、符号链接和非空目录，以免复用旧数据或覆盖正式产物。脚本在该目录下分别创建 `app-output`、`storage`、`home` 和 `tmp`，构建 Release arm64 bundle 后写入唯一的 `com.rongyi.MemoryMonitorUICheck.<timestamp>.<pid>` 标识，并通过 Launch Services 启动。
+
+启动器对子进程设置 `HOME`、`CFFIXED_USER_HOME`、`TMPDIR` 和 `MEMORY_MONITOR_UI_CHECK_STORAGE_ROOT`，输出 `UI_CHECK_PID`、bundle 路径、隔离存储根目录、启动日志和架构等字段。它不执行 AX 点击、进程操作或任何信号调用；收尾由操作者只处理该次输出中的 PID 和 bundle。
+
 ## 风险
 
 - 环境变量是进程级配置，必须只在显式 UI-check 启动器中设置，不能改变正常启动脚本的默认语义；
