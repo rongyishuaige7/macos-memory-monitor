@@ -190,16 +190,41 @@ enum DetailLayoutPolicy {
         availableWidth: Double,
         requiredWidth: Double
     ) -> DetailRowLayoutMode {
+        guard requiredWidth.isFinite else {
+            return .stacked
+        }
         if availableWidth == .infinity {
             return .inline
         }
-        guard availableWidth.isFinite, availableWidth > 0,
-              requiredWidth.isFinite else {
+        guard availableWidth.isFinite, availableWidth > 0 else {
             return .stacked
         }
-        return availableWidth + 0.5 >= max(requiredWidth, 0)
+        return availableWidth >= max(requiredWidth, 0)
             ? .inline
             : .stacked
+    }
+
+    /// Limits a child width to the space that remains after its leading
+    /// siblings. Layout placement uses this helper so a borderline inline
+    /// decision cannot place a child beyond the container's trailing edge.
+    static func boundedInlineWidth(
+        requestedWidth: Double,
+        availableWidth: Double,
+        leadingOffset: Double = 0
+    ) -> Double {
+        let requested: Double
+        if requestedWidth == .infinity {
+            requested = .infinity
+        } else {
+            requested = finiteNonNegative(requestedWidth)
+        }
+        guard availableWidth.isFinite else {
+            guard availableWidth == .infinity, requested.isFinite else { return 0 }
+            return requested
+        }
+        guard availableWidth > 0 else { return 0 }
+        let offset = min(finiteNonNegative(leadingOffset), availableWidth)
+        return min(requested, max(availableWidth - offset, 0))
     }
 
     private static func finiteNonNegative(_ value: Double) -> Double {
@@ -242,7 +267,11 @@ private struct AdaptiveDetailInfoRowLayout: Layout {
                 labelWidth,
                 max(labelFloor, width - horizontalSpacing - minimumValueWidth)
             )
-            let valueWidth = max(width - actualLabelWidth - horizontalSpacing, minimumValueWidth)
+            let valueWidth = DetailLayoutPolicy.boundedInlineWidth(
+                requestedWidth: max(width - actualLabelWidth - horizontalSpacing, minimumValueWidth),
+                availableWidth: Double(width),
+                leadingOffset: Double(actualLabelWidth + horizontalSpacing)
+            )
             let labelSize = sanitizedSize(subviews[0].sizeThatFits(
                 ProposedViewSize(width: actualLabelWidth, height: nil)
             ))
@@ -296,14 +325,22 @@ private struct AdaptiveDetailInfoRowLayout: Layout {
                 labelWidth,
                 max(labelFloor, width - horizontalSpacing - minimumValueWidth)
             )
-            let valueWidth = max(width - actualLabelWidth - horizontalSpacing, minimumValueWidth)
+            let valueWidth = CGFloat(DetailLayoutPolicy.boundedInlineWidth(
+                requestedWidth: max(width - actualLabelWidth - horizontalSpacing, minimumValueWidth),
+                availableWidth: Double(width),
+                leadingOffset: Double(actualLabelWidth + horizontalSpacing)
+            ))
+            let valueOrigin = min(
+                bounds.maxX,
+                bounds.minX + actualLabelWidth + horizontalSpacing
+            )
             subviews[0].place(
                 at: CGPoint(x: bounds.minX, y: bounds.minY),
                 anchor: .topLeading,
                 proposal: ProposedViewSize(width: actualLabelWidth, height: nil)
             )
             subviews[1].place(
-                at: CGPoint(x: bounds.minX + actualLabelWidth + horizontalSpacing, y: bounds.minY),
+                at: CGPoint(x: valueOrigin, y: bounds.minY),
                 anchor: .topLeading,
                 proposal: ProposedViewSize(width: valueWidth, height: nil)
             )
@@ -407,12 +444,21 @@ private struct AdaptiveDetailActionFlowLayout: Layout {
             var x = bounds.minX
             for (index, subview) in subviews.enumerated() {
                 let size = idealSizes[index]
+                let leadingOffset = max(x - bounds.minX, 0)
+                let width = CGFloat(DetailLayoutPolicy.boundedInlineWidth(
+                    requestedWidth: Double(size.width),
+                    availableWidth: Double(finiteNonNegative(bounds.width)),
+                    leadingOffset: Double(leadingOffset)
+                ))
                 subview.place(
                     at: CGPoint(x: x, y: bounds.minY),
                     anchor: .topLeading,
-                    proposal: ProposedViewSize(width: size.width, height: nil)
+                    proposal: ProposedViewSize(width: width, height: nil)
                 )
-                x += size.width + spacing
+                x = min(
+                    bounds.maxX,
+                    x + width + min(spacing, max(bounds.maxX - x - width, 0))
+                )
             }
         case .stacked:
             var y = bounds.minY

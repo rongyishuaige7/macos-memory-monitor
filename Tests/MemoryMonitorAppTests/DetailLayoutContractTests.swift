@@ -38,7 +38,7 @@ final class DetailLayoutContractTests: XCTestCase {
         )
     }
 
-    func testRequiredWidthModeKeepsTheHalfPointToleranceExplicit() {
+    func testRequiredWidthModeUsesAnExactBoundary() {
         let required = 238.0
         XCTAssertEqual(
             DetailLayoutPolicy.modeForRequiredWidth(
@@ -49,29 +49,51 @@ final class DetailLayoutContractTests: XCTestCase {
         )
         XCTAssertEqual(
             DetailLayoutPolicy.modeForRequiredWidth(
-                availableWidth: required - 0.49,
-                requiredWidth: required
-            ),
-            .inline
-        )
-        XCTAssertEqual(
-            DetailLayoutPolicy.modeForRequiredWidth(
-                availableWidth: required - 0.51,
+                availableWidth: required - 0.01,
                 requiredWidth: required
             ),
             .stacked
         )
         XCTAssertEqual(
             DetailLayoutPolicy.modeForRequiredWidth(
-                availableWidth: .infinity,
-                requiredWidth: .nan
+                availableWidth: required,
+                requiredWidth: required
             ),
             .inline
         )
         XCTAssertEqual(
             DetailLayoutPolicy.modeForRequiredWidth(
+                availableWidth: required + 0.01,
+                requiredWidth: required
+            ),
+            .inline
+        )
+        XCTAssertEqual(
+            DetailLayoutPolicy.modeForRequiredWidth(
+                availableWidth: .infinity,
+                requiredWidth: required
+            ),
+            .inline
+        )
+        XCTAssertEqual(
+            DetailLayoutPolicy.modeForRequiredWidth(
+                availableWidth: .infinity,
+                requiredWidth: .nan
+            ),
+            .stacked
+        )
+        XCTAssertEqual(
+            DetailLayoutPolicy.modeForRequiredWidth(
                 availableWidth: .nan,
                 requiredWidth: required
+            ),
+            .stacked
+        )
+
+        XCTAssertEqual(
+            DetailLayoutPolicy.modeForRequiredWidth(
+                availableWidth: 0,
+                requiredWidth: 0
             ),
             .stacked
         )
@@ -109,11 +131,11 @@ final class DetailLayoutContractTests: XCTestCase {
 
         let relationRequired = 52.0 + 74.0 + 140.0 + 16.0
         XCTAssertEqual(
-            DetailLayoutPolicy.relationRowMode(availableWidth: relationRequired - 0.51),
+            DetailLayoutPolicy.relationRowMode(availableWidth: relationRequired - 0.01),
             .stacked
         )
         XCTAssertEqual(
-            DetailLayoutPolicy.relationRowMode(availableWidth: relationRequired - 0.49),
+            DetailLayoutPolicy.relationRowMode(availableWidth: relationRequired),
             .inline
         )
         XCTAssertEqual(
@@ -134,11 +156,11 @@ final class DetailLayoutContractTests: XCTestCase {
             352
         )
         XCTAssertEqual(
-            DetailLayoutPolicy.actionLayoutMode(availableWidth: 352 - 0.51, buttonCount: 3),
+            DetailLayoutPolicy.actionLayoutMode(availableWidth: 352 - 0.01, buttonCount: 3),
             .stacked
         )
         XCTAssertEqual(
-            DetailLayoutPolicy.actionLayoutMode(availableWidth: 352 - 0.49, buttonCount: 3),
+            DetailLayoutPolicy.actionLayoutMode(availableWidth: 352, buttonCount: 3),
             .inline
         )
         XCTAssertEqual(
@@ -230,6 +252,41 @@ final class DetailLayoutContractTests: XCTestCase {
                 maximumColumns: 0
             ),
             1
+        )
+    }
+
+    func testBoundedInlineWidthNeverExceedsRemainingSpace() {
+        XCTAssertEqual(
+            DetailLayoutPolicy.boundedInlineWidth(
+                requestedWidth: 100,
+                availableWidth: 238,
+                leadingOffset: 138
+            ),
+            100
+        )
+        XCTAssertEqual(
+            DetailLayoutPolicy.boundedInlineWidth(
+                requestedWidth: 101,
+                availableWidth: 238,
+                leadingOffset: 138
+            ),
+            100
+        )
+        XCTAssertEqual(
+            DetailLayoutPolicy.boundedInlineWidth(
+                requestedWidth: .infinity,
+                availableWidth: 238,
+                leadingOffset: 138
+            ),
+            100
+        )
+        XCTAssertEqual(
+            DetailLayoutPolicy.boundedInlineWidth(
+                requestedWidth: 100,
+                availableWidth: .nan,
+                leadingOffset: 0
+            ),
+            0
         )
     }
 }
