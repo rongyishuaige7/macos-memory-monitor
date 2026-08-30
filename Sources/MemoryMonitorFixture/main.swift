@@ -1,0 +1,276 @@
+import Darwin
+import Foundation
+import MemoryMonitorCore
+
+private enum FixtureToolError: Error, CustomStringConvertible {
+    case invalidArguments
+    case invalidRoot(String)
+    case nonEmptyRoot
+    case missingOutput(String)
+    case verificationFailed(String)
+
+    var description: String {
+        switch self {
+        case .invalidArguments:
+            return "用法：memory-monitor-fixture --storage-root <临时目录>"
+        case let .invalidRoot(path):
+            return "storage root 必须是 /tmp 或 TMPDIR 下的绝对目录：\(path)"
+        case .nonEmptyRoot:
+            return "storage root 必须为空，以避免复用旧 fixture 数据"
+        case let .missingOutput(path):
+            return "fixture 输出缺失：\(path)"
+        case let .verificationFailed(message):
+            return "fixture 校验失败：\(message)"
+        }
+    }
+}
+
+@main
+struct MemoryMonitorFixtureTool {
+    static func main() async {
+        do {
+            let root = try parseRoot(arguments: Array(CommandLine.arguments.dropFirst()))
+            try validateRoot(root)
+            let dataset = MemoryMonitorUIFixture.makeDataset(now: Date())
+            let historyURL = MemoryMonitorStoragePaths.historyFileURL(root: root)
+            let auditURL = MemoryMonitorStoragePaths.auditFileURL(root: root)
+
+            // Keep thresholds above the fixture size so the pre-launch state
+            // retains a journal. App startup then exercises journal merge and
+            // canonical compaction through the normal load path.
+            let historyStore = HistoryStore(
+                fileURL: historyURL,
+                compactionRecordThreshold: 1_000,
+                compactionByteThreshold: 64 * 1024 * 1024
+            )
+            for record in dataset.historyRecords {
+                _ = try await historyStore.append(record, now: dataset.referenceDate)
+            }
+            let preFlushHistoryDiagnostics = await historyStore.diagnostics()
+            guard preFlushHistoryDiagnostics.journalRecordCount == dataset.historyRecords.count - 1,
+                  preFlushHistoryDiagnostics.journalBytes > 0 else {
+                throw FixtureToolError.verificationFailed(
+                    "history journal 未保留完整的增量记录"
+                )
+            }
+
+            // Read the journal through a new actor before flushing. This is
+            // the same recovery path used by a newly launched app process.
+            let replayStore = HistoryStore(
+                fileURL: historyURL,
+                compactionRecordThreshold: 1_000,
+                compactionByteThreshold: 64 * 1024 * 1024
+            )
+            let replayedHistory = try await replayStore.load(now: dataset.referenceDate)
+            try verifyHistory(
+                replayedHistory,
+                expected: dataset.historyRecords
+            )
+            try await historyStore.flush(now: dataset.referenceDate)
+
+            let auditStore = ProcessActionAuditStore(fileURL: auditURL)
+            for event in dataset.auditEvents {
+                _ = try await auditStore.append(event, now: dataset.referenceDate)
+            }
+            try await auditStore.flush(now: dataset.referenceDate)
+
+            // Verify the post-flush canonical files with fresh actors as well;
+            // this catches date encoding, journal compaction and JSONL repair
+            // regressions that an in-memory assertion would miss.
+            let finalHistoryStore = HistoryStore(
+                fileURL: historyURL,
+                compactionRecordThreshold: 1_000,
+                compactionByteThreshold: 64 * 1024 * 1024
+            )
+            let finalHistory = try await finalHistoryStore.load(now: dataset.referenceDate)
+            try verifyHistory(finalHistory, expected: dataset.historyRecords)
+            let finalAuditStore = ProcessActionAuditStore(fileURL: auditURL)
+            let finalAudit = try await finalAuditStore.load(now: dataset.referenceDate)
+            try verifyAudit(finalAudit, expected: dataset.auditEvents)
+
+            try verifyOutput(
+                root: root,
+                historyURL: historyURL,
+                auditURL: auditURL,
+                expectedHistoryCount: dataset.historyRecords.count,
+                expectedAuditCount: dataset.auditEvents.count,
+                historyDiagnostics: await historyStore.diagnostics()
+            )
+
+            print("FIXTURE_REFERENCE_DATE=\(dataset.referenceDate.timeIntervalSince1970)")
+            print("FIXTURE_HISTORY_RECORDS=\(dataset.historyRecords.count)")
+            print("FIXTURE_AUDIT_EVENTS=\(dataset.auditEvents.count)")
+            print("FIXTURE_HISTORY_JOURNAL_RECORDS=\(preFlushHistoryDiagnostics.journalRecordCount)")
+            print("FIXTURE_STORAGE_ROOT=\(root.path)")
+            print("FIXTURE_HISTORY_FILE=\(historyURL.path)")
+            print("FIXTURE_AUDIT_FILE=\(auditURL.path)")
+        } catch {
+            fputs("memory-monitor-fixture: \(error)\n", stderr)
+            exit(1)
+        }
+    }
+
+    private static func parseRoot(arguments: [String]) throws -> URL {
+        guard arguments.count == 2, arguments[0] == "--storage-root" else {
+            throw FixtureToolError.invalidArguments
+        }
+        let path = arguments[1]
+        guard !path.isEmpty,
+              path.hasPrefix("/"),
+              !path.unicodeScalars.contains(where: { $0.value == 0 }) else {
+            throw FixtureToolError.invalidRoot(path)
+        }
+        return URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+    }
+
+    private static func validateRoot(_ root: URL) throws {
+        let requestedPath = root.standardizedFileURL.path
+        let resolvedPath = root.resolvingSymlinksInPath().standardizedFileURL.path
+        guard requestedPath != "/",
+              requestedPath == resolvedPath else {
+            throw FixtureToolError.invalidRoot(root.path)
+        }
+        let temporaryRoots = [
+            ProcessInfo.processInfo.environment["TMPDIR"],
+            "/tmp"
+        ].compactMap { value -> String? in
+            guard let value, value.hasPrefix("/") else { return nil }
+            return URL(fileURLWithPath: value, isDirectory: true)
+                .resolvingSymlinksInPath()
+                .standardizedFileURL
+                .path
+        }
+        guard temporaryRoots.contains(where: {
+            requestedPath.hasPrefix($0 + "/") && requestedPath != $0
+        }) else {
+            throw FixtureToolError.invalidRoot(root.path)
+        }
+        let fileManager = FileManager.default
+        if isSymbolicLink(atPath: requestedPath) {
+            throw FixtureToolError.invalidRoot(root.path)
+        }
+        if fileManager.fileExists(atPath: requestedPath) {
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: requestedPath, isDirectory: &isDirectory),
+                  isDirectory.boolValue,
+                  !isSymbolicLink(atPath: requestedPath) else {
+                throw FixtureToolError.invalidRoot(requestedPath)
+            }
+            guard try fileManager.contentsOfDirectory(atPath: requestedPath).isEmpty else {
+                throw FixtureToolError.nonEmptyRoot
+            }
+        } else {
+            try fileManager.createDirectory(
+                at: URL(fileURLWithPath: requestedPath, isDirectory: true),
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
+        }
+        try fileManager.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: requestedPath
+        )
+        guard !isSymbolicLink(atPath: requestedPath),
+              URL(fileURLWithPath: requestedPath, isDirectory: true)
+                .resolvingSymlinksInPath().standardizedFileURL.path == requestedPath else {
+            throw FixtureToolError.invalidRoot(requestedPath)
+        }
+    }
+
+    private static func isSymbolicLink(atPath path: String) -> Bool {
+        var info = stat()
+        guard lstat(path, &info) == 0 else { return false }
+        return (info.st_mode & S_IFMT) == S_IFLNK
+    }
+
+    private static func verifyHistory(
+        _ actual: [MemoryHistoryRecord],
+        expected: [MemoryHistoryRecord]
+    ) throws {
+        guard actual.count == expected.count,
+              actual.map(\.timestamp) == expected.map(\.timestamp),
+              actual.allSatisfy({ $0.sourceSampledAt != nil }) else {
+            throw FixtureToolError.verificationFailed(
+                "history reload 数量、顺序或 freshness marker 不匹配"
+            )
+        }
+    }
+
+    private static func verifyAudit(
+        _ actual: [ProcessActionAuditEvent],
+        expected: [ProcessActionAuditEvent]
+    ) throws {
+        let actualIDs = Set(actual.map(\.id))
+        let expectedIDs = Set(expected.map(\.id))
+        guard actual.count == expected.count, actualIDs == expectedIDs else {
+            throw FixtureToolError.verificationFailed(
+                "audit JSONL reload 数量或事件 ID 不匹配"
+            )
+        }
+    }
+
+    private static func verifyOutput(
+        root: URL,
+        historyURL: URL,
+        auditURL: URL,
+        expectedHistoryCount: Int,
+        expectedAuditCount: Int,
+        historyDiagnostics: HistoryStoreDiagnostics
+    ) throws {
+        let fileManager = FileManager.default
+        let expectedPaths = [
+            historyURL.path,
+            historyURL.path + ".clock",
+            historyURL.path + ".journal",
+            historyURL.path + ".lock",
+            auditURL.path,
+            auditURL.path + ".clock",
+            auditURL.path + ".lock"
+        ]
+        for path in expectedPaths {
+            guard fileManager.fileExists(atPath: path) else {
+                throw FixtureToolError.missingOutput(path)
+            }
+        }
+        guard historyDiagnostics.journalRecordCount == 0 else {
+            throw FixtureToolError.verificationFailed(
+                "flush 后 history journal 计数应为 0"
+            )
+        }
+        let auditData = try Data(contentsOf: auditURL)
+        let auditLineCount = auditData
+            .split(separator: 0x0A, omittingEmptySubsequences: true)
+            .count
+        guard auditLineCount == expectedAuditCount else {
+            throw FixtureToolError.missingOutput(auditURL.path)
+        }
+        let expectedNames = Set(expectedPaths.map {
+            URL(fileURLWithPath: $0).lastPathComponent
+        })
+        let actualNames = Set(try fileManager.contentsOfDirectory(atPath: root.path))
+        guard actualNames == expectedNames else {
+            throw FixtureToolError.verificationFailed(
+                "storage root 包含非预期文件"
+            )
+        }
+        guard permissions(atPath: root.path) == 0o700 else {
+            throw FixtureToolError.verificationFailed(
+                "storage root 权限不是 0700"
+            )
+        }
+        for path in expectedPaths {
+            guard !isSymbolicLink(atPath: path),
+                  permissions(atPath: path) == 0o600 else {
+                throw FixtureToolError.missingOutput(path)
+            }
+        }
+    }
+
+    private static func permissions(atPath path: String) -> Int {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              let value = attributes[.posixPermissions] as? NSNumber else {
+            return 0
+        }
+        return value.intValue & 0o777
+    }
+}

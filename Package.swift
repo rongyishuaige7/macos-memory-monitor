@@ -17,6 +17,10 @@ let package = Package(
             targets: ["MemoryMonitorProbe"]
         ),
         .executable(
+            name: "memory-monitor-fixture",
+            targets: ["MemoryMonitorFixture"]
+        ),
+        .executable(
             name: "memory-monitor-app",
             targets: ["MemoryMonitorApp"]
         )
@@ -25,6 +29,10 @@ let package = Package(
         .target(name: "MemoryMonitorCore"),
         .executableTarget(
             name: "MemoryMonitorProbe",
+            dependencies: ["MemoryMonitorCore"]
+        ),
+        .executableTarget(
+            name: "MemoryMonitorFixture",
             dependencies: ["MemoryMonitorCore"]
         ),
         .executableTarget(
