@@ -1,5 +1,6 @@
 #!/bin/zsh
 set -euo pipefail
+umask 077
 
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd -P)"
 project_root="$(cd -- "$script_dir/.." && pwd -P)"
@@ -55,7 +56,7 @@ if (( ! is_temporary )); then
 	exit 2
 fi
 
-for command_name in swift plutil codesign file ps pgrep open env mkdir find sleep date sed; do
+for command_name in swift plutil codesign file ps pgrep open env mkdir find sleep date sed stat awk; do
 	if ! command -v "$command_name" >/dev/null 2>&1; then
 		print -u2 "Required command not found: $command_name"
 		exit 2
@@ -89,17 +90,116 @@ if [[ "$canonical_output_after_mkdir" != "$canonical_output_root" ||
 	exit 2
 fi
 canonical_output_root="$canonical_output_after_mkdir"
+chmod 700 "$canonical_output_root"
 
 app_output_root="$canonical_output_root/app-output"
 storage_root="$canonical_output_root/storage"
 isolated_home="$canonical_output_root/home"
 isolated_tmp="$canonical_output_root/tmp"
 launch_log_path="$canonical_output_root/launch-services.log"
+fixture_log_path="$canonical_output_root/fixture.log"
 if [[ -e "$app_output_root" || -L "$app_output_root" ]]; then
 	print -u2 "Refusing an existing app output path: $app_output_root"
 	exit 2
 fi
 mkdir -m 700 -- "$storage_root" "$isolated_home" "$isolated_tmp"
+
+print "Building isolated fixture writer..."
+swift build \
+	--package-path "$project_root" \
+	--configuration release \
+	--product memory-monitor-fixture
+fixture_bin_dir="$(swift build \
+	--package-path "$project_root" \
+	--configuration release \
+	--show-bin-path)"
+fixture_binary="$fixture_bin_dir/memory-monitor-fixture"
+if [[ ! -x "$fixture_binary" ]]; then
+	print -u2 "Built fixture writer not found: $fixture_binary"
+	exit 1
+fi
+fixture_description="$(file -b "$fixture_binary")"
+if [[ "$fixture_description" != *arm64* ]]; then
+	print -u2 "Built fixture writer is not arm64: $fixture_description"
+	exit 1
+fi
+
+print "Generating isolated history and audit fixture..."
+if ! "$fixture_binary" --storage-root "$storage_root" >"$fixture_log_path" 2>&1; then
+	print -u2 "Fixture writer failed"
+	if [[ -s "$fixture_log_path" ]]; then
+		print -u2 -- "$(sed -n '1,40p' "$fixture_log_path")"
+	fi
+	exit 1
+fi
+
+fixture_history_records="$(sed -n 's/^FIXTURE_HISTORY_RECORDS=//p' "$fixture_log_path")"
+fixture_audit_events="$(sed -n 's/^FIXTURE_AUDIT_EVENTS=//p' "$fixture_log_path")"
+fixture_journal_records="$(sed -n 's/^FIXTURE_HISTORY_JOURNAL_RECORDS=//p' "$fixture_log_path")"
+if [[ "$fixture_history_records" != <-> ||
+	"$fixture_audit_events" != <-> ||
+	"$fixture_journal_records" != <-> ||
+	"$fixture_history_records" -lt 2 ||
+	"$fixture_audit_events" -lt 2 ||
+	"$fixture_journal_records" -ne $(( fixture_history_records - 1 )) ]]; then
+	print -u2 "Fixture writer reported invalid record counts"
+	print -u2 -- "$(sed -n '1,40p' "$fixture_log_path")"
+	exit 1
+fi
+
+history_file="$storage_root/history.json"
+history_journal="$storage_root/history.json.journal"
+history_clock="$storage_root/history.json.clock"
+history_lock="$storage_root/history.json.lock"
+audit_file="$storage_root/actions.jsonl"
+audit_clock="$storage_root/actions.jsonl.clock"
+audit_lock="$storage_root/actions.jsonl.lock"
+fixture_paths=(
+	"$history_file"
+	"$history_journal"
+	"$history_clock"
+	"$history_lock"
+	"$audit_file"
+	"$audit_clock"
+	"$audit_lock"
+)
+for fixture_path in "${fixture_paths[@]}"; do
+	if [[ ! -f "$fixture_path" || -L "$fixture_path" ]]; then
+		print -u2 "Fixture output is missing or not a regular file: $fixture_path"
+		exit 1
+	fi
+	fixture_permissions="$(stat -f '%Lp' "$fixture_path" 2>/dev/null || true)"
+	if [[ "$fixture_permissions" != "600" ]]; then
+		print -u2 "Fixture output has unexpected permissions ($fixture_permissions): $fixture_path"
+		exit 1
+	fi
+done
+storage_permissions="$(stat -f '%Lp' "$storage_root" 2>/dev/null || true)"
+if [[ "$storage_permissions" != "700" ]]; then
+	print -u2 "Fixture storage root has unexpected permissions: $storage_permissions"
+	exit 1
+fi
+storage_entry_count="$(find "$storage_root" -mindepth 1 -maxdepth 1 -print | awk 'END { print NR }')"
+if [[ "$storage_entry_count" != "7" ]]; then
+	print -u2 "Fixture storage root contains an unexpected number of files: $storage_entry_count"
+	exit 1
+fi
+history_line_count="$(awk 'END { print NR }' "$history_journal")"
+audit_line_count="$(awk 'END { print NR }' "$audit_file")"
+if [[ "$history_line_count" != "$fixture_journal_records" ||
+	"$audit_line_count" != "$fixture_audit_events" ]]; then
+	print -u2 "Fixture file line counts do not match writer output"
+	exit 1
+fi
+if [[ ! -s "$history_file" || ! -s "$history_journal" ||
+	! -s "$history_clock" || ! -s "$audit_file" || ! -s "$audit_clock" ]]; then
+	print -u2 "Fixture data or clock file is empty"
+	exit 1
+fi
+# The fixture writer has already decoded the JSON snapshot, journal, JSONL
+# events, and both clock sidecars through the production store actors. Keep
+# this shell layer format-agnostic: `plutil -lint` only accepts plist syntax
+# on the supported macOS versions and would reject these valid JSON files.
 
 bundle_id="com.rongyi.MemoryMonitorUICheck.$(date -u +%Y%m%d%H%M%S).$$"
 build_script="$project_root/scripts/build-app.sh"
@@ -145,11 +245,13 @@ if [[ "$binary_description" != *arm64* ]]; then
 fi
 
 print "Launching isolated UI-check process through Launch Services..."
-if ! env \
+if ! env -i \
+	PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
 	HOME="$isolated_home" \
 	CFFIXED_USER_HOME="$isolated_home" \
 	TMPDIR="$isolated_tmp" \
 	MEMORY_MONITOR_UI_CHECK_STORAGE_ROOT="$storage_root" \
+	MEMORY_MONITOR_UI_CHECK_FIXTURE=1 \
 	open -n -g "$app_path" > /dev/null 2>"$launch_log_path"; then
 	print -u2 "Launch Services could not open the UI-check bundle"
 	if [[ -s "$launch_log_path" ]]; then
@@ -183,13 +285,39 @@ if (( ! started )); then
 	exit 1
 fi
 
+# Launch Services is an external boundary: fail closed if it drops any of the
+# paths or the explicit fixture switch. Keep the complete `ps` payload in
+# memory only and never echo it, since unrelated inherited values are private.
+launch_process_environment="$(ps eww "$pid" 2>/dev/null || true)"
+if [[ "$launch_process_environment" != *"HOME=$isolated_home"* ||
+	"$launch_process_environment" != *"CFFIXED_USER_HOME=$isolated_home"* ||
+	"$launch_process_environment" != *"TMPDIR=$isolated_tmp"* ||
+	"$launch_process_environment" != *"MEMORY_MONITOR_UI_CHECK_STORAGE_ROOT=$storage_root"* ||
+	"$launch_process_environment" != *"MEMORY_MONITOR_UI_CHECK_FIXTURE=1"* ]]; then
+	unset launch_process_environment
+	print -u2 "UI-check process did not inherit the required isolated environment"
+	exit 1
+fi
+unset launch_process_environment
+
+launch_log_permissions="$(stat -f '%Lp' "$launch_log_path" 2>/dev/null || true)"
+if [[ "$launch_log_permissions" != "600" ]]; then
+	print -u2 "Launch Services log has unexpected permissions: $launch_log_permissions"
+	exit 1
+fi
+
 print "UI_CHECK_PID=$pid"
 print "UI_CHECK_BUNDLE_ID=$bundle_id"
 print "UI_CHECK_APP_PATH=$app_path"
 print "UI_CHECK_STORAGE_ROOT=$storage_root"
 print "UI_CHECK_HOME=$isolated_home"
 print "UI_CHECK_LAUNCH_LOG=$launch_log_path"
+print "UI_CHECK_FIXTURE_LOG=$fixture_log_path"
+print "UI_CHECK_FIXTURE_HISTORY_RECORDS=$fixture_history_records"
+print "UI_CHECK_FIXTURE_AUDIT_EVENTS=$fixture_audit_events"
+print "UI_CHECK_FIXTURE_JOURNAL_RECORDS=$fixture_journal_records"
 print "UI_CHECK_LAUNCH_MODE=launch-services"
 print "UI_CHECK_ARCHITECTURE=arm64"
 print "UI_CHECK_SIGNATURE=ad-hoc"
+print "UI_CHECK_ENVIRONMENT=minimal"
 print "No UI actions or process signals were issued by this launcher."
