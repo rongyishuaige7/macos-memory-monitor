@@ -54,8 +54,8 @@ struct MemoryMonitorFixtureTool {
                 )
             }
 
-            // Read the journal through a new actor before flushing. This is
-            // the same recovery path used by a newly launched app process.
+            // Read the journal through a new actor without compacting it. This
+            // is the same recovery path used by a newly launched app process.
             let replayStore = HistoryStore(
                 fileURL: historyURL,
                 compactionRecordThreshold: 1_000,
@@ -66,17 +66,15 @@ struct MemoryMonitorFixtureTool {
                 replayedHistory,
                 expected: dataset.historyRecords
             )
-            try await historyStore.flush(now: dataset.referenceDate)
-
             let auditStore = ProcessActionAuditStore(fileURL: auditURL)
             for event in dataset.auditEvents {
                 _ = try await auditStore.append(event, now: dataset.referenceDate)
             }
-            try await auditStore.flush(now: dataset.referenceDate)
 
-            // Verify the post-flush canonical files with fresh actors as well;
-            // this catches date encoding, journal compaction and JSONL repair
-            // regressions that an in-memory assertion would miss.
+            // Verify the files with fresh actors as well; this catches date
+            // encoding, journal replay and JSONL repair regressions that an
+            // in-memory assertion would miss. The history journal is kept
+            // intentionally so the launched app exercises its recovery path.
             let finalHistoryStore = HistoryStore(
                 fileURL: historyURL,
                 compactionRecordThreshold: 1_000,
@@ -232,9 +230,10 @@ struct MemoryMonitorFixtureTool {
                 throw FixtureToolError.missingOutput(path)
             }
         }
-        guard historyDiagnostics.journalRecordCount == 0 else {
+        guard historyDiagnostics.journalRecordCount == expectedHistoryCount - 1,
+              historyDiagnostics.journalBytes > 0 else {
             throw FixtureToolError.verificationFailed(
-                "flush 后 history journal 计数应为 0"
+                "启动前 history journal 未保留完整的增量记录"
             )
         }
         let auditData = try Data(contentsOf: auditURL)

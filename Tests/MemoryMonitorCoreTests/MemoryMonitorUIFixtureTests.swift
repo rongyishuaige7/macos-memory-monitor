@@ -85,6 +85,84 @@ final class MemoryMonitorUIFixtureTests: XCTestCase {
         )
         XCTAssertTrue(dataset.auditEvents.allSatisfy { $0.hasValidFixtureFields })
     }
+
+    func testFixtureRoundTripsThroughHistoryAndAuditStores() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MemoryMonitorFixtureTests-" + UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let referenceDate = Date(timeIntervalSince1970: 1_750_000_000)
+        let dataset = MemoryMonitorUIFixture.makeDataset(now: referenceDate)
+        let historyURL = MemoryMonitorStoragePaths.historyFileURL(root: root)
+        let auditURL = MemoryMonitorStoragePaths.auditFileURL(root: root)
+
+        let historyStore = HistoryStore(
+            fileURL: historyURL,
+            compactionRecordThreshold: 1_000,
+            compactionByteThreshold: 64 * 1024 * 1024
+        )
+        for record in dataset.historyRecords {
+            _ = try await historyStore.append(record, now: referenceDate)
+        }
+        let preFlushDiagnostics = await historyStore.diagnostics()
+        XCTAssertEqual(
+            preFlushDiagnostics.journalRecordCount,
+            dataset.historyRecords.count - 1
+        )
+
+        let replayStore = HistoryStore(
+            fileURL: historyURL,
+            compactionRecordThreshold: 1_000,
+            compactionByteThreshold: 64 * 1024 * 1024
+        )
+        let replayedHistory = try await replayStore.load(now: referenceDate)
+        XCTAssertEqual(replayedHistory, dataset.historyRecords)
+
+        try await historyStore.flush(now: referenceDate)
+        let finalHistoryStore = HistoryStore(
+            fileURL: historyURL,
+            compactionRecordThreshold: 1_000,
+            compactionByteThreshold: 64 * 1024 * 1024
+        )
+        let finalHistory = try await finalHistoryStore.load(now: referenceDate)
+        XCTAssertEqual(finalHistory, dataset.historyRecords)
+
+        let auditStore = ProcessActionAuditStore(fileURL: auditURL)
+        for event in dataset.auditEvents {
+            _ = try await auditStore.append(event, now: referenceDate)
+        }
+        try await auditStore.flush(now: referenceDate)
+        let finalAuditStore = ProcessActionAuditStore(fileURL: auditURL)
+        let reloadedAudit = try await finalAuditStore.load(now: referenceDate)
+        XCTAssertEqual(
+            Set(reloadedAudit.map(\.id)),
+            Set(dataset.auditEvents.map(\.id))
+        )
+
+        let expectedFiles = [
+            historyURL,
+            URL(fileURLWithPath: historyURL.path + ".journal"),
+            URL(fileURLWithPath: historyURL.path + ".clock"),
+            URL(fileURLWithPath: historyURL.path + ".lock"),
+            auditURL,
+            URL(fileURLWithPath: auditURL.path + ".clock"),
+            URL(fileURLWithPath: auditURL.path + ".lock")
+        ]
+        for file in expectedFiles {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: file.path), file.path)
+            let attributes = try FileManager.default.attributesOfItem(atPath: file.path)
+            XCTAssertEqual(
+                (attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0 & 0o777,
+                0o600,
+                file.path
+            )
+        }
+    }
 }
 
 private extension ProcessActionAuditEvent {
