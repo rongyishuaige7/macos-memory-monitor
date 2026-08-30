@@ -5065,6 +5065,83 @@ private struct HistoryDurableGeneration: Equatable {
     let clock: PersistedFileGeneration?
 }
 
+/// Resolves the small set of files written by the monitor.
+///
+/// Production callers continue to use the normal Application Support
+/// directory unless the explicitly named UI-check environment variable is
+/// present. The override is deliberately a path string rather than a URL so
+/// the validation rules stay deterministic and easy to exercise without
+/// mutating the process environment in tests.
+public enum MemoryMonitorStoragePaths {
+    public static let overrideEnvironmentKey = "MEMORY_MONITOR_UI_CHECK_STORAGE_ROOT"
+
+    private static let directoryName = "MemoryMonitor"
+    private static let historyFileName = "history.json"
+    private static let auditFileName = "actions.jsonl"
+
+    /// The unmodified application-support location used by normal launches.
+    public static var defaultRootURL: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory())
+                .appendingPathComponent("Library", isDirectory: true)
+                .appendingPathComponent("Application Support", isDirectory: true)
+        return base
+            .appendingPathComponent(directoryName, isDirectory: true)
+            .standardizedFileURL
+    }
+
+    /// Resolves an optional path override without touching global process
+    /// state. Empty, relative, root-only, and otherwise malformed values are
+    /// ignored so an accidental setting cannot redirect the store silently.
+    public static func rootURL(
+        overridePath: String?,
+        fallbackRootURL: URL = Self.defaultRootURL
+    ) -> URL {
+        guard let overridePath else { return fallbackRootURL }
+        let trimmed = overridePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed.hasPrefix("/"),
+              !trimmed.unicodeScalars.contains(where: { $0.value == 0 }) else {
+            return fallbackRootURL
+        }
+
+        let candidate = URL(fileURLWithPath: trimmed, isDirectory: true).standardizedFileURL
+        guard candidate.isFileURL,
+              candidate.path.hasPrefix("/"),
+              !candidate.path.isEmpty,
+              candidate.path != "/" else {
+            return fallbackRootURL
+        }
+        return candidate
+    }
+
+    /// Resolves the explicit UI-check override from an injected environment.
+    /// Supplying an environment dictionary keeps unit tests deterministic.
+    public static func rootURL(
+        environment: [String: String],
+        fallbackRootURL: URL = Self.defaultRootURL
+    ) -> URL {
+        rootURL(
+            overridePath: environment[overrideEnvironmentKey],
+            fallbackRootURL: fallbackRootURL
+        )
+    }
+
+    public static func historyFileURL(root: URL) -> URL {
+        root.appendingPathComponent(historyFileName, isDirectory: false)
+    }
+
+    public static func auditFileURL(root: URL) -> URL {
+        root.appendingPathComponent(auditFileName, isDirectory: false)
+    }
+
+    /// Root selected for the current process. This is the only entry point
+    /// that reads ProcessInfo; tests should use one of the pure overloads.
+    public static var currentRootURL: URL {
+        rootURL(environment: ProcessInfo.processInfo.environment)
+    }
+}
+
 /// A small, minute-coalesced JSON history store.
 ///
 /// Appending samples updates memory on every pass, but disk writes happen at
@@ -5094,13 +5171,9 @@ public actor HistoryStore {
     public static let defaultLockTimeoutSeconds: TimeInterval = 2
 
     public static var defaultFileURL: URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSHomeDirectory())
-                .appendingPathComponent("Library", isDirectory: true)
-                .appendingPathComponent("Application Support", isDirectory: true)
-        return base
-            .appendingPathComponent("MemoryMonitor", isDirectory: true)
-            .appendingPathComponent("history.json", isDirectory: false)
+        MemoryMonitorStoragePaths.historyFileURL(
+            root: MemoryMonitorStoragePaths.currentRootURL
+        )
     }
 
     public nonisolated let fileURL: URL
@@ -6596,9 +6669,9 @@ public actor ProcessActionAuditStore {
     public static let defaultLockTimeoutSeconds: TimeInterval = 2
 
     public static var defaultFileURL: URL {
-        HistoryStore.defaultFileURL
-            .deletingLastPathComponent()
-            .appendingPathComponent("actions.jsonl", isDirectory: false)
+        MemoryMonitorStoragePaths.auditFileURL(
+            root: MemoryMonitorStoragePaths.currentRootURL
+        )
     }
 
     public nonisolated let fileURL: URL
