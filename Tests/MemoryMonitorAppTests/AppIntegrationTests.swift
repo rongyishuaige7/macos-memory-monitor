@@ -298,6 +298,151 @@ final class AppIntegrationTests: XCTestCase {
         XCTAssertEqual(system?.level, .attention)
     }
 
+    func testApplicationSamplingSourceFactoryRequiresExplicitFixtureFlag() {
+        let production = MemoryMonitorApplicationDelegate.makeSamplingSource(
+            environment: [:]
+        )
+        XCTAssertTrue(production is MonitorSampler)
+
+        let fixture = MemoryMonitorApplicationDelegate.makeSamplingSource(
+            environment: [MemoryMonitorUIFixture.environmentKey: "1"]
+        )
+        XCTAssertTrue(fixture is MemoryMonitorUIFixtureSamplingSource)
+
+        for value in ["", "0", "true", " 1 "] {
+            let source = MemoryMonitorApplicationDelegate.makeSamplingSource(
+                environment: [MemoryMonitorUIFixture.environmentKey: value]
+            )
+            XCTAssertTrue(source is MonitorSampler, "unexpected source for \(value)")
+        }
+    }
+
+    func testUIFixtureSamplingSourceProvidesCompleteMultipleMemberSnapshot() async {
+        let referenceDate = Date(timeIntervalSince1970: 1_750_000_000)
+        let dataset = MemoryMonitorUIFixture.makeDataset(now: referenceDate)
+        let source = MemoryMonitorUIFixtureSamplingSource(dataset: dataset)
+
+        let sampled = await source.sample(
+            mode: .panel,
+            at: referenceDate.addingTimeInterval(17)
+        )
+
+        XCTAssertEqual(sampled.processes.count, 7)
+        XCTAssertEqual(sampled.groups.count, 2)
+        XCTAssertTrue(sampled.groups.allSatisfy { $0.processCount > 1 })
+        XCTAssertTrue(sampled.groups.allSatisfy { group in
+            Set(group.memberProcessIdentities).isSubset(
+                of: Set(sampled.processes.map(\.identity))
+            )
+        })
+        XCTAssertTrue(sampled.processDataIsUsable)
+        XCTAssertEqual(sampled.diagnostics.mode, .full)
+        XCTAssertEqual(sampled.diagnostics.processCount, sampled.processes.count)
+        XCTAssertEqual(sampled.diagnostics.listedProcessCount, sampled.processes.count)
+        XCTAssertTrue(sampled.processes.allSatisfy { $0.executablePath == nil })
+    }
+
+    func testUIFixtureSamplingSourceRetimestampsWhileKeepingIdentitiesStable() async {
+        let referenceDate = Date(timeIntervalSince1970: 1_750_000_000)
+        let dataset = MemoryMonitorUIFixture.makeDataset(now: referenceDate)
+        let source = MemoryMonitorUIFixtureSamplingSource(dataset: dataset)
+        let firstDate = referenceDate.addingTimeInterval(31)
+        let secondDate = referenceDate.addingTimeInterval(62)
+
+        let first = await source.sample(mode: .panel, at: firstDate)
+        let second = await source.sample(mode: .background, at: secondDate)
+
+        XCTAssertEqual(first.timestamp, firstDate)
+        XCTAssertEqual(first.system?.timestamp, firstDate)
+        XCTAssertEqual(first.systemStatus.sampledAt, firstDate)
+        XCTAssertEqual(first.processStatus.sampledAt, firstDate)
+        XCTAssertEqual(second.timestamp, secondDate)
+        XCTAssertEqual(second.system?.timestamp, secondDate)
+        XCTAssertEqual(second.systemStatus.sampledAt, secondDate)
+        XCTAssertEqual(second.processStatus.sampledAt, secondDate)
+        XCTAssertEqual(
+            first.processes.map(\.identity),
+            second.processes.map(\.identity)
+        )
+        XCTAssertEqual(first.groups, second.groups)
+        // Sampling is read-only: the dataset's canonical snapshot remains at
+        // its reference instant and keeps the intentionally un-actionable
+        // fixture targets.
+        XCTAssertEqual(dataset.snapshot.timestamp, dataset.referenceDate)
+        XCTAssertTrue(dataset.snapshot.processes.allSatisfy { $0.executablePath == nil })
+    }
+
+    func testUIFixtureTargetsAreRejectedByProcessActionPolicy() {
+        let dataset = MemoryMonitorUIFixture.makeDataset(
+            now: Date(timeIntervalSince1970: 1_750_000_000)
+        )
+        let policy = ProcessActionPolicy(currentUserID: 501, monitorPID: 999)
+
+        for process in dataset.snapshot.processes {
+            let validation = policy.validate(expected: process, current: process)
+            XCTAssertFalse(validation.allowed, process.name)
+            XCTAssertEqual(validation.reason, .executablePathUnavailable, process.name)
+        }
+    }
+
+    func testShutdownPreventsFixtureResamplingAndRetainsPublishedData() async throws {
+        let referenceDate = Date(timeIntervalSince1970: 1_750_000_000)
+        let laterDate = referenceDate.addingTimeInterval(90)
+        let dataset = MemoryMonitorUIFixture.makeDataset(now: referenceDate)
+        let source = CountingMonitorSamplingSource(
+            wrapped: MemoryMonitorUIFixtureSamplingSource(dataset: dataset)
+        )
+        let historyPaths = makeTemporaryHistoryURL()
+        let auditPaths = makeTemporaryActionURL()
+        defer {
+            try? FileManager.default.removeItem(at: historyPaths.directory)
+            try? FileManager.default.removeItem(at: auditPaths.directory)
+        }
+        let model = MonitorViewModel(
+            sampler: source,
+            historyStore: HistoryStore(fileURL: historyPaths.url),
+            processActions: ProcessActionController(
+                auditStore: ProcessActionAuditStore(fileURL: auditPaths.url)
+            ),
+            dateProvider: { laterDate },
+            startRefreshTask: false
+        )
+        model.setPanelPresented(true)
+
+        await model.refreshOnce(at: referenceDate)
+        let publishedProcesses = model.processes
+        let publishedGroups = model.groups
+        let publishedSystem = model.system
+        let publishedUpdatedAt = model.updatedAt
+        let publishedProcessStatus = model.processStatus
+
+        await model.shutdown()
+        await model.refreshOnce(at: laterDate)
+
+        XCTAssertEqual(source.callCount, 1)
+        XCTAssertEqual(model.processes, publishedProcesses)
+        XCTAssertEqual(model.groups, publishedGroups)
+        XCTAssertEqual(model.system, publishedSystem)
+        XCTAssertEqual(model.updatedAt, publishedUpdatedAt)
+        XCTAssertEqual(model.processStatus, publishedProcessStatus)
+    }
+
+    func testAuditAccessibilitySummaryLabelsEveryField() {
+        let timestamp = Date(timeIntervalSince1970: 1_756_000_000)
+        let summary = DetailAccessibilityText.auditSummary(
+            action: "请求优雅退出",
+            process: "worker-process",
+            status: "已确认",
+            timestamp: timestamp
+        )
+
+        XCTAssertTrue(summary.hasPrefix("操作：请求优雅退出"))
+        XCTAssertTrue(summary.contains("进程：worker-process"))
+        XCTAssertTrue(summary.contains("状态：已确认"))
+        XCTAssertTrue(summary.contains("时间："))
+        XCTAssertFalse(summary.contains("worker-process，已确认，"))
+    }
+
     func testMonitorViewModelRetainsLastUsableProcessSnapshot() async throws {
         let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
         let firstProcess = makeProcess(pid: 9001, name: "first")
@@ -2393,6 +2538,21 @@ private final class FakeMonitorSamplingSource: MonitorSamplingSource {
             return snapshots.removeFirst()
         }
         return snapshots[0]
+    }
+}
+
+@MainActor
+private final class CountingMonitorSamplingSource: MonitorSamplingSource {
+    private let wrapped: any MonitorSamplingSource
+    private(set) var callCount = 0
+
+    init(wrapped: any MonitorSamplingSource) {
+        self.wrapped = wrapped
+    }
+
+    func sample(mode: SamplingMode, at timestamp: Date) async -> MonitorSnapshot {
+        callCount += 1
+        return await wrapped.sample(mode: mode, at: timestamp)
     }
 }
 

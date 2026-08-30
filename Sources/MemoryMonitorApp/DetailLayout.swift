@@ -1118,6 +1118,21 @@ struct AdaptiveDetailMemberRow: View {
     }
 }
 
+/// Builds a stable, field-labelled summary for assistive technologies.
+/// Explicit labels keep the meaning of each value clear when the visual row
+/// is condensed or its child text is truncated at narrow widths.
+enum DetailAccessibilityText {
+    static func auditSummary(
+        action: String,
+        process: String,
+        status: String,
+        timestamp: Date
+    ) -> String {
+        let formattedTime = timestamp.formatted(date: .omitted, time: .shortened)
+        return "操作：\(action)，进程：\(process)，状态：\(status)，时间：\(formattedTime)"
+    }
+}
+
 struct AdaptiveDetailAuditRow: View {
     let action: String
     let process: String
@@ -1175,12 +1190,12 @@ struct AdaptiveDetailAuditRow: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(accessibilitySummary)
-    }
-
-    private var accessibilitySummary: String {
-        let formattedTime = timestamp.formatted(date: .omitted, time: .shortened)
-        return "\(action)，\(process)，\(status)，\(formattedTime)"
+        .accessibilityLabel(DetailAccessibilityText.auditSummary(
+            action: action,
+            process: process,
+            status: status,
+            timestamp: timestamp
+        ))
     }
 }
 
