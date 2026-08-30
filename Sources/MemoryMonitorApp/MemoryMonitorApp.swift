@@ -2296,7 +2296,7 @@ private struct ProcessDetailView: View {
     }
 
     private func processContent(_ process: ProcessSnapshot) -> some View {
-        ScrollView {
+        AdaptiveDetailScrollView(minimumContentWidth: 460) {
             VStack(alignment: .leading, spacing: 16) {
                 processHeader(process)
                 MonitorDetailDataStatusView(status: dataStatus)
@@ -2306,7 +2306,6 @@ private struct ProcessDetailView: View {
                 parentSection(process)
                 processActionSection(process)
             }
-            .padding(20)
         }
         .confirmationDialog(
             "确认请求优雅退出？",
@@ -2360,10 +2359,7 @@ private struct ProcessDetailView: View {
     }
 
     private func processMetrics(_ process: ProcessSnapshot) -> some View {
-        LazyVGrid(
-            columns: [GridItem(.flexible()), GridItem(.flexible())],
-            spacing: 10
-        ) {
+        AdaptiveDetailMetricGrid {
             DetailMetricTile(
                 title: "footprint",
                 value: MemoryFormatter.bytes(process.physicalFootprintBytes),
@@ -2432,19 +2428,11 @@ private struct ProcessDetailView: View {
                     .fixedSize(horizontal: false, vertical: true)
             } else {
                 ForEach(Array(chain.enumerated()), id: \.offset) { index, parent in
-                    HStack(spacing: 8) {
-                        Text(index == 0 ? "父进程" : "上级 \(index + 1)")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .frame(width: 52, alignment: .leading)
-                        Text(processDisplayName(parent))
-                            .font(.caption)
-                            .lineLimit(1)
-                        Spacer(minLength: 4)
-                        Text("PID \(parent.identity.pid)")
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
+                    AdaptiveDetailRelationRow(
+                        label: index == 0 ? "父进程" : "上级 \(index + 1)",
+                        name: processDisplayName(parent),
+                        trailing: "PID \(parent.identity.pid)"
+                    )
                 }
             }
         }
@@ -2464,7 +2452,7 @@ private struct ProcessDetailView: View {
                     ProcessActionStatusRow(status: status)
                 }
 
-                HStack(spacing: 8) {
+                AdaptiveDetailActionGroup {
                     Button {
                         showGracefulConfirmation = true
                     } label: {
@@ -2528,20 +2516,13 @@ private struct ProcessDetailView: View {
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(Array(actions.recentEvents.prefix(5))) { event in
-                    HStack(spacing: 6) {
-                        Text(event.action.displayName)
-                            .font(.caption2.weight(.medium))
-                        Text(event.processLabel)
-                            .font(.caption2)
-                            .lineLimit(1)
-                        Spacer(minLength: 4)
-                        Text(event.statusDisplayName)
-                            .font(.caption2)
-                            .foregroundStyle(actionAuditColor(event))
-                        Text(event.timestamp, style: .time)
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
+                    AdaptiveDetailAuditRow(
+                        action: event.action.displayName,
+                        process: event.processLabel,
+                        status: event.statusDisplayName,
+                        timestamp: event.timestamp,
+                        statusColor: actionAuditColor(event)
+                    )
                 }
             }
         }
@@ -2649,7 +2630,7 @@ private struct WorkloadGroupDetailView: View {
     }
 
     var body: some View {
-        ScrollView {
+        AdaptiveDetailScrollView(minimumContentWidth: 500) {
             VStack(alignment: .leading, spacing: 16) {
                 groupHeader
                 MonitorDetailDataStatusView(status: dataStatus)
@@ -2664,7 +2645,6 @@ private struct WorkloadGroupDetailView: View {
                 eventSection
                 readOnlyNotice
             }
-            .padding(20)
         }
         .frame(minWidth: 540, idealWidth: 600, minHeight: 600, idealHeight: 720)
         .toolbar {
@@ -2700,10 +2680,7 @@ private struct WorkloadGroupDetailView: View {
     }
 
     private func groupMetrics(_ group: WorkloadGroupSnapshot) -> some View {
-        LazyVGrid(
-            columns: [GridItem(.flexible()), GridItem(.flexible())],
-            spacing: 10
-        ) {
+        AdaptiveDetailMetricGrid {
             DetailMetricTile(
                 title: "footprint 归因总量",
                 value: MemoryFormatter.bytes(group.attributedFootprintBytes),
@@ -2757,19 +2734,11 @@ private struct WorkloadGroupDetailView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                 ForEach(members) { process in
-                    HStack(spacing: 8) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(processDisplayName(process))
-                                .font(.caption.weight(.medium))
-                                .lineLimit(1)
-                            Text("PID \(process.identity.pid) · RSS \(MemoryFormatter.bytes(process.residentBytes))")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer(minLength: 6)
-                        Text(MemoryFormatter.bytes(process.physicalFootprintBytes))
-                            .font(.caption.monospacedDigit())
-                    }
+                    AdaptiveDetailMemberRow(
+                        name: processDisplayName(process),
+                        subtitle: "PID \(process.identity.pid) · RSS \(MemoryFormatter.bytes(process.residentBytes))",
+                        footprint: MemoryFormatter.bytes(process.physicalFootprintBytes)
+                    )
                     if process.id != members.last?.id {
                         Divider()
                     }
@@ -2922,17 +2891,7 @@ private struct DetailInfoRow: View {
     let value: String
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Text(label)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .frame(width: 78, alignment: .leading)
-            Text(value)
-                .font(.caption)
-                .lineLimit(2)
-                .truncationMode(.middle)
-            Spacer(minLength: 0)
-        }
+        AdaptiveDetailInfoRow(label: label, value: value)
     }
 }
 
@@ -2946,15 +2905,17 @@ private struct DetailMetricTile: View {
             Text(title)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
-                .lineLimit(1)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
             Text(value)
                 .font(.system(size: 14, weight: .semibold, design: .monospaced))
                 .lineLimit(1)
-                .minimumScaleFactor(0.7)
+                .minimumScaleFactor(0.65)
             Text(detail)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
-                .lineLimit(1)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, minHeight: 54, alignment: .leading)
         .padding(9)

@@ -2044,6 +2044,82 @@ final class AppIntegrationTests: XCTestCase {
         XCTAssertEqual(invalid.sampledAt, previousSampleAt)
     }
 
+    func testDetailLayoutPolicySwitchesInfoRowsAtTheValueWidthBoundary() {
+        let requiredWidth = DetailLayoutPolicy.defaultInfoLabelWidth
+            + DetailLayoutPolicy.infoRowSpacing
+            + DetailLayoutPolicy.minimumInfoValueWidth
+
+        XCTAssertEqual(
+            DetailLayoutPolicy.infoRowMode(availableWidth: requiredWidth),
+            .inline
+        )
+        XCTAssertEqual(
+            DetailLayoutPolicy.infoRowMode(availableWidth: requiredWidth - 1),
+            .stacked
+        )
+        XCTAssertEqual(
+            DetailLayoutPolicy.infoRowMode(availableWidth: .infinity),
+            .inline
+        )
+        XCTAssertEqual(
+            DetailLayoutPolicy.infoRowMode(availableWidth: .nan),
+            .stacked
+        )
+        XCTAssertEqual(
+            DetailLayoutPolicy.infoRowMode(
+                availableWidth: requiredWidth,
+                labelWidth: 120
+            ),
+            .stacked
+        )
+    }
+
+    func testDetailLayoutPolicyKeepsTrailingMetadataAndActionsReachable() {
+        let relationRequiredWidth = 52.0 + 74.0 + 140.0 + (8.0 * 2)
+        XCTAssertEqual(
+            DetailLayoutPolicy.relationRowMode(availableWidth: relationRequiredWidth),
+            .inline
+        )
+        XCTAssertEqual(
+            DetailLayoutPolicy.relationRowMode(availableWidth: relationRequiredWidth - 1),
+            .stacked
+        )
+
+        let actionRequiredWidth = 3.0 * DetailLayoutPolicy.minimumActionButtonWidth
+            + 2.0 * DetailLayoutPolicy.actionSpacing
+        XCTAssertEqual(
+            DetailLayoutPolicy.actionLayoutMode(
+                availableWidth: actionRequiredWidth,
+                buttonCount: 3
+            ),
+            .inline
+        )
+        XCTAssertEqual(
+            DetailLayoutPolicy.actionLayoutMode(
+                availableWidth: actionRequiredWidth - 1,
+                buttonCount: 3
+            ),
+            .stacked
+        )
+        XCTAssertEqual(
+            DetailLayoutPolicy.actionLayoutMode(availableWidth: 100, buttonCount: 0),
+            .inline
+        )
+        XCTAssertEqual(
+            DetailLayoutPolicy.actionLayoutMode(availableWidth: .nan, buttonCount: 1),
+            .stacked
+        )
+    }
+
+    func testDetailLayoutPolicyUsesOneMetricColumnWhenWidthIsTooSmall() {
+        XCTAssertEqual(DetailLayoutPolicy.metricColumnCount(availableWidth: 460), 2)
+        XCTAssertEqual(DetailLayoutPolicy.metricColumnCount(availableWidth: 600), 2)
+        XCTAssertEqual(DetailLayoutPolicy.metricColumnCount(availableWidth: 359), 1)
+        XCTAssertEqual(DetailLayoutPolicy.metricColumnCount(availableWidth: .infinity), 2)
+        XCTAssertEqual(DetailLayoutPolicy.metricColumnCount(availableWidth: .nan), 1)
+        XCTAssertEqual(DetailLayoutPolicy.metricColumnCount(availableWidth: 0), 1)
+    }
+
     private func makeHealthInput(
         systemStatus: SampleStatus = .estimated(
             at: Date(timeIntervalSince1970: 100),
