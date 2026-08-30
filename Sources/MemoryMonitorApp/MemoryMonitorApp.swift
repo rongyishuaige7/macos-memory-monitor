@@ -2895,7 +2895,7 @@ private struct DetailInfoRow: View {
     }
 }
 
-private struct DetailMetricTile: View {
+struct DetailMetricTile: View {
     let title: String
     let value: String
     let detail: String
@@ -2908,9 +2908,9 @@ private struct DetailMetricTile: View {
                 .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
             Text(value)
-                .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                .font(.body.weight(.semibold).monospaced())
                 .lineLimit(1)
-                .minimumScaleFactor(0.65)
+                .minimumScaleFactor(0.75)
             Text(detail)
                 .font(.caption2)
                 .foregroundStyle(.secondary)

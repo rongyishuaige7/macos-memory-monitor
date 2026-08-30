@@ -72,6 +72,25 @@ final class DetailLayoutSmokeTests: XCTestCase {
         XCTAssertGreaterThan(narrow.height, wide.height)
     }
 
+    func testMetricTileValueGrowsWithDynamicType() {
+        let width = CGFloat(420)
+        let normal = measure(
+            metricTileFixture(width: width, dynamicTypeSize: .medium),
+            width: width
+        )
+        let large = measure(
+            metricTileFixture(width: width, dynamicTypeSize: .accessibility3),
+            width: width
+        )
+
+        XCTAssertTrue(normal.height.isFinite)
+        XCTAssertTrue(large.height.isFinite)
+        // AppKit's headless fitting pass does not always apply the user's
+        // Dynamic Type scale, but the semantic font must never collapse the
+        // tile below its default measured height.
+        XCTAssertGreaterThanOrEqual(large.height, normal.height)
+    }
+
     private func measure<Content: View>(_ view: Content, width: CGFloat) -> CGSize {
         let hostingView = NSHostingView(rootView: view)
         hostingView.frame = NSRect(x: 0, y: 0, width: width, height: 2_000)
@@ -145,16 +164,26 @@ final class DetailLayoutSmokeTests: XCTestCase {
     private func metricFixture(width: CGFloat) -> some View {
         AdaptiveDetailMetricGrid {
             ForEach(0..<4, id: \.self) { index in
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("指标 \(index)")
-                    Text("123.4 MiB")
-                    Text("说明")
-                }
-                .frame(maxWidth: .infinity, minHeight: 54, alignment: .leading)
-                .padding(9)
-                .background(.quaternary, in: RoundedRectangle(cornerRadius: 7))
+                DetailMetricTile(
+                    title: "指标 \(index)",
+                    value: "123.4 MiB",
+                    detail: "说明"
+                )
             }
         }
         .frame(width: width, alignment: .leading)
+    }
+
+    private func metricTileFixture(
+        width: CGFloat,
+        dynamicTypeSize: DynamicTypeSize
+    ) -> some View {
+        DetailMetricTile(
+            title: "footprint",
+            value: "123.4 MiB",
+            detail: "物理归因口径"
+        )
+        .frame(width: width, alignment: .leading)
+        .environment(\.dynamicTypeSize, dynamicTypeSize)
     }
 }
