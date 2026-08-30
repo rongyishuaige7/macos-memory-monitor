@@ -262,11 +262,15 @@ fi
 
 # `open` returns before the application process is observable. Match the
 # exact executable path so a concurrently running formal instance can never
-# be reported as this UI-check process.
+# be reported as this UI-check process. macOS `pgrep -x` anchors the full
+# command line but still interprets its pattern as a regular expression, so
+# escape the path before using `-fx` (for example, `[` and `+` are valid path
+# characters but have special regex meaning).
+app_binary_pattern="$(printf '%s' "$app_binary" | sed 's/[][\\.^$*+?(){}|]/\\&/g')"
 pid=""
 started=0
 for _ in {1..50}; do
-	for candidate_pid in ${(f)"$(pgrep -f "$app_binary" 2>/dev/null || true)"}; do
+	for candidate_pid in ${(f)"$(pgrep -fx "$app_binary_pattern" 2>/dev/null || true)"}; do
 		[[ "$candidate_pid" == <-> ]] || continue
 		candidate_command="$(ps -p "$candidate_pid" -o command= 2>/dev/null | sed 's/^[[:space:]]*//')"
 		if [[ "$candidate_command" == "$app_binary" ]]; then
@@ -288,12 +292,14 @@ fi
 # Launch Services is an external boundary: fail closed if it drops any of the
 # paths or the explicit fixture switch. Keep the complete `ps` payload in
 # memory only and never echo it, since unrelated inherited values are private.
-launch_process_environment="$(ps eww "$pid" 2>/dev/null || true)"
-if [[ "$launch_process_environment" != *"HOME=$isolated_home"* ||
-	"$launch_process_environment" != *"CFFIXED_USER_HOME=$isolated_home"* ||
-	"$launch_process_environment" != *"TMPDIR=$isolated_tmp"* ||
-	"$launch_process_environment" != *"MEMORY_MONITOR_UI_CHECK_STORAGE_ROOT=$storage_root"* ||
-	"$launch_process_environment" != *"MEMORY_MONITOR_UI_CHECK_FIXTURE=1"* ]]; then
+# Add explicit separators so a command/path or similarly named variable cannot
+# satisfy a check as a substring (for example, `NOT_HOME=...`).
+launch_process_environment=" $(ps eww "$pid" 2>/dev/null || true) "
+if [[ "$launch_process_environment" != *" HOME=$isolated_home "* ||
+	"$launch_process_environment" != *" CFFIXED_USER_HOME=$isolated_home "* ||
+	"$launch_process_environment" != *" TMPDIR=$isolated_tmp "* ||
+	"$launch_process_environment" != *" MEMORY_MONITOR_UI_CHECK_STORAGE_ROOT=$storage_root "* ||
+	"$launch_process_environment" != *" MEMORY_MONITOR_UI_CHECK_FIXTURE=1 "* ]]; then
 	unset launch_process_environment
 	print -u2 "UI-check process did not inherit the required isolated environment"
 	exit 1
