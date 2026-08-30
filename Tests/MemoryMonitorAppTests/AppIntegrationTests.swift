@@ -2075,7 +2075,11 @@ final class AppIntegrationTests: XCTestCase {
     }
 
     func testDetailLayoutPolicyKeepsTrailingMetadataAndActionsReachable() {
-        let relationRequiredWidth = 52.0 + 74.0 + 140.0 + (8.0 * 2)
+        let relationRequiredWidth = DetailLayoutPolicy.relationRequiredWidth(
+            labelWidth: 52,
+            nameWidth: 140,
+            trailingWidth: 74
+        )
         XCTAssertEqual(
             DetailLayoutPolicy.relationRowMode(availableWidth: relationRequiredWidth),
             .inline

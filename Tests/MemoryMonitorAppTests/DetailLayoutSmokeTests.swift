@@ -52,6 +52,26 @@ final class DetailLayoutSmokeTests: XCTestCase {
         XCTAssertGreaterThan(oneColumn.height, twoColumn.height)
     }
 
+    func testRelationFixtureUsesVerticalFallbackForNarrowWidth() {
+        let wideWidth = CGFloat(300)
+        let narrowWidth = CGFloat(240)
+
+        let wide = measure(
+            relationFixture(width: wideWidth, dynamicTypeSize: .large),
+            width: wideWidth
+        )
+        let narrow = measure(
+            relationFixture(width: narrowWidth, dynamicTypeSize: .large),
+            width: narrowWidth
+        )
+
+        XCTAssertEqual(wide.width, wideWidth, accuracy: 0.5)
+        XCTAssertEqual(narrow.width, narrowWidth, accuracy: 0.5)
+        XCTAssertTrue(wide.height.isFinite)
+        XCTAssertTrue(narrow.height.isFinite)
+        XCTAssertGreaterThan(narrow.height, wide.height)
+    }
+
     private func measure<Content: View>(_ view: Content, width: CGFloat) -> CGSize {
         let hostingView = NSHostingView(rootView: view)
         hostingView.frame = NSRect(x: 0, y: 0, width: width, height: 2_000)
@@ -106,6 +126,20 @@ final class DetailLayoutSmokeTests: XCTestCase {
                 .buttonStyle(.bordered)
         }
         .frame(width: width, alignment: .leading)
+    }
+
+    private func relationFixture(
+        width: CGFloat,
+        dynamicTypeSize: DynamicTypeSize
+    ) -> some View {
+        AdaptiveDetailRelationRow(
+            label: "父进程",
+            name: "parent-process",
+            trailing: "PID 12345"
+        )
+        .padding(8)
+        .frame(width: width, alignment: .leading)
+        .environment(\.dynamicTypeSize, dynamicTypeSize)
     }
 
     private func metricFixture(width: CGFloat) -> some View {

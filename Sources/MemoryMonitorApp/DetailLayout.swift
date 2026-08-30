@@ -41,6 +41,49 @@ enum DetailRowLayoutMode: String, Equatable, Sendable {
     case stacked
 }
 
+/// Intrinsic widths used by a relation row's inline candidate.
+///
+/// Keeping the measured values in a small value type lets the policy and the
+/// custom SwiftUI layout agree on the same required-width calculation. The
+/// minimum name width mirrors the previous `frame(minWidth:)` guarantee while
+/// allowing the label and trailing metadata to follow their actual fonts.
+struct DetailRelationMetrics: Equatable, Sendable {
+    let labelWidth: Double
+    let nameWidth: Double
+    let trailingWidth: Double
+    let spacing: Double
+    let spacerMinimumLength: Double
+    let minimumNameWidth: Double
+
+    var requiredWidth: Double {
+        let label = nonNegativePreservingInfinity(labelWidth)
+        let name = max(
+            nonNegativePreservingInfinity(nameWidth),
+            nonNegativePreservingInfinity(minimumNameWidth)
+        )
+        let trailing = nonNegativePreservingInfinity(trailingWidth)
+        let gap = nonNegativePreservingInfinity(spacing)
+        let spacer = nonNegativePreservingInfinity(spacerMinimumLength)
+
+        var total = 0.0
+        for component in [label, name, trailing, spacer] {
+            if component == .infinity { return .infinity }
+            total += component
+            if !total.isFinite { return .infinity }
+        }
+        let gaps = gap * Double(DetailLayoutPolicy.relationGapCount)
+        guard gaps.isFinite else { return .infinity }
+        total += gaps
+        return total.isFinite ? total : .infinity
+    }
+
+    private func nonNegativePreservingInfinity(_ value: Double) -> Double {
+        if value == .infinity { return .infinity }
+        guard value.isFinite else { return 0 }
+        return max(value, 0)
+    }
+}
+
 /// Pure sizing decisions shared by the detail layouts and their tests.
 /// Keeping the thresholds here prevents each row from inventing a different
 /// definition of "too narrow".
@@ -51,6 +94,8 @@ enum DetailLayoutPolicy {
     static let infoRowSpacing: Double = 10
     static let minimumInfoValueWidth: Double = 150
     static let relationSpacing: Double = 8
+    static let relationSpacerMinimumLength: Double = 4
+    static let relationGapCount: Int = 3
     static let minimumRelationValueWidth: Double = 140
     static let actionSpacing: Double = 8
     static let minimumActionButtonWidth: Double = 112
@@ -89,12 +134,84 @@ enum DetailLayoutPolicy {
         minimumValueWidth: Double = minimumRelationValueWidth,
         spacing: Double = relationSpacing
     ) -> DetailRowLayoutMode {
+        relationRowMode(
+            availableWidth: availableWidth,
+            metrics: DetailRelationMetrics(
+                labelWidth: leadingWidth,
+                nameWidth: minimumValueWidth,
+                trailingWidth: trailingWidth,
+                spacing: spacing,
+                spacerMinimumLength: relationSpacerMinimumLength,
+                minimumNameWidth: 0
+            )
+        )
+    }
+
+    /// Returns the minimum width needed by a measured relation row.
+    ///
+    /// The inline row contains three HStack gaps: label/name, name/spacer,
+    /// and spacer/trailing. The spacer's minimum length is included as a
+    /// separate term so the policy matches the custom layout exactly.
+    static func relationRequiredWidth(
+        metrics: DetailRelationMetrics
+    ) -> Double {
+        metrics.requiredWidth
+    }
+
+    /// Convenience overload for callers that already have measured child
+    /// widths. The name width is floored at `minimumValueWidth` so a short
+    /// process name cannot collapse the value column.
+    static func relationRequiredWidth(
+        labelWidth: Double,
+        nameWidth: Double,
+        trailingWidth: Double,
+        minimumValueWidth: Double = minimumRelationValueWidth,
+        spacing: Double = relationSpacing,
+        spacerMinimumLength: Double = relationSpacerMinimumLength
+    ) -> Double {
+        relationRequiredWidth(
+            metrics: DetailRelationMetrics(
+                labelWidth: labelWidth,
+                nameWidth: nameWidth,
+                trailingWidth: trailingWidth,
+                spacing: spacing,
+                spacerMinimumLength: spacerMinimumLength,
+                minimumNameWidth: minimumValueWidth
+            )
+        )
+    }
+
+    /// Selects inline or stacked mode from measured relation-row widths.
+    static func relationRowMode(
+        availableWidth: Double,
+        metrics: DetailRelationMetrics
+    ) -> DetailRowLayoutMode {
         modeForRequiredWidth(
             availableWidth: availableWidth,
-            requiredWidth: max(leadingWidth, 0)
-                + max(trailingWidth, 0)
-                + max(minimumValueWidth, 0)
-                + max(spacing, 0) * 2
+            requiredWidth: relationRequiredWidth(metrics: metrics)
+        )
+    }
+
+    /// Measured-width overload kept explicit for tests and non-View callers.
+    static func relationRowMode(
+        availableWidth: Double,
+        labelWidth: Double,
+        nameWidth: Double,
+        trailingWidth: Double,
+        minimumValueWidth: Double = minimumRelationValueWidth,
+        spacing: Double = relationSpacing,
+        spacerMinimumLength: Double = relationSpacerMinimumLength
+    ) -> DetailRowLayoutMode {
+        relationRowMode(
+            availableWidth: availableWidth,
+            metrics: DetailRelationMetrics(
+                labelWidth: labelWidth,
+                nameWidth: nameWidth,
+                trailingWidth: trailingWidth,
+                spacing: spacing,
+                spacerMinimumLength: spacerMinimumLength,
+                minimumNameWidth: minimumValueWidth
+            )
         )
     }
 
@@ -665,47 +782,266 @@ struct AdaptiveDetailInfoRow: View {
     }
 }
 
+private struct AdaptiveDetailRelationRowLayout: Layout {
+    private let spacing = CGFloat(DetailLayoutPolicy.relationSpacing)
+    private let spacerMinimumLength = CGFloat(DetailLayoutPolicy.relationSpacerMinimumLength)
+    private let minimumNameWidth = CGFloat(DetailLayoutPolicy.minimumRelationValueWidth)
+    private let verticalSpacing: CGFloat = 3
+
+    private struct Measurement {
+        let mode: DetailRowLayoutMode
+        let labelWidth: CGFloat
+        let nameWidth: CGFloat
+        let trailingWidth: CGFloat
+        let trailingOffset: CGFloat
+        let verticalSpacing: CGFloat
+        let labelHeight: CGFloat
+        let nameHeight: CGFloat
+        let trailingHeight: CGFloat
+
+        var height: CGFloat {
+            switch mode {
+            case .inline:
+                return max(labelHeight, max(nameHeight, trailingHeight))
+            case .stacked:
+                return max(labelHeight, trailingHeight) + verticalSpacing + nameHeight
+            }
+        }
+    }
+
+    func sizeThatFits(
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) -> CGSize {
+        guard subviews.count >= 3 else { return .zero }
+        let idealSizes = idealSizes(for: subviews)
+        let width = resolvedWidth(proposal.width, idealSizes: idealSizes)
+        let measurement = measure(
+            width: width,
+            idealSizes: idealSizes,
+            subviews: subviews
+        )
+        return CGSize(
+            width: finiteProposedWidth(proposal.width) ?? width,
+            height: measurement.height
+        )
+    }
+
+    func placeSubviews(
+        in bounds: CGRect,
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) {
+        guard subviews.count >= 3 else { return }
+        let idealSizes = idealSizes(for: subviews)
+        let measurement = measure(
+            width: finiteNonNegative(bounds.width),
+            idealSizes: idealSizes,
+            subviews: subviews
+        )
+        let minX = bounds.minX
+        let maxX = bounds.maxX
+
+        switch measurement.mode {
+        case .inline:
+            let nameX = min(
+                maxX,
+                minX + measurement.labelWidth + spacing
+            )
+            let trailingX = min(
+                maxX,
+                max(minX, minX + measurement.trailingOffset)
+            )
+            subviews[0].place(
+                at: CGPoint(x: minX, y: bounds.minY),
+                anchor: .topLeading,
+                proposal: ProposedViewSize(width: measurement.labelWidth, height: nil)
+            )
+            subviews[1].place(
+                at: CGPoint(x: nameX, y: bounds.minY),
+                anchor: .topLeading,
+                proposal: ProposedViewSize(width: measurement.nameWidth, height: nil)
+            )
+            subviews[2].place(
+                at: CGPoint(x: trailingX, y: bounds.minY),
+                anchor: .topLeading,
+                proposal: ProposedViewSize(width: measurement.trailingWidth, height: nil)
+            )
+        case .stacked:
+            let trailingX = min(
+                maxX,
+                max(minX, minX + measurement.trailingOffset)
+            )
+            let topHeight = max(measurement.labelHeight, measurement.trailingHeight)
+            subviews[0].place(
+                at: CGPoint(x: minX, y: bounds.minY),
+                anchor: .topLeading,
+                proposal: ProposedViewSize(width: measurement.labelWidth, height: nil)
+            )
+            subviews[2].place(
+                at: CGPoint(x: trailingX, y: bounds.minY),
+                anchor: .topLeading,
+                proposal: ProposedViewSize(width: measurement.trailingWidth, height: nil)
+            )
+            subviews[1].place(
+                at: CGPoint(x: minX, y: bounds.minY + topHeight + verticalSpacing),
+                anchor: .topLeading,
+                proposal: ProposedViewSize(width: measurement.nameWidth, height: nil)
+            )
+        }
+    }
+
+    private func idealSizes(for subviews: Subviews) -> [CGSize] {
+        subviews.prefix(3).map { sanitizedSize($0.sizeThatFits(.unspecified)) }
+    }
+
+    private func measure(
+        width: CGFloat,
+        idealSizes: [CGSize],
+        subviews: Subviews
+    ) -> Measurement {
+        let safeWidth = finiteNonNegative(width)
+        let labelIdeal = idealSizes[0].width
+        let nameIdeal = max(idealSizes[1].width, minimumNameWidth)
+        let trailingIdeal = idealSizes[2].width
+        let metrics = DetailRelationMetrics(
+            labelWidth: Double(labelIdeal),
+            nameWidth: Double(nameIdeal),
+            trailingWidth: Double(trailingIdeal),
+            spacing: Double(spacing),
+            spacerMinimumLength: Double(spacerMinimumLength),
+            minimumNameWidth: Double(minimumNameWidth)
+        )
+        let mode = DetailLayoutPolicy.relationRowMode(
+            availableWidth: Double(safeWidth),
+            metrics: metrics
+        )
+
+        switch mode {
+        case .inline:
+            let widths = inlineWidths(
+                availableWidth: safeWidth,
+                labelWidth: labelIdeal,
+                nameWidth: nameIdeal,
+                trailingWidth: trailingIdeal
+            )
+            let labelSize = sanitizedSize(subviews[0].sizeThatFits(
+                ProposedViewSize(width: widths.label, height: nil)
+            ))
+            let nameSize = sanitizedSize(subviews[1].sizeThatFits(
+                ProposedViewSize(width: widths.name, height: nil)
+            ))
+            let trailingSize = sanitizedSize(subviews[2].sizeThatFits(
+                ProposedViewSize(width: widths.trailing, height: nil)
+            ))
+            return Measurement(
+                mode: mode,
+                labelWidth: widths.label,
+                nameWidth: widths.name,
+                trailingWidth: widths.trailing,
+                trailingOffset: max(safeWidth - widths.trailing, 0),
+                verticalSpacing: verticalSpacing,
+                labelHeight: labelSize.height,
+                nameHeight: nameSize.height,
+                trailingHeight: trailingSize.height
+            )
+        case .stacked:
+            let trailingWidth = CGFloat(DetailLayoutPolicy.boundedInlineWidth(
+                requestedWidth: Double(trailingIdeal),
+                availableWidth: Double(safeWidth)
+            ))
+            let labelBudget = max(safeWidth - trailingWidth - spacing, 0)
+            let labelWidth = min(labelIdeal, labelBudget)
+            let labelSize = sanitizedSize(subviews[0].sizeThatFits(
+                ProposedViewSize(width: labelWidth, height: nil)
+            ))
+            let trailingSize = sanitizedSize(subviews[2].sizeThatFits(
+                ProposedViewSize(width: trailingWidth, height: nil)
+            ))
+            let nameSize = sanitizedSize(subviews[1].sizeThatFits(
+                ProposedViewSize(width: safeWidth, height: nil)
+            ))
+            return Measurement(
+                mode: mode,
+                labelWidth: labelWidth,
+                nameWidth: safeWidth,
+                trailingWidth: trailingWidth,
+                trailingOffset: max(safeWidth - trailingWidth, 0),
+                verticalSpacing: verticalSpacing,
+                labelHeight: labelSize.height,
+                nameHeight: nameSize.height,
+                trailingHeight: trailingSize.height
+            )
+        }
+    }
+
+    private func inlineWidths(
+        availableWidth: CGFloat,
+        labelWidth: CGFloat,
+        nameWidth: CGFloat,
+        trailingWidth: CGFloat
+    ) -> (label: CGFloat, name: CGFloat, trailing: CGFloat) {
+        let safeWidth = finiteNonNegative(availableWidth)
+        let safeSpacing = finiteNonNegative(spacing)
+        let fixedGaps = safeSpacing * CGFloat(DetailLayoutPolicy.relationGapCount)
+            + finiteNonNegative(spacerMinimumLength)
+        let safeTrailing = min(finiteNonNegative(trailingWidth), safeWidth)
+        let safeName = min(
+            finiteNonNegative(nameWidth),
+            max(safeWidth - safeTrailing - fixedGaps, 0)
+        )
+        let safeLabel = min(
+            finiteNonNegative(labelWidth),
+            max(safeWidth - safeName - safeTrailing - fixedGaps, 0)
+        )
+        return (safeLabel, safeName, safeTrailing)
+    }
+
+    private func resolvedWidth(_ proposedWidth: CGFloat?, idealSizes: [CGSize]) -> CGFloat {
+        if let proposedWidth, proposedWidth.isFinite {
+            return max(proposedWidth, 0)
+        }
+        let metrics = DetailRelationMetrics(
+            labelWidth: Double(idealSizes[0].width),
+            nameWidth: Double(idealSizes[1].width),
+            trailingWidth: Double(idealSizes[2].width),
+            spacing: Double(spacing),
+            spacerMinimumLength: Double(spacerMinimumLength),
+            minimumNameWidth: Double(minimumNameWidth)
+        )
+        let required = DetailLayoutPolicy.relationRequiredWidth(metrics: metrics)
+        if required.isFinite {
+            return CGFloat(max(required, 0))
+        }
+        return minimumNameWidth + spacing * CGFloat(DetailLayoutPolicy.relationGapCount)
+            + spacerMinimumLength
+    }
+}
+
 struct AdaptiveDetailRelationRow: View {
     let label: String
     let name: String
     let trailing: String
 
     var body: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(alignment: .firstTextBaseline, spacing: DetailLayoutPolicy.relationSpacing) {
-                Text(label)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 52, alignment: .leading)
-                Text(name)
-                    .font(.caption)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .frame(minWidth: CGFloat(DetailLayoutPolicy.minimumRelationValueWidth), alignment: .leading)
-                Spacer(minLength: 4)
-                Text(trailing)
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: true, vertical: false)
-            }
-            .fixedSize(horizontal: true, vertical: false)
-
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(label)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    Spacer(minLength: 4)
-                    Text(trailing)
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-                Text(name)
-                    .font(.caption)
-                    .lineLimit(2)
-                    .truncationMode(.middle)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+        AdaptiveDetailRelationRowLayout {
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Text(name)
+                .font(.caption)
+                .lineLimit(2)
+                .truncationMode(.middle)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(trailing)
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .combine)

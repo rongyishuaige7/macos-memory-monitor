@@ -129,7 +129,12 @@ final class DetailLayoutContractTests: XCTestCase {
             .inline
         )
 
-        let relationRequired = 52.0 + 74.0 + 140.0 + 16.0
+        let relationRequired = DetailLayoutPolicy.relationRequiredWidth(
+            labelWidth: 52,
+            nameWidth: 140,
+            trailingWidth: 74
+        )
+        XCTAssertEqual(relationRequired, 294)
         XCTAssertEqual(
             DetailLayoutPolicy.relationRowMode(availableWidth: relationRequired - 0.01),
             .stacked
@@ -147,6 +152,45 @@ final class DetailLayoutContractTests: XCTestCase {
                 spacing: 10
             ),
             .stacked
+        )
+
+        let measuredRequired = DetailLayoutPolicy.relationRequiredWidth(
+            labelWidth: 64,
+            nameWidth: 220,
+            trailingWidth: 116,
+            spacing: 10,
+            spacerMinimumLength: 6
+        )
+        XCTAssertEqual(measuredRequired, 436)
+        XCTAssertEqual(
+            DetailLayoutPolicy.relationRowMode(
+                availableWidth: measuredRequired - 0.01,
+                labelWidth: 64,
+                nameWidth: 220,
+                trailingWidth: 116,
+                spacing: 10,
+                spacerMinimumLength: 6
+            ),
+            .stacked
+        )
+        XCTAssertEqual(
+            DetailLayoutPolicy.relationRowMode(
+                availableWidth: measuredRequired,
+                labelWidth: 64,
+                nameWidth: 220,
+                trailingWidth: 116,
+                spacing: 10,
+                spacerMinimumLength: 6
+            ),
+            .inline
+        )
+        XCTAssertEqual(
+            DetailLayoutPolicy.relationRequiredWidth(
+                labelWidth: .nan,
+                nameWidth: .infinity,
+                trailingWidth: -10
+            ),
+            .infinity
         )
     }
 
