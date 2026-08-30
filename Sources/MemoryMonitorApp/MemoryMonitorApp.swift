@@ -72,8 +72,28 @@ final class MemoryMonitorApplicationDelegate: NSObject, NSApplicationDelegate {
     let terminationAction = ApplicationTerminationAction()
     private let terminationCoordinator: ApplicationTerminationCoordinator
 
+    /// Selects the sampling source without reading global state in tests.
+    /// Synthetic data is available only to the explicit isolated UI-check
+    /// launch; every other environment keeps the production sampler.
+    static func makeSamplingSource(
+        environment: [String: String]
+    ) -> any MonitorSamplingSource {
+        guard MemoryMonitorUIFixture.isEnabled(environment: environment) else {
+            return MonitorSampler()
+        }
+        return MemoryMonitorUIFixtureSamplingSource(
+            dataset: MemoryMonitorUIFixture.makeDataset()
+        )
+    }
+
     override convenience init() {
-        self.init(model: MonitorViewModel())
+        self.init(
+            model: MonitorViewModel(
+                sampler: Self.makeSamplingSource(
+                    environment: ProcessInfo.processInfo.environment
+                )
+            )
+        )
     }
 
     init(
