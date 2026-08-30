@@ -91,6 +91,50 @@ final class DetailLayoutSmokeTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(large.height, normal.height)
     }
 
+    func testNarrowMemberRowRemainsFiniteAtExtremeWidths() {
+        let widths: [CGFloat] = [20, 40, 80]
+        for width in widths {
+            let size = measure(
+                AdaptiveDetailMemberRow(
+                    name: String(repeating: "member-process-", count: 8),
+                    subtitle: String(repeating: "PID 12345 · RSS 123.4 MiB · ", count: 4),
+                    footprint: String(repeating: "123.4 GiB ", count: 8)
+                )
+                .frame(width: width, alignment: .leading)
+                .environment(\.dynamicTypeSize, .accessibility3),
+                width: width
+            )
+
+            XCTAssertEqual(size.width, width, accuracy: 0.5)
+            XCTAssertTrue(size.height.isFinite)
+            XCTAssertGreaterThan(size.height, 0)
+            XCTAssertLessThan(size.height, 120)
+        }
+    }
+
+    func testNarrowAuditRowKeepsActionsAndMetadataSingleLine() {
+        let widths: [CGFloat] = [20, 40, 80]
+        for width in widths {
+            let size = measure(
+                AdaptiveDetailAuditRow(
+                    action: String(repeating: "请求优雅退出 ", count: 8),
+                    process: String(repeating: "long-process-name ", count: 8),
+                    status: String(repeating: "已确认 ", count: 8),
+                    timestamp: Date(timeIntervalSince1970: 1_756_000_000),
+                    statusColor: .orange
+                )
+                .frame(width: width, alignment: .leading)
+                .environment(\.dynamicTypeSize, .accessibility3),
+                width: width
+            )
+
+            XCTAssertEqual(size.width, width, accuracy: 0.5)
+            XCTAssertTrue(size.height.isFinite)
+            XCTAssertGreaterThan(size.height, 0)
+            XCTAssertLessThan(size.height, 120)
+        }
+    }
+
     private func measure<Content: View>(_ view: Content, width: CGFloat) -> CGSize {
         let hostingView = NSHostingView(rootView: view)
         hostingView.frame = NSRect(x: 0, y: 0, width: width, height: 2_000)

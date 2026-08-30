@@ -1101,7 +1101,8 @@ struct AdaptiveDetailMemberRow: View {
                     Spacer(minLength: 4)
                     Text(footprint)
                         .font(.caption.monospacedDigit())
-                        .fixedSize(horizontal: true, vertical: false)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
                 Text(subtitle)
                     .font(.caption2)
@@ -1149,10 +1150,14 @@ struct AdaptiveDetailAuditRow: View {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Text(action)
                         .font(.caption2.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                     Spacer(minLength: 4)
                     Text(status)
                         .font(.caption2)
                         .foregroundStyle(statusColor)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Text(process)
@@ -1163,11 +1168,19 @@ struct AdaptiveDetailAuditRow: View {
                     Text(timestamp, style: .time)
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilitySummary)
+    }
+
+    private var accessibilitySummary: String {
+        let formattedTime = timestamp.formatted(date: .omitted, time: .shortened)
+        return "\(action)，\(process)，\(status)，\(formattedTime)"
     }
 }
 
