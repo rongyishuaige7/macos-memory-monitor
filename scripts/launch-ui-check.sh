@@ -8,7 +8,7 @@ script_name="$0"
 
 usage() {
 	print -u2 "Usage: $script_name --output-dir <new-or-empty-temporary-directory>"
-	print -u2 "The directory must be an explicit absolute path below TMPDIR or /tmp."
+	print -u2 "The directory must be an explicit absolute path below the system Darwin user temporary root or /tmp."
 }
 
 if (( $# == 1 )) && [[ "$1" == "--help" || "$1" == "-h" ]]; then
@@ -20,20 +20,130 @@ if (( $# != 2 )) || [[ "$1" != "--output-dir" ]]; then
 	exit 2
 fi
 
-requested_output_root="$2"
-if [[ -z "$requested_output_root" || "$requested_output_root" != /* ]]; then
+requested_output_argument="$2"
+if [[ -z "$requested_output_argument" ]]; then
 	print -u2 -- "--output-dir must be a non-empty absolute path"
 	exit 2
 fi
-if [[ "$requested_output_root" == *$'\n'* || "$requested_output_root" == *$'\r'* ]]; then
-	print -u2 -- "--output-dir must not contain line breaks"
+
+# Keep the shell-side path parser in lockstep with
+# `MemoryMonitorStoragePaths.canonicalTemporaryPath`: trim surrounding
+# whitespace, reject embedded line breaks, and resolve existing symlink
+# components before applying a complete path-component boundary. Keep both
+# the trimmed lexical spelling and the resolved spelling: the former is used
+# for filesystem checks so a final symlink cannot disappear into `${path:A}`;
+# `REPLY` avoids command substitution changing paths that contain spaces.
+canonicalize_absolute_path() {
+	setopt localoptions extendedglob
+	local raw_path="$1"
+	local trimmed_path="$raw_path"
+	trimmed_path="${trimmed_path##[[:space:]]##}"
+	trimmed_path="${trimmed_path%%[[:space:]]##}"
+	[[ -n "$trimmed_path" && "$trimmed_path" == /* ]] || return 1
+	[[ "$trimmed_path" != *$'\n'* && "$trimmed_path" != *$'\r'* ]] || return 1
+	local lexical_path="${trimmed_path:a}"
+	local resolved_path="${trimmed_path:A}"
+	[[ -n "$resolved_path" && "$resolved_path" == /* && "$resolved_path" != "/" ]] || return 1
+	[[ -n "$lexical_path" && "$lexical_path" == /* ]] || return 1
+	RAW_REPLY="$trimmed_path"
+	LEXICAL_REPLY="$lexical_path"
+	REPLY="$resolved_path"
+}
+
+# `${path:A}` can leave a dangling symlink followed by a not-yet-created suffix
+# looking lexical. Walk every raw prefix and reject ordinary symlink components
+# before `mkdir -p` can follow a link whose destination might later be created
+# elsewhere. The only existing links allowed here are macOS's `/tmp` and `/var`
+# aliases; verify their resolved destinations instead of trusting their names.
+is_allowed_system_alias() {
+	local alias_path="$1"
+	case "$alias_path" in
+		/tmp)
+			[[ "${alias_path:A}" == "/private/tmp" && -d "/private/tmp" ]]
+			;;
+		/var)
+			[[ "${alias_path:A}" == "/private/var" && -d "/private/var" ]]
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+has_unsafe_symlink_prefix() {
+	local probe="$1"
+	while :; do
+		while [[ "$probe" == */ && "$probe" != "/" ]]; do
+			probe="${probe%/}"
+		done
+		if [[ -L "$probe" ]] && ! is_allowed_system_alias "$probe"; then
+			return 0
+		fi
+		[[ "$probe" == "/" ]] && return 1
+		probe="${probe%/*}"
+		[[ -n "$probe" ]] || probe="/"
+	done
+}
+
+if ! canonicalize_absolute_path "$requested_output_argument"; then
+	print -u2 -- "--output-dir must be a non-empty absolute path without embedded line breaks"
 	exit 2
+fi
+requested_output_root="$RAW_REPLY"
+lexical_output_root="$LEXICAL_REPLY"
+canonical_output_root="$REPLY"
+
+canonical_project_root="${project_root:A}"
+
+# `getconf DARWIN_USER_TEMP_DIR` is the shell equivalent of Darwin's
+# `confstr(_CS_DARWIN_USER_TEMP_DIR)`. Do not use the caller-controlled
+# `TMPDIR` as a trust anchor. A failed or malformed query deliberately leaves
+# only canonical `/tmp` in the trust set, matching Core's fail-closed rule.
+darwin_path_max=1024
+getconf_binary="/usr/bin/getconf"
+darwin_temp_root_raw=""
+if [[ -x "$getconf_binary" ]]; then
+	path_max_value="$($getconf_binary PATH_MAX / 2>/dev/null || true)"
+	if [[ "$path_max_value" == <-> && "$path_max_value" -gt 1 ]]; then
+		darwin_path_max="$path_max_value"
+	fi
+	darwin_temp_root_raw="$($getconf_binary DARWIN_USER_TEMP_DIR 2>/dev/null || true)"
+fi
+
+trusted_temporary_roots=()
+if [[ -n "$darwin_temp_root_raw" ]]; then
+	# Core's fixed PATH_MAX buffer accepts a confstr value only when the
+	# returned length is strictly less than the buffer size. confstr reports
+	# the terminating NUL in that length, so the shell equivalent is
+	# `payloadBytes + 1 < PATH_MAX` (not `<=`). Paths returned by getconf are
+	# normally ASCII; C locale length is the byte count that matters here.
+	local_path_locale="${LC_ALL-}"
+	LC_ALL=C
+	darwin_temp_root_bytes=${#darwin_temp_root_raw}
+	if (( darwin_temp_root_bytes + 1 < darwin_path_max )) &&
+		canonicalize_absolute_path "$darwin_temp_root_raw"; then
+		trusted_temporary_roots+=("$REPLY")
+	fi
+	if [[ -n "$local_path_locale" ]]; then
+		LC_ALL="$local_path_locale"
+	else
+		unset LC_ALL
+	fi
+fi
+
+tmp_root="/tmp"
+if ! canonicalize_absolute_path "$tmp_root"; then
+	print -u2 "Unable to resolve the canonical /tmp trust root"
+	exit 2
+fi
+canonical_tmp_root="$REPLY"
+if (( ${#trusted_temporary_roots[@]} == 0 )) ||
+	[[ "${trusted_temporary_roots[1]}" != "$canonical_tmp_root" ]]; then
+	trusted_temporary_roots+=("$canonical_tmp_root")
 fi
 
 # Resolve existing symlink components and dot segments before applying the
 # safety boundaries. The final directory may not exist yet.
-canonical_output_root="${requested_output_root:A}"
-canonical_project_root="${project_root:A}"
 if [[ -z "$canonical_output_root" || "$canonical_output_root" == "/" ||
 	"$canonical_output_root" == "$canonical_project_root" ||
 	"$canonical_output_root" == "$canonical_project_root"/* ]]; then
@@ -41,48 +151,59 @@ if [[ -z "$canonical_output_root" || "$canonical_output_root" == "/" ||
 	exit 2
 fi
 
-temporary_root_candidates=("${TMPDIR:-/tmp}" "/tmp")
 is_temporary=0
-for temporary_root in "${temporary_root_candidates[@]}"; do
-	[[ -n "$temporary_root" && "$temporary_root" == /* ]] || continue
-	canonical_temporary_root="${temporary_root:A}"
-	if [[ "$canonical_output_root" == "$canonical_temporary_root"/* ]]; then
+trusted_output_root=""
+for temporary_root in "${trusted_temporary_roots[@]}"; do
+	if [[ "$canonical_output_root" == "$temporary_root"/* ]]; then
 		is_temporary=1
+		trusted_output_root="$temporary_root"
 		break
 	fi
 done
 if (( ! is_temporary )); then
-	print -u2 -- "--output-dir must be below TMPDIR or /tmp: $canonical_output_root"
+	print -u2 -- "--output-dir must be below the system Darwin user temporary root or /tmp: $canonical_output_root"
 	exit 2
 fi
 
-for command_name in swift plutil codesign file ps pgrep open env mkdir find sleep date sed stat awk; do
+if has_unsafe_symlink_prefix "$requested_output_root" ||
+	has_unsafe_symlink_prefix "$lexical_output_root"; then
+	print -u2 "Refusing an output directory with an unsafe symlink ancestor: $requested_output_root"
+	exit 2
+fi
+
+for command_name in swift plutil codesign file ps pgrep open env mkdir chmod find sleep date sed stat awk; do
 	if ! command -v "$command_name" >/dev/null 2>&1; then
 		print -u2 "Required command not found: $command_name"
 		exit 2
 	fi
 done
 
-if [[ -L "$requested_output_root" ]]; then
+if [[ -L "$lexical_output_root" ]]; then
 	print -u2 "Refusing a symlink output directory: $requested_output_root"
 	exit 2
 fi
-if [[ -e "$requested_output_root" ]]; then
-	if [[ ! -d "$requested_output_root" ]]; then
+if [[ -e "$lexical_output_root" ]]; then
+	if [[ ! -d "$lexical_output_root" ]]; then
 		print -u2 "Output path is not a directory: $requested_output_root"
 		exit 2
 	fi
-	if [[ -n "$(find "$requested_output_root" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+	if [[ -n "$(find "$lexical_output_root" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
 		print -u2 "Output directory must be empty to prevent stale UI-check data: $requested_output_root"
 		exit 2
 	fi
 else
-	mkdir -p -- "$requested_output_root"
+	mkdir -p -- "$lexical_output_root"
 fi
 
 # Re-resolve after creation so a concurrent symlink replacement cannot move
 # generated artifacts into the source tree or another non-temporary location.
-canonical_output_after_mkdir="${requested_output_root:A}"
+if [[ -L "$lexical_output_root" ]] ||
+	has_unsafe_symlink_prefix "$requested_output_root" ||
+	has_unsafe_symlink_prefix "$lexical_output_root"; then
+	print -u2 "Output directory changed to a symlink or unsafe ancestor: $requested_output_root"
+	exit 2
+fi
+canonical_output_after_mkdir="${lexical_output_root:A}"
 if [[ "$canonical_output_after_mkdir" != "$canonical_output_root" ||
 	"$canonical_output_after_mkdir" == "$canonical_project_root" ||
 	"$canonical_output_after_mkdir" == "$canonical_project_root"/* ]]; then
@@ -104,12 +225,19 @@ if [[ -e "$app_output_root" || -L "$app_output_root" ]]; then
 fi
 mkdir -m 700 -- "$storage_root" "$isolated_home" "$isolated_tmp"
 
+# Keep SwiftPM/build staging and the fixture writer away from a caller's
+# potentially persistent TMPDIR. The selected anchor is already one of the
+# fixed trusted roots and remains compatible with the fixture writer's paired
+# storage check; the launched App receives the narrower sibling `isolated_tmp`
+# below.
+build_temporary_root="$trusted_output_root"
+
 print "Building isolated fixture writer..."
-swift build \
+env TMPDIR="$build_temporary_root" swift build \
 	--package-path "$project_root" \
 	--configuration release \
 	--product memory-monitor-fixture
-fixture_bin_dir="$(swift build \
+fixture_bin_dir="$(env TMPDIR="$build_temporary_root" swift build \
 	--package-path "$project_root" \
 	--configuration release \
 	--show-bin-path)"
@@ -125,7 +253,7 @@ if [[ "$fixture_description" != *arm64* ]]; then
 fi
 
 print "Generating isolated history and audit fixture..."
-if ! "$fixture_binary" --storage-root "$storage_root" >"$fixture_log_path" 2>&1; then
+if ! env TMPDIR="$build_temporary_root" "$fixture_binary" --storage-root "$storage_root" >"$fixture_log_path" 2>&1; then
 	print -u2 "Fixture writer failed"
 	if [[ -s "$fixture_log_path" ]]; then
 		print -u2 -- "$(sed -n '1,40p' "$fixture_log_path")"
@@ -210,6 +338,7 @@ fi
 
 print "Building isolated UI-check bundle..."
 env -u APP_VERSION -u BUILD_NUMBER \
+	TMPDIR="$build_temporary_root" \
 	CONFIGURATION=release \
 	OUTPUT_DIR="$app_output_root" \
 	SKIP_SIGNING=1 \

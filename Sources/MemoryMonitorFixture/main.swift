@@ -14,7 +14,7 @@ private enum FixtureToolError: Error, CustomStringConvertible {
         case .invalidArguments:
             return "用法：memory-monitor-fixture --storage-root <临时目录>"
         case let .invalidRoot(path):
-            return "storage root 必须是 /tmp 或 TMPDIR 下的绝对目录：\(path)"
+            return "storage root 必须是系统临时目录（/tmp 或 Darwin 用户临时目录）下的绝对目录：\(path)"
         case .nonEmptyRoot:
             return "storage root 必须为空，以避免复用旧 fixture 数据"
         case let .missingOutput(path):
@@ -112,9 +112,10 @@ struct MemoryMonitorFixtureTool {
         guard arguments.count == 2, arguments[0] == "--storage-root" else {
             throw FixtureToolError.invalidArguments
         }
-        let path = arguments[1]
+        let path = arguments[1].trimmingCharacters(in: .whitespacesAndNewlines)
         guard !path.isEmpty,
               path.hasPrefix("/"),
+              !path.contains(where: { $0 == "\n" || $0 == "\r" }),
               !path.unicodeScalars.contains(where: { $0.value == 0 }) else {
             throw FixtureToolError.invalidRoot(path)
         }
@@ -124,26 +125,29 @@ struct MemoryMonitorFixtureTool {
     private static func validateRoot(_ root: URL) throws {
         let requestedPath = root.standardizedFileURL.path
         let resolvedPath = root.resolvingSymlinksInPath().standardizedFileURL.path
-        guard requestedPath != "/",
-              requestedPath == resolvedPath else {
+        guard requestedPath != "/" else {
             throw FixtureToolError.invalidRoot(root.path)
         }
-        let temporaryRoots = [
-            ProcessInfo.processInfo.environment["TMPDIR"],
-            "/tmp"
-        ].compactMap { value -> String? in
-            guard let value, value.hasPrefix("/") else { return nil }
-            return URL(fileURLWithPath: value, isDirectory: true)
-                .resolvingSymlinksInPath()
-                .standardizedFileURL
-                .path
-        }
-        guard temporaryRoots.contains(where: {
-            requestedPath.hasPrefix($0 + "/") && requestedPath != $0
-        }) else {
+
+        // Keep the CLI and app on the same trust boundary. The Core resolver
+        // uses the host-provided Darwin temporary root and /tmp; TMPDIR is
+        // intentionally not treated as a trust anchor because callers can
+        // point it at the project or another persistent directory.
+        var validationEnvironment = ProcessInfo.processInfo.environment
+        validationEnvironment[MemoryMonitorStoragePaths.overrideEnvironmentKey] = requestedPath
+        guard let isolatedRoot = MemoryMonitorStoragePaths.isolatedRootURL(
+            environment: validationEnvironment
+        ), URL(fileURLWithPath: isolatedRoot.path, isDirectory: true)
+            .resolvingSymlinksInPath().standardizedFileURL.path
+            == URL(fileURLWithPath: resolvedPath, isDirectory: true)
+            .resolvingSymlinksInPath().standardizedFileURL.path else {
             throw FixtureToolError.invalidRoot(root.path)
         }
+
         let fileManager = FileManager.default
+        guard !hasUnsafeExistingAncestor(atPath: requestedPath) else {
+            throw FixtureToolError.invalidRoot(root.path)
+        }
         if isSymbolicLink(atPath: requestedPath) {
             throw FixtureToolError.invalidRoot(root.path)
         }
@@ -168,11 +172,99 @@ struct MemoryMonitorFixtureTool {
             [.posixPermissions: 0o700],
             ofItemAtPath: requestedPath
         )
+        let resolvedPathAfterCreation = URL(fileURLWithPath: requestedPath, isDirectory: true)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+            .path
+        let canonicalIsolatedPath = URL(fileURLWithPath: isolatedRoot.path, isDirectory: true)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+            .path
         guard !isSymbolicLink(atPath: requestedPath),
-              URL(fileURLWithPath: requestedPath, isDirectory: true)
-                .resolvingSymlinksInPath().standardizedFileURL.path == requestedPath else {
+              resolvedPathAfterCreation == canonicalIsolatedPath else {
             throw FixtureToolError.invalidRoot(requestedPath)
         }
+    }
+
+    /// Inspect every path component that already exists before creating the
+    /// requested directory. Foundation's symlink resolver can leave a
+    /// dangling link followed by a missing suffix unresolved; `mkdir` would
+    /// then follow that link when creating the suffix. Stop at the first
+    /// missing component because `withIntermediateDirectories: false` can
+    /// create only the final component and no later component exists yet.
+    private static func hasUnsafeExistingAncestor(atPath path: String) -> Bool {
+        let components = path
+            .split(separator: "/", omittingEmptySubsequences: true)
+            .map(String.init)
+        guard !components.isEmpty else { return true }
+
+        var currentPath = ""
+        for (index, component) in components.enumerated() {
+            currentPath += "/" + component
+
+            var information = stat()
+            guard lstat(currentPath, &information) == 0 else {
+                // An absent component ends the existing ancestor chain. Any
+                // other error means the path cannot be trusted or inspected.
+                return errno == ENOENT ? false : true
+            }
+
+            let fileType = information.st_mode & S_IFMT
+            var isTraversableDirectory = fileType == S_IFDIR
+            if fileType == S_IFLNK {
+                guard isAllowedSystemAlias(atPath: currentPath) else {
+                    return true
+                }
+                isTraversableDirectory = true
+            }
+            if index < components.count - 1 && !isTraversableDirectory {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// macOS exposes `/tmp` and `/var` as stable aliases to `/private/tmp`
+    /// and `/private/var`. They are the only symlink components permitted in
+    /// an otherwise trusted path, and the link target is checked explicitly
+    /// so a replaced system alias cannot widen this exception.
+    private static func isAllowedSystemAlias(atPath path: String) -> Bool {
+        let allowedTargets: [String: [String]] = [
+            "/tmp": ["private/tmp", "/private/tmp"],
+            "/var": ["private/var", "/private/var"]
+        ]
+        guard let expectedTargets = allowedTargets[path] else { return false }
+
+        var targetBuffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+        let targetLength = path.withCString { pathPointer in
+            targetBuffer.withUnsafeMutableBufferPointer { buffer in
+                readlink(pathPointer, buffer.baseAddress, buffer.count)
+            }
+        }
+        guard targetLength > 0,
+              targetLength < targetBuffer.count,
+              let target = String(
+                  bytes: targetBuffer.prefix(Int(targetLength)).map {
+                      UInt8(bitPattern: $0)
+                  },
+                  encoding: .utf8
+              ) else {
+            return false
+        }
+        guard expectedTargets.contains(target) else { return false }
+
+        let expectedPath: String
+        switch path {
+        case "/tmp":
+            expectedPath = "/private/tmp"
+        case "/var":
+            expectedPath = "/private/var"
+        default:
+            return false
+        }
+        var targetInformation = stat()
+        guard lstat(expectedPath, &targetInformation) == 0 else { return false }
+        return (targetInformation.st_mode & S_IFMT) == S_IFDIR
     }
 
     private static func isSymbolicLink(atPath path: String) -> Bool {

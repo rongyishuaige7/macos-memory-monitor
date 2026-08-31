@@ -5129,16 +5129,71 @@ public enum MemoryMonitorStoragePaths {
 
     /// Resolves a storage root for the paired isolated UI-check launch.
     /// Unlike the general override resolver, this entry point only accepts a
-    /// canonical path below the caller's temporary directory or `/tmp`.
+    /// canonical path below the host-provided Darwin user temporary directory
+    /// or `/tmp`; the caller's `TMPDIR` value is never used as an anchor.
     /// Returning `nil` lets the app fail closed when the fixture switch and
     /// its storage root are not supplied together.
     public static func isolatedRootURL(
         environment: [String: String]
     ) -> URL? {
+        isolatedRootURL(
+            environment: environment,
+            trustedTemporaryRoots: trustedTemporaryRootPaths()
+        )
+    }
+
+    /// Test-only trust-root injection used to exercise path boundaries without
+    /// mutating the process environment. Resolution performs read-only
+    /// filesystem checks so dangling symlink escapes are rejected; production
+    /// code must use the one-argument overload so callers cannot provide their
+    /// own trust anchor.
+    static func isolatedRootURL(
+        environment: [String: String],
+        trustedTemporaryRoots: [String]
+    ) -> URL? {
         guard let rawOverride = environment[overrideEnvironmentKey] else {
             return nil
         }
-        let trimmed = rawOverride.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let candidatePath = canonicalTemporaryPath(rawOverride),
+              let candidateBoundary = boundaryPath(candidatePath) else {
+            return nil
+        }
+
+        let temporaryRoots = trustedTemporaryRoots.compactMap { rawRoot -> String? in
+            guard let rootPath = canonicalTemporaryPath(rawRoot) else { return nil }
+            return boundaryPath(rootPath)
+        }
+        guard temporaryRoots.contains(where: { root in
+            candidateBoundary.hasPrefix(root + "/")
+        }) else {
+            return nil
+        }
+        return URL(fileURLWithPath: candidatePath, isDirectory: true)
+    }
+
+    /// Returns fixed system trust anchors. `confstr` is intentionally used
+    /// instead of `TMPDIR` or `FileManager.temporaryDirectory`: both can be
+    /// influenced by the caller's environment, while the Darwin user temp
+    /// root remains the host-provided boundary for the current account.
+    private static func trustedTemporaryRootPaths() -> [String] {
+        var roots = ["/tmp"]
+        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+        let length = confstr(
+            Int32(_CS_DARWIN_USER_TEMP_DIR),
+            &buffer,
+            buffer.count
+        )
+        if length > 0,
+           length < buffer.count,
+           let root = String(bytes: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, encoding: .utf8),
+           !root.isEmpty {
+            roots.insert(root, at: 0)
+        }
+        return roots
+    }
+
+    private static func canonicalTemporaryPath(_ rawPath: String) -> String? {
+        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               trimmed.hasPrefix("/"),
               !trimmed.contains(where: { $0 == "\n" || $0 == "\r" }),
@@ -5146,36 +5201,119 @@ public enum MemoryMonitorStoragePaths {
             return nil
         }
 
-        let candidate = URL(fileURLWithPath: trimmed, isDirectory: true)
+        let url = URL(fileURLWithPath: trimmed, isDirectory: true)
             .resolvingSymlinksInPath()
             .standardizedFileURL
-        guard candidate.isFileURL,
-              candidate.path.hasPrefix("/"),
-              candidate.path != "/" else {
+        guard url.isFileURL,
+              url.path.hasPrefix("/"),
+              url.path != "/" else {
             return nil
+        }
+        return url.path
+    }
+
+    /// Resolve symlink components for boundary comparison, including a
+    /// dangling link followed by a not-yet-created suffix. Foundation's
+    /// `resolvingSymlinksInPath()` intentionally leaves that suffix untouched,
+    /// which can otherwise make an escape look as though it were still below
+    /// the trusted root. The returned path is used only for comparison; the
+    /// public resolver keeps Foundation's established spelling (for example,
+    /// `/tmp` rather than `/private/tmp`). Filesystem races remain the
+    /// launcher's responsibility.
+    private static func boundaryPath(_ path: String) -> String? {
+        var pending = path
+            .split(separator: "/", omittingEmptySubsequences: true)
+            .map(String.init)
+        var resolved: [String] = []
+        var index = 0
+        var symlinkDepth = 0
+
+        while index < pending.count {
+            let component = pending[index]
+            index += 1
+
+            if component == "." || component.isEmpty {
+                continue
+            }
+            if component == ".." {
+                guard !resolved.isEmpty else { return nil }
+                resolved.removeLast()
+                continue
+            }
+
+            var candidateComponents = resolved
+            candidateComponents.append(component)
+            let candidate = "/" + candidateComponents.joined(separator: "/")
+            var information = stat()
+            if lstat(candidate, &information) == 0 {
+                let fileType = information.st_mode & S_IFMT
+                if fileType == S_IFLNK {
+                    symlinkDepth += 1
+                    guard symlinkDepth <= 32 else { return nil }
+
+                    var targetBuffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+                    let targetLength = candidate.withCString { candidatePointer in
+                        targetBuffer.withUnsafeMutableBufferPointer { buffer in
+                            readlink(candidatePointer, buffer.baseAddress, buffer.count)
+                        }
+                    }
+                    guard targetLength > 0,
+                          targetLength < targetBuffer.count,
+                          let target = String(
+                              bytes: targetBuffer.prefix(Int(targetLength)).map {
+                                  UInt8(bitPattern: $0)
+                              },
+                              encoding: .utf8
+                          ),
+                          !target.isEmpty else {
+                        return nil
+                    }
+
+                    let remaining = Array(pending[index...])
+                    pending = target.split(separator: "/", omittingEmptySubsequences: true)
+                        .map(String.init) + remaining
+                    index = 0
+                    if target.hasPrefix("/") {
+                        resolved.removeAll(keepingCapacity: true)
+                    }
+                    continue
+                }
+
+                // A non-directory component cannot have a meaningful child.
+                if index < pending.count && fileType != S_IFDIR {
+                    return nil
+                }
+            } else {
+                switch errno {
+                case ENOENT:
+                    // No later component can currently be a symlink. Normalize
+                    // the not-yet-created suffix lexically and finish.
+                    resolved.append(component)
+                    while index < pending.count {
+                        let remaining = pending[index]
+                        index += 1
+                        if remaining == "." || remaining.isEmpty {
+                            continue
+                        }
+                        if remaining == ".." {
+                            guard !resolved.isEmpty else { return nil }
+                            resolved.removeLast()
+                        } else {
+                            resolved.append(remaining)
+                        }
+                    }
+                    guard !resolved.isEmpty else { return nil }
+                    return "/" + resolved.joined(separator: "/")
+                default:
+                    return nil
+                }
+            }
+
+            resolved.append(component)
         }
 
-        let temporaryRoots = [environment["TMPDIR"], "/tmp"].compactMap { rawRoot -> String? in
-            guard let rawRoot else { return nil }
-            let trimmedRoot = rawRoot.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmedRoot.isEmpty,
-                  trimmedRoot.hasPrefix("/"),
-                  !trimmedRoot.contains(where: { $0 == "\n" || $0 == "\r" }) else {
-                return nil
-            }
-            let root = URL(fileURLWithPath: trimmedRoot, isDirectory: true)
-                .resolvingSymlinksInPath()
-                .standardizedFileURL
-                .path
-            guard root != "/" else { return nil }
-            return root
-        }
-        guard temporaryRoots.contains(where: { root in
-            candidate.path.hasPrefix(root + "/") && candidate.path != root
-        }) else {
-            return nil
-        }
-        return candidate
+        guard !resolved.isEmpty else { return nil }
+        return "/" + resolved.joined(separator: "/")
     }
 
     public static func historyFileURL(root: URL) -> URL {
