@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import XCTest
 @testable import MemoryMonitorApp
@@ -60,6 +61,22 @@ final class AppIntegrationTests: XCTestCase {
 
         XCTAssertEqual(coordinator.status, .enabled)
         XCTAssertNil(coordinator.lastError)
+    }
+
+    func testLoginCoordinatorPublishesExternalStatusRefresh() {
+        let runtime = FakeLoginLaunchRuntime()
+        let coordinator = LoginLaunchCoordinator(runtime: runtime)
+        var updateCount = 0
+        let cancellable = coordinator.objectWillChange.sink { _ in
+            updateCount += 1
+        }
+
+        runtime.statusValue = .enabled
+        coordinator.refreshStatus()
+
+        XCTAssertEqual(coordinator.status, .enabled)
+        XCTAssertGreaterThan(updateCount, 0)
+        withExtendedLifetime(cancellable) {}
     }
 
     func testLoginCoordinatorTreatsApprovalAsRegisteredToggle() async {

@@ -52,6 +52,7 @@ struct MemoryMonitorApp: App {
             MonitorPopover(
                 model: applicationDelegate.model,
                 processActions: applicationDelegate.model.processActions,
+                loginLaunch: applicationDelegate.model.loginLaunch,
                 terminationAction: applicationDelegate.terminationAction
             )
                 .onAppear { applicationDelegate.model.setPanelPresented(true) }
@@ -1645,7 +1646,12 @@ private struct MonitorPopover: View {
     /// the controller here so audit failures immediately affect the health
     /// indicator in the popover.
     @ObservedObject var processActions: ProcessActionController
+    /// Login-item state is published by its own coordinator and is not
+    /// forwarded through `MonitorViewModel`. Observe the coordinator at the
+    /// popover boundary so the health icon follows external changes.
+    @ObservedObject var loginLaunch: LoginLaunchCoordinator
     let terminationAction: ApplicationTerminationAction
+    private let layout = MonitorPopoverLayoutPolicy.default
     @State private var listMode: MonitorListMode = .processes
     @State private var viewMode: MonitorViewMode = .live
     @State private var processScope: ProcessScope = .all
@@ -1666,21 +1672,29 @@ private struct MonitorPopover: View {
             .pickerStyle(.segmented)
             .labelsHidden()
 
-            switch viewMode {
-            case .live:
-                liveContent
-            case .history:
-                HistoryPanel(model: model)
+            MonitorPopoverContentScroll(layout: layout) {
+                switch viewMode {
+                case .live:
+                    liveContent
+                case .history:
+                    HistoryPanel(model: model)
+                }
             }
+
+            footer
+                .accessibilityIdentifier("monitor-popover-footer")
         }
         .padding(16)
-        .frame(width: 410)
+        .frame(
+            width: CGFloat(layout.width),
+            alignment: .topLeading
+        )
         .sheet(item: $detailSelection) { selection in
             switch selection {
             case .process(let identity):
                 ProcessDetailView(
                     model: model,
-                    actions: model.processActions,
+                    actions: processActions,
                     identity: identity
                 )
             case .group(let groupID):
@@ -1691,11 +1705,21 @@ private struct MonitorPopover: View {
             MonitorHealthPanel(
                 model: model,
                 processActions: processActions,
-                loginLaunch: model.loginLaunch
+                loginLaunch: loginLaunch
             )
         }
         .sheet(isPresented: $showAuditPanel) {
-            OperationsAuditPanel(actions: model.processActions)
+            OperationsAuditPanel(actions: processActions)
+        }
+        .onAppear {
+            loginLaunch.refreshStatus()
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: NSApplication.didBecomeActiveNotification
+            )
+        ) { _ in
+            loginLaunch.refreshStatus()
         }
     }
 
@@ -1705,7 +1729,6 @@ private struct MonitorPopover: View {
         recommendationCard
         samplingNotice
         processList
-        footer
     }
 
     private var header: some View {
@@ -1773,6 +1796,8 @@ private struct MonitorPopover: View {
         // Touch the nested observable explicitly so SwiftUI subscribes to its
         // objectWillChange stream while evaluating the computed health state.
         _ = processActions.auditError
+        _ = loginLaunch.status
+        _ = loginLaunch.lastError
         return model.healthSnapshot.overall
     }
 
