@@ -119,7 +119,6 @@ struct MonitorDetailDataStatus: Equatable, Sendable {
             }
             return make(
                 kind: .unavailable,
-                reason: .targetUnavailable,
                 sampledAt: nil,
                 message: nil
             )

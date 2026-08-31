@@ -2335,10 +2335,7 @@ final class AppIntegrationTests: XCTestCase {
         )
 
         XCTAssertEqual(targetUnavailableWithoutRows.kind, .unavailable)
-        XCTAssertEqual(
-            targetUnavailableWithoutRows.retentionReason,
-            .targetUnavailable
-        )
+        XCTAssertNil(targetUnavailableWithoutRows.retentionReason)
         XCTAssertFalse(targetUnavailableWithoutRows.hasRetainedData)
         XCTAssertNil(targetUnavailableWithoutRows.sampledAt)
     }
