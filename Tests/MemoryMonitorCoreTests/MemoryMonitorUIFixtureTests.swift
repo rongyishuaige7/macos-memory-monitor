@@ -18,6 +18,36 @@ final class MemoryMonitorUIFixtureTests: XCTestCase {
         }
     }
 
+    func testFixtureRequiresPairedTemporaryStorageOverride() {
+        let storageKey = MemoryMonitorStoragePaths.overrideEnvironmentKey
+        let validEnvironment = [
+            MemoryMonitorUIFixture.environmentKey: "1",
+            storageKey: "/tmp/memory-monitor-ui-check-paired"
+        ]
+        XCTAssertEqual(
+            MemoryMonitorUIFixture.isolatedStorageRootURL(environment: validEnvironment)?.path,
+            URL(fileURLWithPath: "/tmp/memory-monitor-ui-check-paired")
+                .resolvingSymlinksInPath()
+                .standardizedFileURL
+                .path
+        )
+
+        let invalidEnvironments: [[String: String]] = [
+            [:],
+            [MemoryMonitorUIFixture.environmentKey: "1"],
+            [storageKey: "/tmp/memory-monitor-ui-check-paired"],
+            [MemoryMonitorUIFixture.environmentKey: "0", storageKey: "/tmp/memory-monitor-ui-check-paired"],
+            [MemoryMonitorUIFixture.environmentKey: "1", storageKey: "relative/path"],
+            [MemoryMonitorUIFixture.environmentKey: "1", storageKey: "/Users/example/production"]
+        ]
+        for environment in invalidEnvironments {
+            XCTAssertNil(
+                MemoryMonitorUIFixture.isolatedStorageRootURL(environment: environment),
+                "fixture launch should fail closed: \(environment)"
+            )
+        }
+    }
+
     func testFixtureContainsStableMultipleMembersAndSafeTargets() throws {
         let referenceDate = Date(timeIntervalSince1970: 1_750_000_000)
         let dataset = MemoryMonitorUIFixture.makeDataset(now: referenceDate)

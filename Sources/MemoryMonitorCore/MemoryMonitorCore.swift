@@ -5127,6 +5127,57 @@ public enum MemoryMonitorStoragePaths {
         )
     }
 
+    /// Resolves a storage root for the paired isolated UI-check launch.
+    /// Unlike the general override resolver, this entry point only accepts a
+    /// canonical path below the caller's temporary directory or `/tmp`.
+    /// Returning `nil` lets the app fail closed when the fixture switch and
+    /// its storage root are not supplied together.
+    public static func isolatedRootURL(
+        environment: [String: String]
+    ) -> URL? {
+        guard let rawOverride = environment[overrideEnvironmentKey] else {
+            return nil
+        }
+        let trimmed = rawOverride.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed.hasPrefix("/"),
+              !trimmed.contains(where: { $0 == "\n" || $0 == "\r" }),
+              !trimmed.unicodeScalars.contains(where: { $0.value == 0 }) else {
+            return nil
+        }
+
+        let candidate = URL(fileURLWithPath: trimmed, isDirectory: true)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        guard candidate.isFileURL,
+              candidate.path.hasPrefix("/"),
+              candidate.path != "/" else {
+            return nil
+        }
+
+        let temporaryRoots = [environment["TMPDIR"], "/tmp"].compactMap { rawRoot -> String? in
+            guard let rawRoot else { return nil }
+            let trimmedRoot = rawRoot.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedRoot.isEmpty,
+                  trimmedRoot.hasPrefix("/"),
+                  !trimmedRoot.contains(where: { $0 == "\n" || $0 == "\r" }) else {
+                return nil
+            }
+            let root = URL(fileURLWithPath: trimmedRoot, isDirectory: true)
+                .resolvingSymlinksInPath()
+                .standardizedFileURL
+                .path
+            guard root != "/" else { return nil }
+            return root
+        }
+        guard temporaryRoots.contains(where: { root in
+            candidate.path.hasPrefix(root + "/") && candidate.path != root
+        }) else {
+            return nil
+        }
+        return candidate
+    }
+
     public static func historyFileURL(root: URL) -> URL {
         root.appendingPathComponent(historyFileName, isDirectory: false)
     }

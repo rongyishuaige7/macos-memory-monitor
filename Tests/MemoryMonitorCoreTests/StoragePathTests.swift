@@ -47,6 +47,41 @@ final class StoragePathTests: XCTestCase {
         )
     }
 
+    func testIsolatedRootRequiresACanonicalTemporaryBoundary() {
+        let environment = [
+            "TMPDIR": "/tmp",
+            MemoryMonitorStoragePaths.overrideEnvironmentKey:
+                "  /tmp/memory-monitor-ui-check/../paired  "
+        ]
+        let expected = URL(fileURLWithPath: "/tmp/paired", isDirectory: true)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+
+        XCTAssertEqual(
+            MemoryMonitorStoragePaths.isolatedRootURL(environment: environment),
+            expected
+        )
+
+        let invalidValues: [String?] = [
+            nil,
+            "",
+            "relative/path",
+            "/",
+            "/tmp",
+            "/tmpish/child",
+            "/tmp/../var/fallback",
+            "/tmp/memory-monitor\nui-check"
+        ]
+        for value in invalidValues {
+            var invalidEnvironment = environment
+            invalidEnvironment[MemoryMonitorStoragePaths.overrideEnvironmentKey] = value
+            XCTAssertNil(
+                MemoryMonitorStoragePaths.isolatedRootURL(environment: invalidEnvironment),
+                "isolated root should be rejected: \(String(describing: value))"
+            )
+        }
+    }
+
     func testInvalidOverridesFallBackWithoutRedirectingTheStore() {
         let fallback = URL(fileURLWithPath: "/var/fallback/MemoryMonitor", isDirectory: true)
         let invalidValues: [String?] = [

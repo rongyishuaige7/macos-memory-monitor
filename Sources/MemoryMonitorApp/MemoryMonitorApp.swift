@@ -66,6 +66,23 @@ struct MemoryMonitorApp: App {
     }
 }
 
+struct MemoryMonitorLaunchConfiguration: Equatable {
+    let usesUIFixture: Bool
+    let storageRoot: URL
+
+    static func resolve(environment: [String: String]) -> Self {
+        guard let isolatedRoot = MemoryMonitorUIFixture.isolatedStorageRootURL(
+            environment: environment
+        ) else {
+            return Self(
+                usesUIFixture: false,
+                storageRoot: MemoryMonitorStoragePaths.defaultRootURL
+            )
+        }
+        return Self(usesUIFixture: true, storageRoot: isolatedRoot)
+    }
+}
+
 @MainActor
 final class MemoryMonitorApplicationDelegate: NSObject, NSApplicationDelegate {
     let model: MonitorViewModel
@@ -78,7 +95,19 @@ final class MemoryMonitorApplicationDelegate: NSObject, NSApplicationDelegate {
     static func makeSamplingSource(
         environment: [String: String]
     ) -> any MonitorSamplingSource {
-        guard MemoryMonitorUIFixture.isEnabled(environment: environment) else {
+        makeSamplingSource(configuration: resolveLaunchConfiguration(environment: environment))
+    }
+
+    static func resolveLaunchConfiguration(
+        environment: [String: String]
+    ) -> MemoryMonitorLaunchConfiguration {
+        MemoryMonitorLaunchConfiguration.resolve(environment: environment)
+    }
+
+    private static func makeSamplingSource(
+        configuration: MemoryMonitorLaunchConfiguration
+    ) -> any MonitorSamplingSource {
+        guard configuration.usesUIFixture else {
             return MonitorSampler()
         }
         return MemoryMonitorUIFixtureSamplingSource(
@@ -86,14 +115,33 @@ final class MemoryMonitorApplicationDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
-    override convenience init() {
-        self.init(
-            model: MonitorViewModel(
-                sampler: Self.makeSamplingSource(
-                    environment: ProcessInfo.processInfo.environment
-                )
+    static func makeModel(
+        environment: [String: String],
+        startRefreshTask: Bool = true,
+        dateProvider: @escaping @MainActor () -> Date = { Date() }
+    ) -> MonitorViewModel {
+        let configuration = resolveLaunchConfiguration(environment: environment)
+        let historyStore = HistoryStore(
+            fileURL: MemoryMonitorStoragePaths.historyFileURL(
+                root: configuration.storageRoot
             )
         )
+        let auditStore = ProcessActionAuditStore(
+            fileURL: MemoryMonitorStoragePaths.auditFileURL(
+                root: configuration.storageRoot
+            )
+        )
+        return MonitorViewModel(
+            sampler: makeSamplingSource(configuration: configuration),
+            historyStore: historyStore,
+            processActions: ProcessActionController(auditStore: auditStore),
+            dateProvider: dateProvider,
+            startRefreshTask: startRefreshTask
+        )
+    }
+
+    override convenience init() {
+        self.init(model: Self.makeModel(environment: ProcessInfo.processInfo.environment))
     }
 
     init(

@@ -304,17 +304,118 @@ final class AppIntegrationTests: XCTestCase {
         )
         XCTAssertTrue(production is MonitorSampler)
 
+        let fixtureEnvironment = [
+            MemoryMonitorUIFixture.environmentKey: "1",
+            MemoryMonitorStoragePaths.overrideEnvironmentKey: "/tmp/memory-monitor-ui-check-paired"
+        ]
         let fixture = MemoryMonitorApplicationDelegate.makeSamplingSource(
-            environment: [MemoryMonitorUIFixture.environmentKey: "1"]
+            environment: fixtureEnvironment
         )
         XCTAssertTrue(fixture is MemoryMonitorUIFixtureSamplingSource)
 
         for value in ["", "0", "true", " 1 "] {
             let source = MemoryMonitorApplicationDelegate.makeSamplingSource(
-                environment: [MemoryMonitorUIFixture.environmentKey: value]
+                environment: [
+                    MemoryMonitorUIFixture.environmentKey: value,
+                    MemoryMonitorStoragePaths.overrideEnvironmentKey: "/tmp/memory-monitor-ui-check-paired"
+                ]
             )
             XCTAssertTrue(source is MonitorSampler, "unexpected source for \(value)")
         }
+
+        XCTAssertTrue(
+            MemoryMonitorApplicationDelegate.makeSamplingSource(
+                environment: [MemoryMonitorUIFixture.environmentKey: "1"]
+            ) is MonitorSampler
+        )
+        XCTAssertTrue(
+            MemoryMonitorApplicationDelegate.makeSamplingSource(
+                environment: [
+                    MemoryMonitorStoragePaths.overrideEnvironmentKey: "/tmp/memory-monitor-ui-check-paired"
+                ]
+            ) is MonitorSampler
+        )
+    }
+
+    func testLaunchConfigurationPairsFixtureAndStorageRoot() {
+        let storageKey = MemoryMonitorStoragePaths.overrideEnvironmentKey
+        let fixtureEnvironment = [
+            MemoryMonitorUIFixture.environmentKey: "1",
+            storageKey: "/tmp/memory-monitor-ui-check/../paired"
+        ]
+        let fixtureConfiguration = MemoryMonitorApplicationDelegate.resolveLaunchConfiguration(
+            environment: fixtureEnvironment
+        )
+        XCTAssertTrue(fixtureConfiguration.usesUIFixture)
+        XCTAssertEqual(
+            fixtureConfiguration.storageRoot,
+            URL(fileURLWithPath: "/tmp/paired", isDirectory: true)
+                .resolvingSymlinksInPath()
+                .standardizedFileURL
+        )
+
+        let fallbackRoot = MemoryMonitorStoragePaths.defaultRootURL
+        for environment in [
+            [:],
+            [MemoryMonitorUIFixture.environmentKey: "1"],
+            [storageKey: "/tmp/memory-monitor-ui-check/paired"],
+            [MemoryMonitorUIFixture.environmentKey: "1", storageKey: "/Users/example/production"]
+        ] {
+            let configuration = MemoryMonitorApplicationDelegate.resolveLaunchConfiguration(
+                environment: environment
+            )
+            XCTAssertFalse(configuration.usesUIFixture, "unexpected fixture mode: \(environment)")
+            XCTAssertEqual(configuration.storageRoot, fallbackRoot)
+        }
+    }
+
+    func testModelFactoryPersistsPairedFixtureIntoSelectedRoot() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MemoryMonitorLaunchConfiguration-" + UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let environment = [
+            MemoryMonitorUIFixture.environmentKey: "1",
+            MemoryMonitorStoragePaths.overrideEnvironmentKey: root.path,
+            "TMPDIR": FileManager.default.temporaryDirectory.path
+        ]
+        let configuration = MemoryMonitorApplicationDelegate.resolveLaunchConfiguration(
+            environment: environment
+        )
+        guard configuration.usesUIFixture else {
+            XCTFail("paired fixture test must resolve to an isolated UI fixture")
+            return
+        }
+        XCTAssertEqual(configuration.storageRoot, root.standardizedFileURL)
+        let referenceDate = Date(timeIntervalSince1970: 1_750_000_000)
+        let model = MemoryMonitorApplicationDelegate.makeModel(
+            environment: environment,
+            startRefreshTask: false,
+            dateProvider: { referenceDate }
+        )
+
+        await model.refreshOnce(at: referenceDate)
+        await model.shutdown()
+
+        let historyURL = MemoryMonitorStoragePaths.historyFileURL(root: root)
+        let auditURL = MemoryMonitorStoragePaths.auditFileURL(root: root)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: historyURL.path))
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: historyURL.path + ".clock")
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: auditURL.path))
+        let auditEvents = try await ProcessActionAuditStore(fileURL: auditURL).load(
+            now: referenceDate
+        )
+        XCTAssertTrue(auditEvents.isEmpty)
+        let reloaded = try await HistoryStore(fileURL: historyURL).load(now: referenceDate)
+        XCTAssertEqual(reloaded.count, 1)
+        XCTAssertEqual(reloaded.first?.sourceSampledAt, referenceDate)
     }
 
     func testUIFixtureSamplingSourceProvidesCompleteMultipleMemberSnapshot() async {

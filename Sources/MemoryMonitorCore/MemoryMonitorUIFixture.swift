@@ -110,6 +110,16 @@ public enum MemoryMonitorUIFixture {
         environment[environmentKey] == "1"
     }
 
+    /// Enables synthetic data only when the explicit switch is paired with a
+    /// canonical temporary storage root. A lone fixture flag must never make
+    /// a normal launch write synthetic samples into production storage.
+    public static func isolatedStorageRootURL(
+        environment: [String: String]
+    ) -> URL? {
+        guard isEnabled(environment: environment) else { return nil }
+        return MemoryMonitorStoragePaths.isolatedRootURL(environment: environment)
+    }
+
     public static func makeDataset(now: Date = Date()) -> Dataset {
         let referenceDate = alignedDate(now)
         let processes = makeProcesses(referenceDate: referenceDate)
