@@ -42,3 +42,53 @@
 2. **Core 规则**：实现 confstr 根解析、测试注入入口和路径回归矩阵。
 3. **端到端同步**：让 fixture writer 与 shell launcher 复用/对齐 Core 规则，验证正常和恶意环境。
 4. **验证交付**：运行全量门禁，更新本文档；真实详情 AX 检查仍在稳定登录桌面会话中单独进行。
+
+## 实施结果（2026-08-31）
+
+本阶段的代码已经落地，三条入口共享固定的系统临时根和完整组件边界契约：Core
+使用 `confstr(_CS_DARWIN_USER_TEMP_DIR)` 与 canonical `/tmp`，fixture writer
+复用 Core 解析后再执行创建前后的文件系统检查，launcher 使用
+`getconf DARWIN_USER_TEMP_DIR` 与相同的 `/tmp` 边界。调用方提供的 `TMPDIR`
+不会再成为信任锚点；它只可作为构建/fixture 子进程的临时环境，并且 launcher
+会把该环境收敛到已验证的系统根。Core 在值级解析时允许仍位于可信根内的
+symlink ancestor；writer 和 launcher 在实际创建目录前额外拒绝普通 symlink，
+只放行并复核 macOS `/tmp`、`/var` 系统别名。
+
+具体实现包括：
+
+- Core 增加测试注入的 trusted-root overload、完整组件边界比较、现存和悬空
+  symlink 的 canonical 解析，以及 Darwin `/tmp`、`/var` 别名兼容；Core 对指向
+  信任根外的目标拒绝，普通非系统 symlink 则由 fixture/launcher 的创建前检查
+  拒绝。
+- fixture writer 对输入执行首尾空白规范化、内部换行/NUL 拒绝、空目录和
+  `0700/0600` 权限检查，并在 `mkdir` 后再次确认最终路径没有被替换。
+- launcher 保留 lexical 与 canonical 两种路径表示，拒绝项目树、根目录、前缀
+  碰撞、最终或祖先普通 symlink、悬空 symlink 前缀和并发替换；还显式预检
+  `chmod` 等运行时依赖，避免在路径创建后才出现命令缺失。
+
+## 验证证据
+
+- `swift test --filter StoragePathTests`：10/10 通过。
+- `swift test --filter MemoryMonitorUIFixtureTests`：7/7 通过。
+- `swift test --parallel`：279/279 通过。
+- `swift build --configuration debug -Xswiftc -strict-concurrency=complete` 和
+  `swift build --configuration release -Xswiftc -strict-concurrency=complete`：通过。
+- Release fixture writer 正常临时根生成 240 条 history、239 条 journal 增量和
+  12 条 audit；项目目录、普通 symlink 祖先和非系统持久目录均 fail closed。
+- `./scripts/verify-release.sh`：通过；本次 Release probe 为 `456/648`（部分可用），
+  兼容性报告为 schema `1`、macOS `26.5.1`、arm64，App 版本 `1.0.3`、build `13`，
+  bundle 的 `codesign --verify --deep --strict` 通过。
+- launcher 在 `/tmp` 下、调用者 `TMPDIR` 指向项目且参数带首尾空白的空目录上完成了
+  fixture、bundle、Launch Services 及环境继承检查；验证启动的专用 PID 已按精确
+  可执行路径收尾，未向其他实例发送信号，也未执行 AX 点击。
+- `zsh -n scripts/launch-ui-check.sh` 与 `git diff --check`：通过；本轮所有临时
+  fixture、bundle 和专用进程均已清理，正式存储和未跟踪用户文件未触碰。
+
+## 当前缺口与下一阶段
+
+- 真实详情页的桌面 AX 验收（多成员、长审计文本、顶部/末端滚动和关闭入口）
+  仍需在稳定登录桌面会话中只读完成；无头测试不宣称这部分通过。
+- 路径检查仍明确不承诺消除文件系统 TOCTOU；launcher 和 writer 的创建前后复核
+  只降低竞态窗口。跨 macOS 14/15 CI 尚未运行 Launch Services fixture。
+- 下一阶段优先收集真实 fixture 详情页的 AX 证据，随后评估登录启动、Developer ID
+  签名/notarization 与 App Sandbox 的发布策略；在此之前保持登录项和权限状态不变。
