@@ -2161,6 +2161,7 @@ final class AppIntegrationTests: XCTestCase {
             processStatus: .available(at: observedAt),
             samplingDiagnostics: completeDiagnostics,
             retainedItemCount: 800,
+            targetPresent: true,
             observedAt: observedAt
         )
 
@@ -2177,6 +2178,7 @@ final class AppIntegrationTests: XCTestCase {
                 listed: 800
             ),
             retainedItemCount: 600,
+            targetPresent: true,
             observedAt: observedAt
         )
 
@@ -2193,6 +2195,7 @@ final class AppIntegrationTests: XCTestCase {
                 listed: 0
             ),
             retainedItemCount: 0,
+            targetPresent: true,
             observedAt: nil
         )
 
@@ -2213,6 +2216,7 @@ final class AppIntegrationTests: XCTestCase {
                 listed: 0
             ),
             retainedItemCount: 24,
+            targetPresent: true,
             observedAt: observedAt,
             lastSuccessfulSampledAt: previousSampleAt
         )
@@ -2229,6 +2233,7 @@ final class AppIntegrationTests: XCTestCase {
                 listed: 100
             ),
             retainedItemCount: 24,
+            targetPresent: true,
             observedAt: observedAt,
             lastSuccessfulSampledAt: previousSampleAt
         )
@@ -2250,6 +2255,7 @@ final class AppIntegrationTests: XCTestCase {
                 listed: 0
             ),
             retainedItemCount: 24,
+            targetPresent: true,
             observedAt: observedAt,
             lastSuccessfulSampledAt: previousSampleAt
         )
@@ -2267,6 +2273,7 @@ final class AppIntegrationTests: XCTestCase {
                 listed: 0
             ),
             retainedItemCount: 0,
+            targetPresent: true,
             observedAt: observedAt
         )
         XCTAssertEqual(unavailable.kind, .unavailable)
@@ -2281,6 +2288,7 @@ final class AppIntegrationTests: XCTestCase {
                 listed: 800
             ),
             retainedItemCount: 24,
+            targetPresent: true,
             observedAt: observedAt,
             lastSuccessfulSampledAt: previousSampleAt
         )
@@ -2288,6 +2296,51 @@ final class AppIntegrationTests: XCTestCase {
         XCTAssertEqual(invalid.kind, .retained)
         XCTAssertEqual(invalid.retentionReason, .invalidTimestamp)
         XCTAssertEqual(invalid.sampledAt, previousSampleAt)
+    }
+
+    func testMonitorDetailDataStatusMarksMissingTargetBeforeGlobalFreshness() {
+        let previousSampleAt = Date(timeIntervalSince1970: 20_000)
+        let observedAt = previousSampleAt.addingTimeInterval(30)
+
+        let targetUnavailable = MonitorDetailDataStatus.resolve(
+            processStatus: .available(at: observedAt),
+            samplingDiagnostics: makeDetailDiagnostics(
+                performed: true,
+                sampled: 800,
+                listed: 800
+            ),
+            retainedItemCount: 24,
+            targetPresent: false,
+            observedAt: observedAt,
+            lastSuccessfulSampledAt: previousSampleAt
+        )
+
+        XCTAssertEqual(targetUnavailable.kind, .retained)
+        XCTAssertEqual(targetUnavailable.retentionReason, .targetUnavailable)
+        XCTAssertTrue(targetUnavailable.hasRetainedData)
+        XCTAssertEqual(targetUnavailable.sampledAt, previousSampleAt)
+        XCTAssertNotEqual(targetUnavailable.kind, .current)
+        XCTAssertNotEqual(targetUnavailable.kind, .partial)
+
+        let targetUnavailableWithoutRows = MonitorDetailDataStatus.resolve(
+            processStatus: .estimated(at: observedAt),
+            samplingDiagnostics: makeDetailDiagnostics(
+                performed: true,
+                sampled: 600,
+                listed: 800
+            ),
+            retainedItemCount: 0,
+            targetPresent: false,
+            observedAt: observedAt
+        )
+
+        XCTAssertEqual(targetUnavailableWithoutRows.kind, .unavailable)
+        XCTAssertEqual(
+            targetUnavailableWithoutRows.retentionReason,
+            .targetUnavailable
+        )
+        XCTAssertFalse(targetUnavailableWithoutRows.hasRetainedData)
+        XCTAssertNil(targetUnavailableWithoutRows.sampledAt)
     }
 
     func testDetailLayoutPolicySwitchesInfoRowsAtTheValueWidthBoundary() {

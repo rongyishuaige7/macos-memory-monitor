@@ -20,6 +20,7 @@ struct MonitorDetailDataStatus: Equatable, Sendable {
         case insufficientCoverage
         case expired
         case invalidTimestamp
+        case targetUnavailable
     }
 
     /// Keep this aligned with the process freshness window used by the
@@ -66,6 +67,7 @@ struct MonitorDetailDataStatus: Equatable, Sendable {
         processStatus: SampleStatus,
         samplingDiagnostics: SamplingDiagnostics,
         retainedItemCount: Int,
+        targetPresent: Bool,
         observedAt: Date?,
         lastSuccessfulSampledAt: Date? = nil
     ) -> MonitorDetailDataStatus {
@@ -101,6 +103,25 @@ struct MonitorDetailDataStatus: Equatable, Sendable {
                 sampledItemCount: sampledCount,
                 listedItemCount: listedCount,
                 message: message
+            )
+        }
+
+        // A detail window can outlive the row that opened it. Resolve the
+        // target boundary before sampling quality so a healthy global pass
+        // cannot describe a missing process or workload as current.
+        guard targetPresent else {
+            if retainedCount > 0 {
+                return make(
+                    kind: .retained,
+                    reason: .targetUnavailable,
+                    message: nil
+                )
+            }
+            return make(
+                kind: .unavailable,
+                reason: .targetUnavailable,
+                sampledAt: nil,
+                message: nil
             )
         }
 

@@ -486,11 +486,15 @@ final class MonitorViewModel: ObservableObject {
         }
     }
 
-    func detailDataStatus(retainedItemCount: Int) -> MonitorDetailDataStatus {
+    func detailDataStatus(
+        retainedItemCount: Int,
+        targetPresent: Bool
+    ) -> MonitorDetailDataStatus {
         MonitorDetailDataStatus.resolve(
             processStatus: processStatus,
             samplingDiagnostics: samplingDiagnostics,
             retainedItemCount: retainedItemCount,
+            targetPresent: targetPresent,
             observedAt: updatedAt,
             lastSuccessfulSampledAt: lastUsableProcessSampleAt
         )
@@ -2236,11 +2240,15 @@ private struct MonitorDetailDataStatusView: View {
         case .partial:
             return "当前采样部分可用"
         case .retained:
-            return "显示上次成功采样"
+            return status.retentionReason == .targetUnavailable
+                ? "详情目标已离开当前快照"
+                : "显示上次成功采样"
         case .failed:
             return "本轮进程采样失败"
         case .unavailable:
-            return "暂无可用进程快照"
+            return status.retentionReason == .targetUnavailable
+                ? "详情目标不在当前快照"
+                : "暂无可用进程快照"
         }
     }
 
@@ -2263,6 +2271,8 @@ private struct MonitorDetailDataStatusView: View {
                 reason = "当前采样已过期"
             case .invalidTimestamp, .none:
                 reason = "当前采样时间无法确认"
+            case .targetUnavailable:
+                return "最新快照中没有这个详情目标；当前列表仍有其他条目，无法确认目标此刻状态。"
             }
             return "\(reason)；显示上次成功快照\(ageText)，仅供观察，不代表此刻进程状态。"
         case .failed:
@@ -2274,6 +2284,9 @@ private struct MonitorDetailDataStatusView: View {
             }
             return "\(failure)；当前没有可用进程快照。"
         case .unavailable:
+            if status.retentionReason == .targetUnavailable {
+                return "最新快照中没有这个详情目标；当前没有可用于该详情的进程数据。"
+            }
             let unavailable = status.message?.isEmpty == false
                 ? status.message!
                 : "本轮没有可用进程数据"
@@ -2338,7 +2351,10 @@ private struct ProcessDetailView: View {
     @State private var showForceConfirmation = false
 
     private var dataStatus: MonitorDetailDataStatus {
-        model.detailDataStatus(retainedItemCount: model.processes.count)
+        model.detailDataStatus(
+            retainedItemCount: model.processes.count,
+            targetPresent: model.process(for: identity) != nil
+        )
     }
 
     var body: some View {
@@ -2568,7 +2584,7 @@ private struct ProcessDetailView: View {
     private var recentActionSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("最近操作记录")
+                Text("最近操作记录（全局）")
                     .font(.caption.weight(.medium))
                 Spacer()
                 if let error = actions.auditError {
@@ -2578,6 +2594,10 @@ private struct ProcessDetailView: View {
                         .help(error)
                 }
             }
+            Text("这里显示应用最近确认的全局操作记录。审计日志不保存 PID、启动时间或路径，无法按当前进程精确筛选。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             if actions.recentEvents.isEmpty {
                 Text("暂无已确认的操作记录")
                     .font(.caption2)
@@ -2642,7 +2662,10 @@ private struct WorkloadGroupDetailView: View {
     @Environment(\.dismiss) private var dismiss
 
     private var dataStatus: MonitorDetailDataStatus {
-        model.detailDataStatus(retainedItemCount: model.groups.count)
+        model.detailDataStatus(
+            retainedItemCount: model.groups.count,
+            targetPresent: model.group(for: groupID) != nil
+        )
     }
 
     private var group: WorkloadGroupSnapshot? {
