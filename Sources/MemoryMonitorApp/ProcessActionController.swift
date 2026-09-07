@@ -394,32 +394,32 @@ final class ProcessActionController: ObservableObject {
         switch state {
         case .requestingGraceful(let target) where target == identity:
             return ProcessActionStatus(
-                message: "正在重新验证进程身份…",
+                message: "正在准备退出…",
                 tone: .neutral
             )
         case .waitingForGraceful(let target, _ ) where target == identity:
             return ProcessActionStatus(
-                message: "已请求优雅退出，等待进程结束（最长 \(gracefulTimeoutDisplaySeconds) 秒）…",
+                message: "退出请求已发送，等待关闭（最多 \(gracefulTimeoutDisplaySeconds) 秒）…",
                 tone: .neutral
             )
         case .timedOut(let target) where target == identity:
             return ProcessActionStatus(
-                message: "优雅退出等待超时；只有确认没有未保存工作时才应强制结束。",
+                message: "进程没有响应。确认工作已保存后，可选择强制结束。",
                 tone: .warning
             )
         case .forceTerminating(let target) where target == identity:
             return ProcessActionStatus(
-                message: "正在重新验证并发送强制结束请求…",
+                message: "正在强制结束…",
                 tone: .warning
             )
         case .verifyingForce(let target) where target == identity:
             return ProcessActionStatus(
-                message: "强制结束请求已发送，正在确认进程是否结束…",
+                message: "强制结束请求已发送，等待关闭…",
                 tone: .warning
             )
         case .completed(let target, let action, let message) where target == identity:
             return ProcessActionStatus(
-                message: "\(action.displayName)：\(message)",
+                message: "\(action == .gracefulExit ? "退出进程" : "强制结束")：\(message)",
                 tone: .success
             )
         case .denied(let target, let message) where target == nil || target == identity:

@@ -1640,552 +1640,206 @@ private enum MonitorViewMode: String, CaseIterable, Identifiable {
     }
 }
 
-private struct MonitorPopover: View {
+struct MonitorPopover: View {
     @ObservedObject var model: MonitorViewModel
-    /// Process actions publish independently from monitor sampling. Observe
-    /// the controller here so audit failures immediately affect the health
-    /// indicator in the popover.
     @ObservedObject var processActions: ProcessActionController
-    /// Login-item state is published by its own coordinator and is not
-    /// forwarded through `MonitorViewModel`. Observe the coordinator at the
-    /// popover boundary so the health icon follows external changes.
     @ObservedObject var loginLaunch: LoginLaunchCoordinator
     let terminationAction: ApplicationTerminationAction
-    private let layout = MonitorPopoverLayoutPolicy.default
-    @State private var listMode: MonitorListMode = .processes
-    @State private var viewMode: MonitorViewMode = .live
-    @State private var processScope: ProcessScope = .all
-    @State private var processSortMode: ProcessSortMode = .footprint
     @State private var searchText = ""
-    @State private var detailSelection: MonitorDetailSelection?
-    @State private var showHealthPanel = false
-    @State private var showAuditPanel = false
+    @State private var showSystemProcesses = false
+    @State private var selectedProcess: ProcessIdentity?
+    @State private var showSettings = false
+    @State private var showAudit = false
+
+    private var visibleProcesses: [ProcessSnapshot] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return model.processes.filter { process in
+            let isSystem = process.isSystem || process.userID == 0
+            guard showSystemProcesses || !isSystem else { return false }
+            return query.isEmpty || [
+                process.name, process.applicationName, process.workingDirectoryLabel
+            ].compactMap { $0 }.contains { $0.localizedCaseInsensitiveContains(query) }
+        }.sorted(by: ProcessSnapshot.memoryDescending)
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            header
-            Picker("视图", selection: $viewMode) {
-                ForEach(MonitorViewMode.allCases) { mode in
-                    Text(mode.title).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-
-            MonitorPopoverContentScroll(layout: layout) {
-                switch viewMode {
-                case .live:
-                    liveContent
-                case .history:
-                    HistoryPanel(model: model)
-                }
-            }
-
-            footer
-                .accessibilityIdentifier("monitor-popover-footer")
-        }
-        .padding(16)
-        .frame(
-            width: CGFloat(layout.width),
-            alignment: .topLeading
-        )
-        .sheet(item: $detailSelection) { selection in
-            switch selection {
-            case .process(let identity):
-                ProcessDetailView(
-                    model: model,
-                    actions: processActions,
-                    identity: identity
-                )
-            case .group(let groupID):
-                WorkloadGroupDetailView(model: model, groupID: groupID)
-            }
-        }
-        .sheet(isPresented: $showHealthPanel) {
-            MonitorHealthPanel(
-                model: model,
-                processActions: processActions,
-                loginLaunch: loginLaunch
-            )
-        }
-        .sheet(isPresented: $showAuditPanel) {
-            OperationsAuditPanel(actions: processActions)
-        }
-        .onAppear {
-            loginLaunch.refreshStatus()
-        }
-        .onReceive(
-            NotificationCenter.default.publisher(
-                for: NSApplication.didBecomeActiveNotification
-            )
-        ) { _ in
-            loginLaunch.refreshStatus()
-        }
-    }
-
-    @ViewBuilder
-    private var liveContent: some View {
-        metrics
-        recommendationCard
-        samplingNotice
-        processList
-    }
-
-    private var header: some View {
-        let overall = healthOverall
-        return HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Memory Monitor")
-                    .font(.system(size: 18, weight: .semibold))
-                Text("全量进程观察 · \(model.processObservationDescription)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(model.pressure.color)
-                        .frame(width: 8, height: 8)
-                    Text(model.systemDataIsUsable ? model.pressure.title : "采集受限")
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(model.pressure.color)
-                }
-            }
-            Spacer()
-            HStack(spacing: 8) {
-                Button {
-                    showHealthPanel = true
-                } label: {
-                    Image(systemName: overall.iconName)
-                        .foregroundStyle(healthLevelColor(overall))
-                }
-                .buttonStyle(.borderless)
-                .help("运行健康与权限诊断")
-                .accessibilityLabel("运行健康与权限诊断")
-
-                Button {
-                    showAuditPanel = true
-                } label: {
-                    Image(systemName: "doc.text.magnifyingglass")
-                }
-                .buttonStyle(.borderless)
-                .help("查看操作审计")
-                .accessibilityLabel("查看操作审计")
-
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text("内存")
+                    .font(.system(size: 16, weight: .semibold))
+                Spacer()
                 Menu {
-                    Button(role: .destructive) {
-                        terminationAction()
-                    } label: {
-                        Label("退出 Memory Monitor", systemImage: "power")
-                    }
+                    Toggle("显示系统进程", isOn: $showSystemProcesses)
+                    Divider()
+                    Button("设置", systemImage: "gearshape") { showSettings = true }
+                    Button("操作记录", systemImage: "clock.arrow.circlepath") { showAudit = true }
                 } label: {
-                    Image(systemName: "ellipsis.circle")
+                    Image(systemName: "ellipsis")
+                        .frame(width: 28, height: 28)
                 }
                 .menuStyle(.borderlessButton)
-                .help("更多操作")
-                .accessibilityLabel("更多操作")
-
-                if let updatedAt = model.updatedAt {
-                    Text(updatedAt, style: .time)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                .fixedSize()
+                .help("更多选项")
+                .accessibilityLabel("更多选项")
             }
-        }
-    }
-
-    private var healthOverall: MonitorHealthLevel {
-        // Touch the nested observable explicitly so SwiftUI subscribes to its
-        // objectWillChange stream while evaluating the computed health state.
-        _ = processActions.auditError
-        _ = loginLaunch.status
-        _ = loginLaunch.lastError
-        return model.healthSnapshot.overall
-    }
-
-    @ViewBuilder
-    private var recommendationCard: some View {
-        if let recommendation = model.recommendation {
-            VStack(alignment: .leading, spacing: 5) {
-                HStack(spacing: 6) {
-                    Image(systemName: recommendationIcon(recommendation.severity))
-                        .imageScale(.small)
-                        .foregroundStyle(recommendationColor(recommendation.severity))
-                    Text(recommendation.title)
-                        .font(.subheadline.weight(.medium))
-                        .lineLimit(1)
-                    Spacer(minLength: 4)
-                    Text(recommendation.severity.displayName)
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(recommendationColor(recommendation.severity))
-                }
-                Text(recommendation.detail)
-                    .font(.caption)
-                    .foregroundStyle(.primary)
-                    .fixedSize(horizontal: false, vertical: true)
-                if !recommendation.evidence.isEmpty {
-                    Text(recommendation.evidence.prefix(3).map { "\($0.label) \($0.value)" }.joined(separator: " · "))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                }
-                HStack(spacing: 4) {
-                    Text("置信度 \(recommendation.confidencePercent)% · 只读建议")
-                    Spacer(minLength: 6)
-                    Text(recommendation.lastConfirmedAt, style: .relative)
-                    Text("前确认")
-                }
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            }
-            .padding(9)
-            .background(
-                recommendationColor(recommendation.severity).opacity(0.10),
-                in: RoundedRectangle(cornerRadius: 7)
-            )
-        }
-    }
-
-    private var metrics: some View {
-        HStack(spacing: 8) {
-            MetricTile(
-                title: "CPU",
-                fraction: model.cpuUsageFraction,
-                status: model.cpuStatus
-            )
-            MetricTile(
-                title: "内存",
-                fraction: model.systemDataIsUsable ? model.system?.usedFraction : nil,
-                status: model.systemStatus
-            )
-            MetricTile(
-                title: "GPU",
-                fraction: model.gpuUsageFraction,
-                status: model.gpuStatus
-            )
-        }
-    }
-
-    private var processList: some View {
-        VStack(alignment: .leading, spacing: 7) {
+            memorySummary
+            Divider()
             HStack {
                 Text("内存占用")
-                    .font(.headline)
+                    .font(.subheadline.weight(.semibold))
                 Spacer()
-                Text(sortSummary)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Picker("显示", selection: $listMode) {
-                ForEach(MonitorListMode.allCases) { mode in
-                    Text(mode.title).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-
-            HStack(spacing: 6) {
-                TextField("搜索进程或工作组", text: $searchText)
+                TextField("搜索", text: $searchText)
                     .textFieldStyle(.roundedBorder)
-                    .font(.caption)
-                Menu {
-                    Picker("范围", selection: $processScope) {
-                        ForEach(ProcessScope.allCases) { scope in
-                            Text(scope.title).tag(scope)
-                        }
-                    }
-                    Picker("排序", selection: $processSortMode) {
-                        ForEach(ProcessSortMode.allCases) { mode in
-                            Text(mode.title).tag(mode)
-                        }
-                    }
-                } label: {
-                    Image(systemName: "line.3.horizontal.decrease.circle")
-                        .imageScale(.medium)
-                }
-                .menuStyle(.borderlessButton)
-                .help("筛选与排序")
-                .accessibilityLabel("筛选与排序")
+                    .frame(width: 150)
+                    .accessibilityLabel("搜索进程")
             }
-
-            switch listMode {
-            case .processes:
-                processRanking
-            case .groups:
-                groupRanking
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var samplingNotice: some View {
-        if let notice = model.samplingNoticeDescription {
-            HStack(spacing: 6) {
-                Image(systemName: model.samplingIssueDescription == nil
-                    ? "info.circle"
-                    : "exclamationmark.triangle")
-                    .imageScale(.small)
+            if let notice = SimpleMonitorPresentation.listNotice(
+                status: model.detailDataStatus(
+                    retainedItemCount: model.processes.count,
+                    targetPresent: !model.processes.isEmpty
+                )
+            ) {
                 Text(notice)
-                    .font(.caption2)
-                    .foregroundStyle(
-                        model.samplingIssueDescription == nil ? Color.secondary : Color.orange
-                    )
-                    .fixedSize(horizontal: false, vertical: true)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("monitor-data-notice")
             }
-        }
-    }
-
-    private var normalizedSearchText: String {
-        searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    }
-
-    private var hasActiveListFilter: Bool {
-        !normalizedSearchText.isEmpty || processScope != .all
-    }
-
-    private func emptyState(
-        visibleItemCount: Int,
-        retainedItemCount: Int
-    ) -> MonitorListEmptyState? {
-        MonitorListEmptyState.resolve(
-            visibleItemCount: visibleItemCount,
-            hasActiveFilter: hasActiveListFilter,
-            samplingPerformed: model.samplingDiagnostics.processSamplingPerformed,
-            retainedItemCount: retainedItemCount,
-            quality: model.processStatus.quality,
-            message: model.processStatus.message
-        )
-    }
-
-    private var sortSummary: String {
-        switch (listMode, processSortMode) {
-        case (.processes, .footprint): return "footprint 降序"
-        case (.processes, .resident): return "RSS 降序"
-        case (.groups, .footprint): return "归因总量 · footprint"
-        case (.groups, .resident): return "归因总量 · RSS"
-        }
-    }
-
-    private func matchesSearch(_ process: ProcessSnapshot) -> Bool {
-        guard !normalizedSearchText.isEmpty else { return true }
-        let fields = [
-            process.name,
-            process.applicationName,
-            process.bundleIdentifier,
-            process.workingDirectoryLabel
-        ].compactMap { $0?.lowercased() }
-        return fields.contains { $0.contains(normalizedSearchText) }
-    }
-
-    private var sortedProcesses: [ProcessSnapshot] {
-        let filtered = model.processes.filter { process in
-            switch processScope {
-            case .all: return true
-            case .user: return !process.isSystem
-            case .system: return process.isSystem
-            }
-        }.filter { process in
-            matchesSearch(process)
-        }
-
-        switch processSortMode {
-        case .footprint:
-            return filtered.sorted(by: ProcessSnapshot.memoryDescending)
-        case .resident:
-            return filtered.sorted {
-                if $0.residentBytes != $1.residentBytes {
-                    return $0.residentBytes > $1.residentBytes
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    if visibleProcesses.isEmpty {
+                        Text(searchText.isEmpty ? "暂时没有可显示的进程" : "没有搜索结果")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, minHeight: 120)
+                    }
+                    ForEach(visibleProcesses) { process in
+                        Button {
+                            selectedProcess = process.identity
+                        } label: {
+                            SimpleProcessRow(process: process)
+                        }
+                        .buttonStyle(.plain)
+                        Divider()
+                    }
                 }
-                if $0.physicalFootprintBytes != $1.physicalFootprintBytes {
-                    return $0.physicalFootprintBytes > $1.physicalFootprintBytes
-                }
-                return $0.identity.pid < $1.identity.pid
             }
-        }
-    }
-
-    private var processStatusText: String {
-        if let state = emptyState(
-            visibleItemCount: sortedProcesses.count,
-            retainedItemCount: model.processes.count
-        ) {
-            return state.shortStatus
-        }
-        if !model.samplingDiagnostics.processSamplingPerformed {
-            return sortedProcesses.isEmpty ? "等待首次进程采样" : "上次采样"
-        }
-        switch model.processStatus.quality {
-        case .available:
-            return "共 \(sortedProcesses.count) 个"
-        case .estimated:
-            return "\(sortedProcesses.count) 个 · 部分可用"
-        case .unavailable, .error:
-            return sortedProcesses.isEmpty ? model.processStatus.quality.displayName : "上次数据"
-        }
-    }
-
-    private var processRanking: some View {
-        VStack(alignment: .leading, spacing: 5) {
+            .frame(height: 290)
+            .accessibilityIdentifier("monitor-popover-content")
+            Divider()
             HStack {
-                Text(processSortMode == .footprint ? "按单个进程 footprint 从大到小排列" : "按单个进程 RSS 从大到小排列")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                if processActions.auditError != nil {
+                    Button("操作记录暂时不可用") { showAudit = true }
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .buttonStyle(.plain)
+                } else {
+                    Button {
+                        showSettings = true
+                    } label: {
+                        Image(systemName: "gearshape")
+                            .frame(width: 28, height: 28)
+                    }
+                    .buttonStyle(.plain)
+                    .help("设置")
+                    .accessibilityLabel("设置")
+                }
                 Spacer()
-                Text(processStatusText)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-
-            if let state = emptyState(
-                visibleItemCount: sortedProcesses.count,
-                retainedItemCount: model.processes.count
-            ) {
-                MonitorListEmptyStateView(state: state)
-                    .frame(maxWidth: .infinity, minHeight: 112, maxHeight: 150, alignment: .topLeading)
-            } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(Array(sortedProcesses.enumerated()), id: \.element.id) { index, process in
-                            Button {
-                                detailSelection = .process(process.identity)
-                            } label: {
-                                ProcessRow(rank: index + 1, process: process)
-                            }
-                            .buttonStyle(.plain)
-                            if index < sortedProcesses.count - 1 {
-                                Divider()
-                            }
-                        }
-                    }
-                }
-                .frame(minHeight: 112, maxHeight: 230)
-            }
-        }
-    }
-
-    private var sortedGroups: [WorkloadGroupSnapshot] {
-        model.groups.filter { group in
-            let scopeMatches: Bool
-            switch processScope {
-            case .all: scopeMatches = true
-            case .user: scopeMatches = !group.isSystem
-            case .system: scopeMatches = group.isSystem
-            }
-            guard scopeMatches, !normalizedSearchText.isEmpty else { return scopeMatches }
-            let groupFieldsMatch = [group.title, group.id, group.representativeProcess]
-                .contains { $0.lowercased().contains(normalizedSearchText) }
-            return groupFieldsMatch || model.processes(in: group).contains { process in
-                matchesSearch(process)
-            }
-        }.sorted {
-            let leftValue: UInt64
-            let rightValue: UInt64
-            switch processSortMode {
-            case .footprint:
-                leftValue = $0.attributedFootprintBytes
-                rightValue = $1.attributedFootprintBytes
-            case .resident:
-                leftValue = $0.attributedResidentBytes
-                rightValue = $1.attributedResidentBytes
-            }
-            if $0.containsEstimatedFootprint != $1.containsEstimatedFootprint {
-                return !$0.containsEstimatedFootprint
-            }
-            if leftValue != rightValue {
-                return leftValue > rightValue
-            }
-            if $0.isSystem != $1.isSystem {
-                return !$0.isSystem
-            }
-            return $0.id < $1.id
-        }
-    }
-
-    private var groupRanking: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("组内数值为 footprint/RSS 相加的归因总量，当前按 \(processSortMode == .footprint ? "footprint" : "RSS") 降序。")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                Spacer(minLength: 4)
-                Text(groupStatusText)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-
-            if let state = emptyState(
-                visibleItemCount: sortedGroups.count,
-                retainedItemCount: model.groups.count
-            ) {
-                MonitorListEmptyStateView(state: state)
-                    .frame(maxWidth: .infinity, minHeight: 112, maxHeight: 150, alignment: .topLeading)
-            } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 8) {
-                        ForEach(sortedGroups) { group in
-                            Button {
-                                detailSelection = .group(group.id)
-                            } label: {
-                                WorkloadGroupRow(group: group)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                }
-                .frame(minHeight: 112, maxHeight: 230)
-            }
-        }
-    }
-
-    private var groupStatusText: String {
-        if let state = emptyState(
-            visibleItemCount: sortedGroups.count,
-            retainedItemCount: model.groups.count
-        ) {
-            return state.shortStatus
-        }
-        switch model.processStatus.quality {
-        case .available:
-            return "共 \(sortedGroups.count) 组"
-        case .estimated:
-            return "共 \(sortedGroups.count) 组 · 部分可用"
-        case .unavailable, .error:
-            return "上次数据"
-        }
-    }
-
-    private var footer: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                Text("本地监视 · 操作需确认 · \(model.samplingCadenceDescription)")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                Spacer(minLength: 4)
-                Text("Apple Silicon")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: true, vertical: false)
-            }
-
-            HStack(spacing: 6) {
-                Text(model.samplingDiagnosticsDescription)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                Spacer(minLength: 4)
-                Button(role: .destructive) {
+                Button {
                     terminationAction()
                 } label: {
                     Label("退出", systemImage: "power")
                 }
-                .buttonStyle(.borderless)
+                .buttonStyle(.plain)
                 .help("退出 Memory Monitor")
                 .accessibilityLabel("退出 Memory Monitor")
             }
+            .accessibilityIdentifier("monitor-popover-footer")
         }
+        .padding(18)
+        .frame(width: 380)
+        .sheet(isPresented: Binding(
+            get: { selectedProcess != nil },
+            set: { if !$0 { selectedProcess = nil } }
+        )) {
+            if let identity = selectedProcess {
+                ProcessDetailView(model: model, actions: processActions, identity: identity)
+            }
+        }
+        .sheet(isPresented: $showSettings) {
+            MonitorHealthPanel(model: model, processActions: processActions, loginLaunch: loginLaunch)
+        }
+        .sheet(isPresented: $showAudit) {
+            OperationsAuditPanel(actions: processActions)
+        }
+        .onAppear { loginLaunch.refreshStatus() }
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didBecomeActiveNotification
+        )) { _ in
+            loginLaunch.refreshStatus()
+        }
+    }
+
+    private var memorySummary: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(model.systemDataIsUsable
+                    ? model.system.map { "\(Int($0.usedFraction * 100))%" } ?? "--"
+                    : "--")
+                    .font(.system(size: 32, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                Spacer()
+                Text(SimpleMonitorPresentation.pressureTitle(
+                    usable: model.systemDataIsUsable,
+                    level: model.pressureLevel
+                ))
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(model.pressure.color)
+            }
+            ProgressView(value: model.systemDataIsUsable ? model.system?.usedFraction ?? 0 : 0)
+                .tint(model.pressure.color)
+                .accessibilityLabel("内存使用率")
+            if model.systemDataIsUsable, let system = model.system {
+                Text("约用 \(SimpleMonitorPresentation.memory(system.usedEstimateBytes)) / 共 \(SimpleMonitorPresentation.memory(system.totalBytes))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+struct SimpleProcessRow: View {
+    let process: ProcessSnapshot
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: process.isSystem || process.userID == 0 ? "gearshape" : "app.fill")
+                .font(.system(size: 16))
+                .foregroundStyle(.secondary)
+                .frame(width: 28, height: 28)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(process.applicationName ?? processDisplayName(process))
+                    .font(.system(size: 13, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if let label = process.workingDirectoryLabel {
+                    Text(label)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: 8)
+            Text((process.physicalFootprintIsEstimated ? "约 " : "")
+                + SimpleMonitorPresentation.memory(process.physicalFootprintBytes))
+                .font(.system(size: 13, weight: .medium))
+                .monospacedDigit()
+                .fixedSize()
+            Image(systemName: "chevron.right")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.tertiary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 48)
+        .contentShape(Rectangle())
     }
 }
 
@@ -2367,7 +2021,7 @@ private struct MonitorDetailDataStatusView: View {
     }
 }
 
-private struct ProcessDetailView: View {
+struct ProcessDetailView: View {
     @ObservedObject var model: MonitorViewModel
     @ObservedObject var actions: ProcessActionController
     let identity: ProcessIdentity
@@ -2383,301 +2037,129 @@ private struct ProcessDetailView: View {
     }
 
     var body: some View {
-        Group {
-            if let process = model.process(for: identity) {
-                processContent(process)
-            } else {
-                processGoneContent
-            }
-        }
-        .frame(minWidth: 500, idealWidth: 540, minHeight: 560, idealHeight: 650)
-        .toolbar {
-            ToolbarItem(placement: .confirmationAction) {
-                Button {
-                    dismiss()
-                } label: {
+        VStack(alignment: .leading, spacing: 20) {
+            HStack(alignment: .top) {
+                Text(model.process(for: identity).map {
+                    $0.applicationName ?? processDisplayName($0)
+                } ?? "进程已不可用")
+                    .font(.system(size: 18, weight: .semibold))
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 12)
+                Button { dismiss() } label: {
                     Image(systemName: "xmark")
+                        .frame(width: 28, height: 28)
                 }
+                .buttonStyle(.plain)
                 .help("关闭")
                 .accessibilityLabel("关闭进程详情")
             }
-        }
-    }
-
-    private func processContent(_ process: ProcessSnapshot) -> some View {
-        AdaptiveDetailScrollView(minimumContentWidth: 460) {
-            VStack(alignment: .leading, spacing: 16) {
-                processHeader(process)
-                MonitorDetailDataStatusView(status: dataStatus)
-                processMetrics(process)
-                identitySection(process)
-                groupSection(process)
-                parentSection(process)
-                processActionSection(process)
+            if let notice = SimpleMonitorPresentation.listNotice(status: dataStatus) {
+                Text(notice)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if let process = model.process(for: identity) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("内存占用")
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text((process.physicalFootprintIsEstimated ? "约 " : "")
+                        + SimpleMonitorPresentation.memory(process.physicalFootprintBytes))
+                        .font(.system(size: 24, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                }
+                Text("进程编号 " + String(process.identity.pid))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Divider()
+                actionsContent(process)
+            } else {
+                Text("它可能已退出，或暂时无法读取。")
+                    .foregroundStyle(.secondary)
+                actionStatus
+                if actions.canCancel(for: identity) {
+                    Button("停止等待", systemImage: "stop.circle") {
+                        actions.cancel(for: identity)
+                    }
+                }
+            }
+            if actions.auditError != nil {
+                Label("操作记录暂时无法保存", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
             }
         }
+        .padding(24)
+        .frame(width: 380, alignment: .leading)
         .confirmationDialog(
-            "确认请求优雅退出？",
+            "退出这个进程？",
             isPresented: $showGracefulConfirmation,
             titleVisibility: .visible
         ) {
-            Button("请求优雅退出", role: .destructive) {
-                actions.requestGracefulExit(for: process)
+            Button("退出进程", role: .destructive) {
+                if let process = model.process(for: identity) {
+                    actions.requestGracefulExit(for: process)
+                }
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("应用或进程会先收到正常退出请求，并有机会保存数据。若在约 \(Int(actions.gracefulTimeoutForDisplay)) 秒内仍未退出，才会出现强制结束选项。")
+            Text("请先保存工作。退出请求可能中断正在进行的任务；若没有响应，可再选择强制结束。")
         }
         .confirmationDialog(
-            "确认强制结束？",
+            "强制结束这个进程？",
             isPresented: $showForceConfirmation,
             titleVisibility: .visible
         ) {
             Button("强制结束", role: .destructive) {
-                actions.requestForceTerminate(for: process)
+                if let process = model.process(for: identity) {
+                    actions.requestForceTerminate(for: process)
+                }
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("这会立即终止进程，可能丢失未保存的数据。执行前会再次校验进程身份。")
-        }
-    }
-
-    private func processHeader(_ process: ProcessSnapshot) -> some View {
-        HStack(alignment: .top, spacing: 12) {
-            Image(systemName: process.isSystem ? "gearshape.2" : "memorychip")
-                .font(.system(size: 24, weight: .medium))
-                .foregroundStyle(process.isSystem ? Color.secondary : Color.accentColor)
-                .frame(width: 34, height: 34)
-                .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(processDisplayName(process))
-                    .font(.title3.weight(.semibold))
-                    .lineLimit(2)
-                Text("PID \(process.identity.pid) · \(process.isSystem ? "系统进程" : "用户进程")")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                if process.physicalFootprintIsEstimated {
-                    Label("footprint 使用 RSS 估算", systemImage: "exclamationmark.triangle")
-                        .font(.caption2)
-                        .foregroundStyle(.orange)
-                }
-            }
-            Spacer(minLength: 8)
-        }
-    }
-
-    private func processMetrics(_ process: ProcessSnapshot) -> some View {
-        AdaptiveDetailMetricGrid {
-            DetailMetricTile(
-                title: "footprint",
-                value: MemoryFormatter.bytes(process.physicalFootprintBytes),
-                detail: process.physicalFootprintIsEstimated ? "RSS 估算" : "物理归因口径"
-            )
-            DetailMetricTile(
-                title: "RSS",
-                value: MemoryFormatter.bytes(process.residentBytes),
-                detail: "驻留集大小"
-            )
-            DetailMetricTile(
-                title: "虚拟内存",
-                value: MemoryFormatter.bytes(process.virtualBytes),
-                detail: "虚拟地址空间"
-            )
-            DetailMetricTile(
-                title: "累计 CPU 时间",
-                value: cpuDurationLabel(process.cpuTimeNanos),
-                detail: "用户 + 系统"
-            )
-            DetailMetricTile(
-                title: "线程",
-                value: process.threadCount >= 0 ? "\(process.threadCount)" : "--",
-                detail: "当前采样"
-            )
-            DetailMetricTile(
-                title: "用户 UID",
-                value: "\(process.userID)",
-                detail: process.isSystem ? "系统对象" : "进程所有者"
-            )
-        }
-    }
-
-    private func identitySection(_ process: ProcessSnapshot) -> some View {
-        DetailSection(title: "身份与来源") {
-            DetailInfoRow(label: "应用", value: process.applicationName ?? "未解析")
-            DetailInfoRow(label: "Bundle ID", value: process.bundleIdentifier ?? "未解析")
-            DetailInfoRow(label: "可执行文件", value: executableLabel(process.executablePath) ?? process.name)
-            DetailInfoRow(label: "工作目录", value: process.workingDirectoryLabel ?? "未采集（仅对部分运行时读取）")
-            DetailInfoRow(label: "启动时间", value: process.startDate.map(detailDateLabel) ?? "不可用")
+            Text("进程会立即关闭，未保存的内容可能丢失。")
         }
     }
 
     @ViewBuilder
-    private func groupSection(_ process: ProcessSnapshot) -> some View {
-        if let group = model.group(containing: process.identity) {
-            DetailSection(title: "当前工作组") {
-                DetailInfoRow(label: "名称", value: group.title)
-                DetailInfoRow(label: "归因依据", value: group.attributionReason.displayName)
-                DetailInfoRow(label: "组内归因总量", value: MemoryFormatter.bytes(group.attributedFootprintBytes))
-                Text("组内总量是成员 footprint 的相加值，包含共享映射；它不是去重后的整机内存。")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-    }
-
-    private func parentSection(_ process: ProcessSnapshot) -> some View {
-        let chain = model.parentChain(for: process)
-        return DetailSection(title: "父进程链") {
-            if chain.isEmpty {
-                Text("当前快照未找到可见父进程（父进程可能已退出或受权限限制）。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else {
-                ForEach(Array(chain.enumerated()), id: \.offset) { index, parent in
-                    AdaptiveDetailRelationRow(
-                        label: index == 0 ? "父进程" : "上级 \(index + 1)",
-                        name: processDisplayName(parent),
-                        trailing: "PID \(parent.identity.pid)"
-                    )
-                }
-            }
+    private var actionStatus: some View {
+        if let status = actions.status(for: identity) {
+            ProcessActionStatusRow(status: status)
         }
     }
 
     @ViewBuilder
-    private func processActionSection(_ process: ProcessSnapshot) -> some View {
+    private func actionsContent(_ process: ProcessSnapshot) -> some View {
         let validation = actions.eligibility(for: process)
-        DetailSection(title: "进程操作") {
-            if validation.allowed {
-                Text("仅允许当前用户的非系统进程。每次发送信号前都会重新校验启动身份、父 PID 和可执行路径。")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                if let status = actions.status(for: process.identity) {
-                    ProcessActionStatusRow(status: status)
+        actionStatus
+        if validation.allowed {
+            HStack(spacing: 10) {
+                Button("退出进程", systemImage: "rectangle.portrait.and.arrow.right") {
+                    showGracefulConfirmation = true
                 }
-
-                AdaptiveDetailActionGroup {
+                .disabled(actions.isBusy || actions.canForceTerminate(for: identity))
+                if actions.canForceTerminate(for: identity) {
+                    Button("强制结束", systemImage: "xmark.octagon", role: .destructive) {
+                        showForceConfirmation = true
+                    }
+                }
+                if actions.canCancel(for: identity) {
                     Button {
-                        showGracefulConfirmation = true
+                        actions.cancel(for: identity)
                     } label: {
-                        Label("请求优雅退出", systemImage: "rectangle.portrait.and.arrow.right")
+                        Image(systemName: "stop.circle")
                     }
-                    .buttonStyle(.bordered)
-                    .disabled(actions.isBusy || actions.canForceTerminate(for: process.identity))
-                    .help("先请求应用正常退出")
-
-                    if actions.canForceTerminate(for: process.identity) {
-                        Button(role: .destructive) {
-                            showForceConfirmation = true
-                        } label: {
-                            Label("强制结束", systemImage: "xmark.octagon")
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .help("仅在优雅退出超时后使用")
-                    }
-
-                    if actions.canCancel(for: process.identity) {
-                        Button {
-                            actions.cancel(for: process.identity)
-                        } label: {
-                            Label("取消当前操作", systemImage: "stop.circle")
-                        }
-                        .buttonStyle(.bordered)
-                        .help("停止等待或取消尚未完成的操作")
-                    }
-                }
-
-                recentActionSection
-            } else {
-                Label(validation.message, systemImage: "lock.shield")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text("此进程仍可观察；为保护系统或避免身份不完整，不提供退出或强制结束入口。")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-    }
-
-    private var recentActionSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("最近操作记录（全局）")
-                    .font(.caption.weight(.medium))
-                Spacer()
-                if let error = actions.auditError {
-                    Text("记录受限")
-                        .font(.caption2)
-                        .foregroundStyle(.orange)
-                        .help(error)
+                    .help("停止等待")
+                    .accessibilityLabel("停止等待")
                 }
             }
-            Text("这里显示应用最近确认的全局操作记录。审计日志不保存 PID、启动时间或路径，无法按当前进程精确筛选。")
-                .font(.caption2)
+            .buttonStyle(.bordered)
+        } else {
+            Label("这个进程暂不支持退出", systemImage: "lock")
+                .font(.subheadline)
                 .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            if actions.recentEvents.isEmpty {
-                Text("暂无已确认的操作记录")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            } else {
-                ForEach(Array(actions.recentEvents.prefix(5))) { event in
-                    AdaptiveDetailAuditRow(
-                        action: event.action.displayName,
-                        process: event.processLabel,
-                        status: event.statusDisplayName,
-                        timestamp: event.timestamp,
-                        statusColor: actionAuditColor(event)
-                    )
-                }
-            }
+                .help(validation.message)
         }
-        .padding(.top, 4)
-    }
-
-    private var processGoneContent: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            MonitorDetailDataStatusView(status: dataStatus)
-            Image(systemName: "clock.arrow.circlepath")
-                .font(.system(size: 28))
-                .foregroundStyle(.secondary)
-            Text("进程已不在当前采样")
-                .font(.title3.weight(.semibold))
-            Text("PID \(identity.pid) 的启动身份（\(identity.startTimeSeconds)）已经无法在最新快照中找到。进程可能已退出，也可能受权限限制；不会将复用的 PID 当成同一个进程。")
-                .font(.body)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            if let status = actions.status(for: identity) {
-                ProcessActionStatusRow(status: status)
-            }
-            if actions.canCancel(for: identity) {
-                Button {
-                    actions.cancel(for: identity)
-                } label: {
-                    Label("停止跟踪", systemImage: "stop.circle")
-                }
-                .buttonStyle(.bordered)
-                .help("停止等待当前进程操作，不发送新的信号")
-                Text("当前快照无法确认目标状态，只能停止跟踪；不会提供强制结束入口。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else {
-                Label("进程不在当前快照中，因此没有新的退出或强制结束操作。", systemImage: "lock.shield")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-        .padding(24)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 }
 

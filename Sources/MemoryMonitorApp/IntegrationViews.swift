@@ -7,6 +7,7 @@ struct MonitorHealthPanel: View {
     @ObservedObject var processActions: ProcessActionController
     @ObservedObject var loginLaunch: LoginLaunchCoordinator
     @Environment(\.dismiss) private var dismiss
+    @State private var showDiagnostics = false
 
     private var snapshot: MonitorHealthSnapshot {
         // The audit controller is independent from the sampling model. Touch
@@ -19,14 +20,31 @@ struct MonitorHealthPanel: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                header
-                healthRows
+                HStack {
+                    Text("设置")
+                        .font(.title3.weight(.semibold))
+                    Spacer()
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark")
+                            .frame(width: 28, height: 28)
+                    }
+                    .buttonStyle(.plain)
+                    .help("关闭设置")
+                }
                 loginControls
-                privacyNotice
+                DisclosureGroup("运行诊断", isExpanded: $showDiagnostics) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        header
+                        healthRows
+                        privacyNotice
+                    }
+                    .padding(.top, 12)
+                }
+                .font(.subheadline)
             }
             .padding(20)
         }
-        .frame(minWidth: 500, idealWidth: 560, minHeight: 520, idealHeight: 620)
+        .frame(width: 420, height: showDiagnostics ? 520 : 240)
         .toolbar {
             ToolbarItem(placement: .confirmationAction) {
                 Button {
@@ -86,12 +104,15 @@ struct MonitorHealthPanel: View {
     }
 
     private var loginControls: some View {
-        DetailSection(title: "系统集成") {
+        VStack(alignment: .leading, spacing: 12) {
             Toggle(isOn: Binding(
                 get: { loginLaunch.toggleValue },
                 set: { loginLaunch.setEnabled($0) }
             )) {
-                Label("登录时启动", systemImage: "power.circle")
+                HStack {
+                    Label("登录时启动", systemImage: "power.circle")
+                    Spacer()
+                }
             }
             .toggleStyle(.switch)
             .disabled(loginLaunch.isUpdating)
@@ -189,9 +210,9 @@ struct OperationsAuditPanel: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("操作审计")
+                    Text("操作记录")
                         .font(.title3.weight(.semibold))
-                    Text("仅显示本地脱敏记录，最多保留最近 7 天。")
+                    Text("最近 7 天")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
