@@ -23,8 +23,8 @@ struct DesktopMenuPanel: View {
                 Spacer()
                 Text(model.pressure.title).foregroundStyle(model.pressure.color)
             }.font(.caption).foregroundStyle(.secondary)
-            MemoryTrend(records: model.history, hours: 1, now: model.updatedAt ?? Date(), compact: true)
-                .frame(height: 85)
+            MemoryTrend(records: model.history, hours: 1, now: model.updatedAt ?? Date(), compact: true, sparkline: true)
+                .frame(height: 64)
             VStack(spacing: 9) {
                 metric("系统保留", bytes: model.system?.wiredBytes, color: .purple)
                 metric("已压缩", bytes: model.system?.compressedBytes, color: .orange)
@@ -32,7 +32,7 @@ struct DesktopMenuPanel: View {
             }
             Button { openDesktop(.cleanup) } label: {
                 Label("释放内存", systemImage: "sparkles").frame(maxWidth: .infinity).padding(.vertical, 4)
-            }.buttonStyle(.borderedProminent).controlSize(.large)
+            }.buttonStyle(MonitorPrimaryButtonStyle())
             Divider()
             route("打开主窗口", symbol: "macwindow", page: .overview)
             route("查看进程", symbol: "list.bullet.rectangle", page: .processes)
@@ -62,7 +62,7 @@ struct DesktopMenuPanel: View {
         Button { openDesktop(page) } label: {
             Label(title, systemImage: symbol).frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.vertical, 3).contentShape(Rectangle())
-        }.buttonStyle(.plain).foregroundStyle(.secondary)
+        }.buttonStyle(.plain).foregroundStyle(.secondary).monitorRowHover()
         .accessibilityIdentifier("menu-route-" + page.rawValue)
     }
 }

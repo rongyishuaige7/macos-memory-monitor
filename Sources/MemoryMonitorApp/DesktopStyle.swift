@@ -1,0 +1,59 @@
+import SwiftUI
+
+struct GlassSurface: ViewModifier {
+    @Environment(\.colorScheme) private var scheme
+    var accent: Color = .white
+
+    func body(content: Content) -> some View {
+        content
+            .background {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(.regularMaterial)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(accent.opacity(scheme == .dark ? 0.055 : 0.025))
+                    }
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(LinearGradient(
+                        colors: [.white.opacity(scheme == .dark ? 0.20 : 0.7), .white.opacity(0.03)],
+                        startPoint: .topLeading, endPoint: .bottomTrailing), lineWidth: 0.7)
+            }
+    }
+}
+
+struct MonitorPrimaryButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var enabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(enabled ? Color.white : Color.secondary)
+            .padding(.horizontal, 20).frame(height: 40)
+            .background {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(LinearGradient(colors: enabled ? [.init(red: 0.15, green: 0.66, blue: 0.96), .blue] : [.gray.opacity(0.18)],
+                                         startPoint: .topLeading, endPoint: .bottomTrailing))
+            }
+            .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(.white.opacity(enabled ? 0.26 : 0.06), lineWidth: 0.8) }
+            .brightness(configuration.isPressed ? -0.09 : 0)
+    }
+}
+
+struct MonitorRowHover: ViewModifier {
+    @State private var hovering = false
+    var selected = false
+
+    func body(content: Content) -> some View {
+        content
+            .background((selected ? Color.blue.opacity(0.14) : hovering ? Color.primary.opacity(0.055) : .clear),
+                        in: RoundedRectangle(cornerRadius: 6))
+            .onHover { hovering = $0 }
+    }
+}
+
+extension View {
+    func glassSurface(accent: Color = .white) -> some View { modifier(GlassSurface(accent: accent)) }
+    func monitorRowHover(selected: Bool = false) -> some View { modifier(MonitorRowHover(selected: selected)) }
+}

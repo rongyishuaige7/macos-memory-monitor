@@ -6,6 +6,38 @@ import MemoryMonitorCore
 
 @MainActor
 final class DesktopPresentationTests: XCTestCase {
+    func testHistoryRangeAndGapsUseOriginalSamples() {
+        let now = Date()
+        func record(_ age: Double) -> MemoryHistoryRecord {
+            .init(timestamp: now.addingTimeInterval(-age), availableFraction: 0.5, compressedBytes: 0, swapUsedBytes: 0)
+        }
+        XCTAssertEqual(DesktopPresentation.initialHistoryHours([], now: now), 1)
+        XCTAssertEqual(DesktopPresentation.initialHistoryHours([record(600)], now: now), 1)
+        XCTAssertEqual(DesktopPresentation.initialHistoryHours([record(7200)], now: now), 6)
+        XCTAssertEqual(DesktopPresentation.initialHistoryHours([record(40000)], now: now), 24)
+        let records = [record(600), record(540), record(60), record(0)]
+        let segments = DesktopPresentation.chartSegments(records, hours: 1, now: now)
+        XCTAssertEqual(segments[records[0].timestamp], segments[records[1].timestamp])
+        XCTAssertNotEqual(segments[records[1].timestamp], segments[records[2].timestamp])
+        let dense = (0..<1440).map { record(Double($0) * 60) }
+        XCTAssertEqual(Set(DesktopPresentation.chartSegments(dense, hours: 24, now: now).values).count, 1)
+    }
+
+    func testGroupingKeepsEachVisibleProcessOnceAndSearchesMembers() throws {
+        let processes = MemoryMonitorUIFixture.makeDataset().snapshot.processes
+        let groups = DesktopPresentation.groupedProcesses([], processes: processes, query: "", includeSystem: true, sort: .memory, cpu: [:])
+        XCTAssertEqual(groups.flatMap(\.members).count, processes.count)
+        let first = try XCTUnwrap(processes.first)
+        let group = WorkloadGroupSnapshot(id: "app", title: "An application", processCount: processes.count,
+            physicalFootprintBytes: 0, residentBytes: 0, isSystem: false, representativeProcess: first.name,
+            memberProcessIdentities: processes.map(\.identity))
+        let grouped = DesktopPresentation.groupedProcesses([group, group], processes: processes,
+            query: String(first.identity.pid), includeSystem: true, sort: .memory, cpu: [:])
+        XCTAssertEqual(grouped.count, 1)
+        XCTAssertEqual(grouped.first?.members.count, processes.count)
+        XCTAssertNil(grouped.first?.cpu([first.identity: 10]))
+    }
+
     func testChartBudgetPreservesPeakAndEndpoints() {
         let now = Date()
         let records = (0..<1440).map { index in
@@ -83,13 +115,19 @@ final class DesktopPresentationTests: XCTestCase {
         await model.refreshOnce(at: dataset.referenceDate)
         let navigation = DesktopNavigation()
         let test = MemoryTestController()
+        let suite = "desktop-render-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        for appearance in ["dark", "light"] {
+        defaults.set(appearance, forKey: "desktopAppearance")
         for width in [960, 800] {
             for page in DesktopPage.allCases {
                 navigation.page = page
                 let view = DesktopWindowRoot(model: model, navigation: navigation, memoryTest: test)
-                try render(view, name: "desktop-\(page.rawValue)-\(width)",
+                try render(view.defaultAppStorage(defaults), name: "desktop-\(page.rawValue)-\(width)-\(appearance)",
                            size: NSSize(width: width, height: width == 960 ? 628 : 538))
             }
+        }
         }
         try render(DesktopMenuPanel(model: model, openDesktop: { _ in }, terminationAction: ApplicationTerminationAction(handler: {})),
                    name: "desktop-menu", size: NSSize(width: 290, height: 520))
