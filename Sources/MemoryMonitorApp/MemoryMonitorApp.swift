@@ -53,7 +53,10 @@ struct MemoryMonitorApp: App {
                 model: applicationDelegate.model,
                 processActions: applicationDelegate.model.processActions,
                 loginLaunch: applicationDelegate.model.loginLaunch,
-                terminationAction: applicationDelegate.terminationAction
+                terminationAction: applicationDelegate.terminationAction,
+                openDesktop: { page, process, audit in
+                    applicationDelegate.desktop.show(page, process: process, audit: audit)
+                }
             )
                 .onAppear { applicationDelegate.model.setPanelPresented(true) }
                 .onDisappear { applicationDelegate.model.setPanelPresented(false) }
@@ -87,6 +90,7 @@ struct MemoryMonitorLaunchConfiguration: Equatable {
 @MainActor
 final class MemoryMonitorApplicationDelegate: NSObject, NSApplicationDelegate {
     let model: MonitorViewModel
+    lazy var desktop = DesktopWindowCoordinator(model: model)
     let terminationAction = ApplicationTerminationAction()
     private let terminationCoordinator: ApplicationTerminationCoordinator
 
@@ -154,6 +158,19 @@ final class MemoryMonitorApplicationDelegate: NSObject, NSApplicationDelegate {
             timeoutSeconds: terminationTimeoutSeconds
         )
         super.init()
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        desktop.show()
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        desktop.show(desktop.navigation.page)
+        return true
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -255,6 +272,8 @@ final class MonitorViewModel: ObservableObject {
     @Published private(set) var historyDiagnostics: HistoryStoreDiagnostics?
     @Published private(set) var updatedAt: Date?
     @Published private(set) var isPanelPresented = false
+    private var isPopoverPresented = false
+    private var isDesktopPresented = false
     @Published private(set) var pressureLevel: MemoryPressureLevel?
     @Published private(set) var samplingDiagnostics = SamplingDiagnostics(
         mode: .background,
@@ -536,6 +555,17 @@ final class MonitorViewModel: ObservableObject {
     }
 
     func setPanelPresented(_ presented: Bool) {
+        isPopoverPresented = presented
+        updatePresentationState()
+    }
+
+    func setDesktopPresented(_ presented: Bool) {
+        isDesktopPresented = presented
+        updatePresentationState()
+    }
+
+    private func updatePresentationState() {
+        let presented = isPopoverPresented || isDesktopPresented
         guard isPanelPresented != presented else { return }
         isPanelPresented = presented
         Task { await refreshWakeup.signal() }
@@ -1645,6 +1675,7 @@ struct MonitorPopover: View {
     @ObservedObject var processActions: ProcessActionController
     @ObservedObject var loginLaunch: LoginLaunchCoordinator
     let terminationAction: ApplicationTerminationAction
+    var openDesktop: ((DesktopPage, ProcessIdentity?, Bool) -> Void)? = nil
     @State private var searchText = ""
     @State private var showSystemProcesses = false
     @State private var selectedProcess: ProcessIdentity?
@@ -1671,8 +1702,9 @@ struct MonitorPopover: View {
                 Menu {
                     Toggle("显示系统进程", isOn: $showSystemProcesses)
                     Divider()
-                    Button("设置", systemImage: "gearshape") { showSettings = true }
-                    Button("操作记录", systemImage: "clock.arrow.circlepath") { showAudit = true }
+                    Button("打开主窗口", systemImage: "macwindow") { openDesktop?(.overview, nil, false) }
+                    Button("设置", systemImage: "gearshape") { openSettings() }
+                    Button("操作记录", systemImage: "clock.arrow.circlepath") { openAudit() }
                 } label: {
                     Image(systemName: "ellipsis")
                         .frame(width: 28, height: 28)
@@ -1714,7 +1746,11 @@ struct MonitorPopover: View {
                     }
                     ForEach(visibleProcesses) { process in
                         Button {
-                            selectedProcess = process.identity
+                            if let openDesktop {
+                                openDesktop(.processes, process.identity, false)
+                            } else {
+                                selectedProcess = process.identity
+                            }
                         } label: {
                             SimpleProcessRow(process: process)
                         }
@@ -1728,13 +1764,13 @@ struct MonitorPopover: View {
             Divider()
             HStack {
                 if processActions.auditError != nil {
-                    Button("操作记录暂时不可用") { showAudit = true }
+                    Button("操作记录暂时不可用") { openAudit() }
                         .font(.caption)
                         .foregroundStyle(.orange)
                         .buttonStyle(.plain)
                 } else {
                     Button {
-                        showSettings = true
+                        openSettings()
                     } label: {
                         Image(systemName: "gearshape")
                             .frame(width: 28, height: 28)
@@ -1777,6 +1813,16 @@ struct MonitorPopover: View {
         )) { _ in
             loginLaunch.refreshStatus()
         }
+    }
+
+    private func openSettings() {
+        if let openDesktop { openDesktop(.settings, nil, false) }
+        else { showSettings = true }
+    }
+
+    private func openAudit() {
+        if let openDesktop { openDesktop(.settings, nil, true) }
+        else { showAudit = true }
     }
 
     private var memorySummary: some View {
