@@ -49,14 +49,10 @@ struct MemoryMonitorApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            MonitorPopover(
+            DesktopMenuPanel(
                 model: applicationDelegate.model,
-                processActions: applicationDelegate.model.processActions,
-                loginLaunch: applicationDelegate.model.loginLaunch,
-                terminationAction: applicationDelegate.terminationAction,
-                openDesktop: { page, process, audit in
-                    applicationDelegate.desktop.show(page, process: process, audit: audit)
-                }
+                openDesktop: { page in applicationDelegate.desktop.show(page) },
+                terminationAction: applicationDelegate.terminationAction
             )
                 .onAppear { applicationDelegate.model.setPanelPresented(true) }
                 .onDisappear { applicationDelegate.model.setPanelPresented(false) }
@@ -262,6 +258,8 @@ final class MonitorViewModel: ObservableObject {
     @Published private(set) var gpuUsageFraction: Double?
     @Published private(set) var gpuStatus = SampleStatus.unavailable(message: "等待首次采样")
     @Published private(set) var processes: [ProcessSnapshot] = []
+    @Published private(set) var processCPUPercent: [ProcessIdentity: Double] = [:]
+    private var processCPUBaseline = ProcessCPUBaseline()
     @Published private(set) var groups: [WorkloadGroupSnapshot] = []
     @Published private(set) var processStatus = SampleStatus.unavailable(message: "等待首次采样")
     @Published private(set) var observedProcessCount = 0
@@ -920,6 +918,9 @@ final class MonitorViewModel: ObservableObject {
         }
 
         if processSampleUsable {
+            if let processSampledAt {
+                processCPUPercent = processCPUBaseline.update(snapshot.processes, at: processSampledAt)
+            }
             lastUsableProcessSampleAt = processSampledAt
             processes = snapshot.processes
             groups = snapshot.groups
@@ -1481,18 +1482,22 @@ enum PressureState: String {
 private struct MenuBarStatus: View {
     @ObservedObject var model: MonitorViewModel
     let terminationAction: ApplicationTerminationAction
+    @AppStorage("menuBarShowsPercentage") private var showsPercentage = true
 
     var body: some View {
         HStack(spacing: 4) {
             Circle()
                 .fill(model.pressure.color)
                 .frame(width: 7, height: 7)
-            Text(
+            if showsPercentage { Text(
                 model.systemDataIsUsable
                     ? (model.system.map { "内存 \(Int($0.usedFraction * 100))%" } ?? "内存 --")
                     : "内存 --"
             )
                 .font(.system(size: 12, weight: .medium, design: .rounded))
+            } else {
+                Image(systemName: "memorychip")
+            }
         }
         .contextMenu {
             Button(role: .destructive) {

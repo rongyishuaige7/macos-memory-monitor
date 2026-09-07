@@ -62,3 +62,39 @@ Stage 1: independent NSWindow routing implemented. Two window lifecycle and
 visibility tests plus 65 integration/presentation tests passed. Settings now
 routes out of the menu panel; closing/reopening reuses the retained window.
 The desktop page content is replaced in stage 2.
+
+Stage 2: six desktop destinations and the 290-point menu companion implemented.
+Native appearance follows the stored light/dark selection. Search/sort results
+are cached between relevant input updates. Process CPU percentages require two
+forward-time snapshots of the same identity; counter resets and long sampling
+gaps produce an unavailable value. Chart sampling preserves bucket extrema and
+endpoints within a 240-point budget. Existing 24-hour retention is unchanged.
+
+Verification on September 7, 2026:
+
+- `swift test`: 299 tests passed. Following the final appearance/alignment edit,
+  all eight desktop presentation/window tests passed again.
+- `swift build -c release -Xswiftc -strict-concurrency=complete`: passed.
+- Release bundle build and `codesign --verify --deep --strict`: passed.
+- Native desktop integration script: passed; existing login item is enabled.
+  Report: `/private/tmp/memory-monitor-desktop-v110-integration.json`.
+- Twelve desktop render captures cover all destinations at 960 and 800 points;
+  a thirteenth captures the menu companion. Pixel diversity checks passed.
+- Native Accessibility actions traversed all six pages. The percentage toggle
+  changed from 1 to 0 and was restored. A real CGEvent mouse click also changed
+  that toggle from 1 to 0 and was restored. After Finder activation and return,
+  settings remained interactive. Pressing the actual menu-bar item and its
+  settings route returned to the persistent desktop settings page.
+- Actual full-window captures, including settings after deactivation and settings
+  opened from the menu, are in `/tmp/memory-monitor-desktop-v110-review/`.
+  Verification helper: `/tmp/memory-monitor-window-check.swift`.
+- Production app is running from
+  `~/Library/Application Support/MemoryMonitor/releases/1.1.0/MemoryMonitor.app`,
+  version 1.1.0 build 110, with `MEMORY_MONITOR_UI_CHECK_FIXTURE=0`.
+
+Limits: no reboot/login-cycle test or Developer ID notarization. Stress-worker
+completion/cancellation was tested with small allocations; large live stress
+loads were not run on this already busy Mac. Current real memory pressure
+correctly disables the start action. UI navigation and click checks do not
+constitute a sustained scrolling frame-time benchmark. No unrelated process
+was terminated and no cache or user file was removed.

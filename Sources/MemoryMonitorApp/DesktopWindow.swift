@@ -38,6 +38,7 @@ final class DesktopNavigation: ObservableObject {
 @MainActor
 final class DesktopWindowCoordinator: NSObject, NSWindowDelegate {
     let navigation = DesktopNavigation()
+    let memoryTest = MemoryTestController()
     private let model: MonitorViewModel
     private(set) var window: NSWindow?
 
@@ -59,10 +60,11 @@ final class DesktopWindowCoordinator: NSObject, NSWindowDelegate {
             window.identifier = NSUserInterfaceItemIdentifier("memory-monitor-desktop")
             window.isReleasedWhenClosed = false
             window.hidesOnDeactivate = false
+            window.titlebarAppearsTransparent = true
             window.minSize = NSSize(width: 800, height: 560)
             window.delegate = self
             window.contentView = NSHostingView(rootView: DesktopWindowRoot(
-                model: model, navigation: navigation
+                model: model, navigation: navigation, memoryTest: memoryTest
             ))
             window.center()
             window.setFrameAutosaveName("MemoryMonitorDesktop")
@@ -76,6 +78,7 @@ final class DesktopWindowCoordinator: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        memoryTest.stop()
         model.setDesktopPresented(false)
     }
 
@@ -91,26 +94,11 @@ final class DesktopWindowCoordinator: NSObject, NSWindowDelegate {
 struct DesktopWindowRoot: View {
     @ObservedObject var model: MonitorViewModel
     @ObservedObject var navigation: DesktopNavigation
+    @ObservedObject var memoryTest: MemoryTestController
+    @AppStorage("desktopAppearance") private var appearance = "dark"
 
     var body: some View {
-        HStack(spacing: 0) {
-            List(DesktopPage.allCases, selection: $navigation.page) { page in
-                Label(page.title, systemImage: page.symbol).tag(page)
-            }
-            .frame(width: 170)
-            Divider()
-            Group {
-                if navigation.page == .settings {
-                    MonitorHealthPanel(model: model, processActions: model.processActions,
-                                       loginLaunch: model.loginLaunch)
-                } else {
-                    MonitorPopover(model: model, processActions: model.processActions,
-                                   loginLaunch: model.loginLaunch,
-                                   terminationAction: ApplicationTerminationAction())
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
+        DesktopShell(model: model, navigation: navigation, memoryTest: memoryTest)
         .sheet(isPresented: Binding(
             get: { navigation.selectedProcess != nil },
             set: { if !$0 { navigation.selectedProcess = nil } }
@@ -122,5 +110,23 @@ struct DesktopWindowRoot: View {
         .sheet(isPresented: $navigation.showsAudit) {
             OperationsAuditPanel(actions: model.processActions)
         }
+        .background(DesktopWindowAppearance(dark: appearance != "light"))
+        .preferredColorScheme(appearance == "light" ? .light : .dark)
+    }
+}
+
+private struct DesktopWindowAppearance: NSViewRepresentable {
+    let dark: Bool
+
+    func makeNSView(context: Context) -> AppearanceView { AppearanceView() }
+    func updateNSView(_ view: AppearanceView, context: Context) {
+        view.dark = dark
+        view.apply()
+    }
+
+    final class AppearanceView: NSView {
+        var dark = true
+        override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); apply() }
+        func apply() { window?.appearance = NSAppearance(named: dark ? .darkAqua : .aqua) }
     }
 }
