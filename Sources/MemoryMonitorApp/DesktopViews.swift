@@ -8,6 +8,9 @@ struct DesktopShell: View {
     @ObservedObject var navigation: DesktopNavigation
     @ObservedObject var memoryTest: MemoryTestController
     @AppStorage("desktopAppearance") private var appearance = "dark"
+    @AppStorage("desktopMotionEnabled") private var motionEnabled = true
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var appActive = NSRunningApplication.current.isActive
 
     var body: some View {
         HStack(spacing: 0) {
@@ -51,6 +54,11 @@ struct DesktopShell: View {
         .tint(.blue)
         .background(Color(nsColor: .windowBackgroundColor))
         .environment(\.colorScheme, appearance == "light" ? .light : .dark)
+        .environment(\.monitorMotionAllowed, motionEnabled && !reduceMotion && appActive &&
+                     model.systemDataIsUsable && model.pressureLevel == .normal &&
+                     navigation.selectedProcess == nil && !navigation.showsAudit)
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in appActive = true }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in appActive = false }
     }
 
     private var sidebar: some View {
@@ -174,6 +182,7 @@ struct DesktopOverview: View {
 
 struct MemoryUsageRing: View {
     let system: SystemMemorySnapshot?
+    @Environment(\.monitorMotionAllowed) private var motion
 
     var body: some View {
         ZStack {
@@ -192,6 +201,7 @@ struct MemoryUsageRing: View {
                 Text("内存使用率").font(.system(size: 13)).foregroundStyle(.secondary)
                 Text(system.map { "\(Int($0.usedFraction * 100))%" } ?? "--")
                     .font(.system(size: 44, weight: .semibold, design: .rounded)).monospacedDigit()
+                    .contentTransition(.numericText())
                 Text(system.map {
                     "\(SimpleMonitorPresentation.memory($0.usedEstimateBytes)) / \(SimpleMonitorPresentation.memory($0.totalBytes))"
                 } ?? "等待数据")
@@ -199,6 +209,7 @@ struct MemoryUsageRing: View {
             }.padding(20)
         }
         .padding(16)
+        .animation(motion ? .easeOut(duration: 0.22) : nil, value: system?.usedFraction)
         .accessibilityElement(children: .combine)
         .help("使用量为扣除估算可用内存后的值")
     }
@@ -225,6 +236,7 @@ private struct MemoryMetric: View {
     let title: String
     let bytes: UInt64?
     let color: Color
+    @Environment(\.monitorMotionAllowed) private var motion
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -235,6 +247,7 @@ private struct MemoryMetric: View {
             Text(bytes.map(SimpleMonitorPresentation.memory) ?? "--")
                 .font(.system(size: 20, weight: .semibold, design: .rounded))
                 .monospacedDigit().lineLimit(1).minimumScaleFactor(0.75)
+                .contentTransition(.numericText()).animation(motion ? .easeOut(duration: 0.2) : nil, value: bytes)
         }
         .padding(14).frame(maxWidth: .infinity, alignment: .leading)
         .glassSurface(accent: color)
@@ -479,6 +492,7 @@ struct DesktopTestInstrument: View {
     @ObservedObject var model: MonitorViewModel
     @ObservedObject var test: MemoryTestController
     @State private var intensity: MemoryTestIntensity = .light
+    @Environment(\.monitorMotionAllowed) private var motion
 
     var body: some View {
         ScrollView {
@@ -491,6 +505,8 @@ struct DesktopTestInstrument: View {
                             .rotationEffect(.degrees(-90))
                         Image(systemName: "cpu").font(.system(size: 70, weight: .ultraLight)).foregroundStyle(.cyan)
                     }.padding(10).frame(width: 174, height: 174)
+                        .overlay { MonitorParticles(mode: .running, running: test.isRunning).allowsHitTesting(false).accessibilityHidden(true) }
+                        .animation(motion ? .easeOut(duration: 0.22) : nil, value: test.elapsed)
                     VStack(alignment: .leading, spacing: 10) {
                         Text(test.isRunning ? "测试进行中" : "30 秒内存测试").font(.title2.weight(.semibold))
                         Text(test.isRunning ? "已分配 " + SimpleMonitorPresentation.memory(UInt64(test.allocatedBytes)) : "测试分配量")
@@ -543,6 +559,7 @@ struct DesktopPreferences: View {
     @ObservedObject var navigation: DesktopNavigation
     @AppStorage("desktopAppearance") private var appearance = "dark"
     @AppStorage("menuBarShowsPercentage") private var showsPercentage = true
+    @AppStorage("desktopMotionEnabled") private var motionEnabled = true
     @State private var showsDiagnostics = false
 
     var body: some View {
@@ -569,6 +586,10 @@ struct DesktopPreferences: View {
                     }
                 }
                 Divider()
+                Toggle(isOn: $motionEnabled) {
+                    HStack { Text("界面动效"); Spacer() }
+                }.toggleStyle(.switch)
+                    .accessibilityIdentifier("desktop-settings-motion")
                 HStack {
                     Text("操作记录")
                     Spacer()

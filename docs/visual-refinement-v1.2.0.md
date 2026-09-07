@@ -54,4 +54,37 @@ membership/search and original-sample gap segmentation have focused coverage.
 The fixture release list is intentionally empty under the live action policy;
 real-list selection/confirmation will be checked in the versioned app.
 
-Stage 2 and packaged runtime verification pending.
+Stage 2: full suite passed (302 tests), followed by 8 focused presentation
+tests after aligning the motion toggle and correcting nested helper-app icons.
+Strict-concurrency Release compilation passed. Native Core Animation tests
+run an AppKit event loop and use ScreenCaptureKit pixel comparisons: continuous
+particles move, success particles stop emitting at 140 ms and are removed by
+850 ms, and hidden/minimized/offscreen/disabled effects stop. A consumed or
+suppressed burst never replays. Captures: `/tmp/memory-monitor-v120-motion`.
+
+The isolated particle harness consumed 0.005 CPU seconds idle and 0.002 CPU
+seconds with particles over separate 3-second intervals; these are near the
+measurement floor and exclude WindowServer/GPU cost. Short native overview
+samples on this busy 16 GB Mac were 0-4.5% CPU / 74-108 MB on 1.1.0 and
+0-6.4% CPU / 71-110 MB on the 1.2.0 candidate. Different load/timing means these
+are smoke measurements, not proof of a speedup or a frame-rate guarantee.
+The real session reported elevated pressure and approximately 13.5 GB of
+disk swap, so decorative motion was correctly suppressed in that session.
+
+Candidate package passed ad-hoc signature and desktop integration checks.
+Real mouse settings toggle, light/dark previews, motion toggle, Finder
+deactivation/return, menu-to-settings route, release selection/detail dismissal
+and list scrolling passed. No exit signal was sent to a real user process.
+Runtime screenshots: `/tmp/memory-monitor-desktop-v120-review`.
+
+The final 1.2.0 (build 120) package passed signature verification and the
+complete native interaction sequence again, including group expand/collapse.
+Nested Chrome helpers now use the containing application's icon and settings
+switches share the same trailing alignment. The running executable was verified
+at `~/Library/Application Support/MemoryMonitor/releases/1.2.0-final/MemoryMonitor.app`,
+with fixture mode disabled and the normal storage root. The prior candidate
+and 1.1.0 packages remain available; only the final app is running.
+
+No Developer ID/notarization, reboot/login-cycle verification, sustained
+frame-time benchmark, or large live memory-stress run was performed. This is
+a local ad-hoc signed delivery with focused native interaction evidence.

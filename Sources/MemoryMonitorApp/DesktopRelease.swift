@@ -10,6 +10,8 @@ struct DesktopRelease: View {
     @State private var query = ""
     @State private var reviewed: ProcessIdentity?
     @State private var result: String?
+    @State private var burst = 0
+    @State private var awaitsFeedback = false
 
     private var process: ProcessSnapshot? { candidates.first { $0.identity == selected } }
 
@@ -27,6 +29,7 @@ struct DesktopRelease: View {
                 Image(systemName: result == nil ? "square.stack.3d.up" : "checkmark.circle")
                     .font(.system(size: 44, weight: .light)).foregroundStyle(result == nil ? .cyan : .green)
                     .frame(width: 74, height: 84)
+                    .overlay { MonitorParticles(mode: .burst, trigger: burst).allowsHitTesting(false).accessibilityHidden(true) }
                 VStack(alignment: .leading, spacing: 7) {
                     Text(result == nil ? "选中进程占用" : "进程已退出")
                         .font(.system(size: 13)).foregroundStyle(.secondary)
@@ -96,6 +99,14 @@ struct DesktopRelease: View {
                 if case let .completed(identity, _, message) = actions.state, identity == reviewed {
                     result = message
                     selected = nil
+                    if navigation.selectedProcess == nil { burst += 1 }
+                    else { awaitsFeedback = true }
+                }
+            }
+            .onChange(of: navigation.selectedProcess) {
+                if navigation.selectedProcess == nil, awaitsFeedback {
+                    burst += 1
+                    awaitsFeedback = false
                 }
             }
     }

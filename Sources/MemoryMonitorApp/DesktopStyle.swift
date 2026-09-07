@@ -25,6 +25,7 @@ struct GlassSurface: ViewModifier {
 
 struct MonitorPrimaryButtonStyle: ButtonStyle {
     @Environment(\.isEnabled) private var enabled
+    @Environment(\.monitorMotionAllowed) private var motion
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -38,10 +39,13 @@ struct MonitorPrimaryButtonStyle: ButtonStyle {
             }
             .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(.white.opacity(enabled ? 0.26 : 0.06), lineWidth: 0.8) }
             .brightness(configuration.isPressed ? -0.09 : 0)
+            .scaleEffect(configuration.isPressed && motion ? 0.985 : 1)
+            .animation(motion ? .easeOut(duration: 0.15) : nil, value: configuration.isPressed)
     }
 }
 
 struct MonitorRowHover: ViewModifier {
+    @Environment(\.monitorMotionAllowed) private var motion
     @State private var hovering = false
     var selected = false
 
@@ -50,6 +54,8 @@ struct MonitorRowHover: ViewModifier {
             .background((selected ? Color.blue.opacity(0.14) : hovering ? Color.primary.opacity(0.055) : .clear),
                         in: RoundedRectangle(cornerRadius: 6))
             .onHover { hovering = $0 }
+            .animation(motion ? .easeOut(duration: 0.16) : nil, value: hovering)
+            .animation(motion ? .easeOut(duration: 0.18) : nil, value: selected)
     }
 }
 

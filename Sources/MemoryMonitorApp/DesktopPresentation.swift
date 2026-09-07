@@ -148,8 +148,8 @@ final class ProcessIconCache {
     func icon(for process: ProcessSnapshot) -> NSImage {
         let key = "\(process.identity.pid):\(process.identity.startTimeSeconds):\(process.identity.startTimeMicroseconds)" as NSString
         if let image = cache.object(forKey: key) { return image }
-        let image = NSRunningApplication(processIdentifier: process.identity.pid)?.icon
-            ?? applicationIcon(path: process.executablePath)
+        let image = applicationIcon(path: process.executablePath)
+            ?? NSRunningApplication(processIdentifier: process.identity.pid)?.icon
             ?? NSImage(systemSymbolName: "app.dashed", accessibilityDescription: nil)!
         cache.setObject(image, forKey: key)
         return image
@@ -158,12 +158,12 @@ final class ProcessIconCache {
     private func applicationIcon(path: String?) -> NSImage? {
         guard let path else { return nil }
         var url = URL(fileURLWithPath: path)
+        var applicationURL: URL?
         while url.path != "/" {
-            if url.pathExtension == "app", FileManager.default.fileExists(atPath: url.path) {
-                return NSWorkspace.shared.icon(forFile: url.path)
-            }
+            if url.pathExtension == "app" { applicationURL = url }
             url.deleteLastPathComponent()
         }
-        return nil
+        guard let applicationURL, FileManager.default.fileExists(atPath: applicationURL.path) else { return nil }
+        return NSWorkspace.shared.icon(forFile: applicationURL.path)
     }
 }
