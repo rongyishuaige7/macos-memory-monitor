@@ -6,11 +6,11 @@
 - 物理内存基线：16 GiB
 - 首版形态：菜单栏常驻 + 点击弹出详细面板
 - 首版范围（历史基线）：只监视、分析和给出建议，不执行进程退出或强制结束
-- 当前 App bundle：v1.2.0（build 120）；独立桌面窗口 + 菜单栏快捷面板
+- 当前 App bundle：v1.2.1（build 121）；独立桌面窗口 + 菜单栏快捷面板
 - 当前本地 App bundle 使用 ad-hoc 签名；Developer ID、notarization 和沙盒策略尚未启用
 - 文档状态：设计基线，可作为后续实现的验收依据
 
-## 当前桌面版（v1.2.0）
+## 当前桌面版（v1.2.1）
 
 主窗口提供内存概览、进程管理、释放内存、24 小时历史、压力测试和设置。
 菜单栏保留快速查看及页面入口；设置和进程详情归主窗口管理，避免菜单栏
@@ -27,9 +27,15 @@
 128/256/512 MB，最长 30 秒，支持停止和自动释放；内存紧张时拒绝启动。
 历史范围为 1/6/24 小时，与现有本地保留期限一致。
 
-架构与验收记录见 [桌面版重构](docs/desktop-interface-v1.1.0.md) 和
-[1.2.0 界面优化](docs/visual-refinement-v1.2.0.md)。以下章节保留早期设计
-与历次实现背景，当前界面以这两份文档为准。
+应用标识采用 M 字母与开口监测环，已用于 Dock、侧栏、设置页及菜单栏
+关闭百分比后的图标模式。[Logo 预览](Resources/Brand/Logo-Preview.png)、
+[透明 PNG](Resources/Brand/Logo.png)、[SVG](Resources/Brand/Logo.svg) 和
+[macOS 图标](Resources/MemoryMonitor.icns) 均在仓库中。
+
+架构与验收记录见 [桌面版重构](docs/desktop-interface-v1.1.0.md)、
+[1.2.0 界面优化](docs/visual-refinement-v1.2.0.md) 和
+[1.2.1 应用标识](docs/brand-identity-v1.2.1.md)。以下章节保留早期设计
+与历次实现背景，当前界面以上述文档为准。
 
 ## 1. 产品定位
 

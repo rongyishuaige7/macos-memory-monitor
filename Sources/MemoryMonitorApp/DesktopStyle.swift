@@ -1,4 +1,22 @@
+import AppKit
 import SwiftUI
+
+struct MemoryMonitorMark: Shape {
+    // MenuBarExtra extracts Image labels but does not display arbitrary shapes.
+    @MainActor static let menuBarImage: NSImage = {
+        let image = NSImage(size: NSSize(width: 17, height: 17), flipped: true) { rect in
+            guard let context = NSGraphicsContext.current?.cgContext else { return false }
+            MemoryMonitorBrand.drawSymbol(in: context, rect: rect, color: CGColor(gray: 0, alpha: 1))
+            return true
+        }
+        image.isTemplate = true
+        return image
+    }()
+
+    func path(in rect: CGRect) -> Path {
+        Path(MemoryMonitorBrand.symbolPath(in: rect))
+    }
+}
 
 struct GlassSurface: ViewModifier {
     @Environment(\.colorScheme) private var scheme

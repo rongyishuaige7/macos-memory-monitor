@@ -1496,7 +1496,7 @@ private struct MenuBarStatus: View {
             )
                 .font(.system(size: 12, weight: .medium, design: .rounded))
             } else {
-                Image(systemName: "memorychip")
+                Image(nsImage: MemoryMonitorMark.menuBarImage).accessibilityHidden(true)
             }
         }
         .contextMenu {

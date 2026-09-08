@@ -64,7 +64,7 @@ struct DesktopShell: View {
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 9) {
-                Image(systemName: "memorychip.fill").font(.system(size: 23)).foregroundStyle(.cyan)
+                MemoryMonitorMark().fill(.cyan).frame(width: 28, height: 28).accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Memory Monitor").font(.system(size: 13, weight: .semibold)).lineLimit(1).minimumScaleFactor(0.8)
                     Text("Mac 内存管理").font(.caption2).foregroundStyle(.secondary)
@@ -609,7 +609,7 @@ struct DesktopPreferences: View {
                 }
                 Divider()
                 HStack(alignment: .top) {
-                    Image(systemName: "memorychip").font(.title).foregroundStyle(.cyan)
+                    MemoryMonitorMark().fill(.cyan).frame(width: 30, height: 30).accessibilityHidden(true)
                     VStack(alignment: .leading, spacing: 6) {
                         Text("Memory Monitor").font(.headline)
                         Text("版本 \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "开发版")")
@@ -633,7 +633,7 @@ struct DesktopPreferences: View {
                     Rectangle().fill(value == "dark" ? Color(white: 0.14) : Color(white: 0.86)).frame(width: 25)
                     ZStack {
                         Rectangle().fill(value == "dark" ? Color(white: 0.23) : .white)
-                        Image(systemName: "memorychip").foregroundStyle(.cyan).font(.system(size: 22))
+                        MemoryMonitorMark().fill(.cyan).frame(width: 22, height: 22).accessibilityHidden(true)
                     }
                 }.frame(width: 100, height: 58).clipShape(RoundedRectangle(cornerRadius: 6))
                     .overlay { RoundedRectangle(cornerRadius: 6).strokeBorder(appearance == value ? .blue : .gray.opacity(0.2), lineWidth: 2) }

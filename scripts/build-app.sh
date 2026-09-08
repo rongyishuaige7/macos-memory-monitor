@@ -18,6 +18,7 @@ fi
 binary_name="memory-monitor-app"
 app_name="MemoryMonitor.app"
 info_plist="$project_root/Resources/Info.plist"
+app_icon="$project_root/Resources/MemoryMonitor.icns"
 
 if [[ "$configuration" != "debug" && "$configuration" != "release" ]]; then
 	print -u2 "CONFIGURATION must be debug or release"
@@ -43,6 +44,10 @@ for command_name in swift plutil file install codesign xattr ditto mktemp; do
 done
 
 plutil -lint "$info_plist" >/dev/null
+if [[ ! -s "$app_icon" ]]; then
+	print -u2 "App icon not found: $app_icon"
+	exit 2
+fi
 
 # Keep the bundle's default version in one source of truth. Release tooling
 # can still override either value explicitly without modifying the source plist.
@@ -149,6 +154,7 @@ staged_app_path="$staging_root/$app_name"
 mkdir -p "$staged_app_path/Contents/MacOS" "$staged_app_path/Contents/Resources"
 install -m 0755 "$source_binary" "$staged_app_path/Contents/MacOS/$binary_name"
 install -m 0644 "$info_plist" "$staged_app_path/Contents/Info.plist"
+install -m 0644 "$app_icon" "$staged_app_path/Contents/Resources/MemoryMonitor.icns"
 
 plutil -replace CFBundleShortVersionString -string "$app_version" "$staged_app_path/Contents/Info.plist"
 plutil -replace CFBundleVersion -string "$build_number" "$staged_app_path/Contents/Info.plist"
