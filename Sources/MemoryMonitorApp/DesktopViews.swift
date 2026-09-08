@@ -39,7 +39,7 @@ struct DesktopShell: View {
                     switch navigation.page {
                     case .overview: DesktopOverview(model: model, navigation: navigation)
                     case .processes: DesktopProcesses(model: model, navigation: navigation)
-                    case .cleanup: DesktopRelease(model: model, actions: model.processActions, navigation: navigation)
+                    case .cleanup: DesktopRelease(model: model, cleanup: model.smartCleanup, navigation: navigation)
                     case .history: DesktopHistory(model: model)
                     case .stress: DesktopTestInstrument(model: model, test: memoryTest)
                     case .settings: DesktopPreferences(model: model, login: model.loginLaunch, navigation: navigation)

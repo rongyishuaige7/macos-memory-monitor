@@ -278,6 +278,7 @@ final class ProcessActionController: ObservableObject {
     @Published private(set) var state: ProcessActionState = .idle
     @Published private(set) var recentEvents: [ProcessActionAuditEvent] = []
     @Published private(set) var auditError: String?
+    let operationGate = MonitorOperationGate()
 
     private let policy: ProcessActionPolicy
     private let runtime: any ProcessActionRuntime
@@ -435,6 +436,10 @@ final class ProcessActionController: ObservableObject {
 
     func requestGracefulExit(for process: ProcessSnapshot) {
         guard !isShuttingDown, !isBusy else { return }
+        guard operationGate.owner == nil else {
+            state = .denied(process.identity, "请等待智能清理或内存测试结束。")
+            return
+        }
         cancelCurrentTask()
 
         let validation = eligibility(for: process)
@@ -467,6 +472,7 @@ final class ProcessActionController: ObservableObject {
 
     func requestForceTerminate(for process: ProcessSnapshot) {
         guard !isShuttingDown else { return }
+        guard operationGate.owner == nil else { return }
         guard canForceTerminate(for: process.identity),
               let expected = targetProcess,
               expected.identity == process.identity else {

@@ -73,13 +73,26 @@ final class MemoryTestController: ObservableObject {
     @Published private(set) var elapsed = 0
     @Published private(set) var message: String?
     private var task: Task<MemoryTestResult, Never>?
+    private let operationGate: MonitorOperationGate
+    private let manualActionIsBusy: @MainActor () -> Bool
+
+    init(operationGate: MonitorOperationGate = MonitorOperationGate(),
+         manualActionIsBusy: @escaping @MainActor () -> Bool = { false }) {
+        self.operationGate = operationGate
+        self.manualActionIsBusy = manualActionIsBusy
+    }
 
     func start(system: SystemMemorySnapshot?, usable: Bool, pressure: MemoryPressureLevel?, intensity: MemoryTestIntensity) {
         guard !isRunning else { return }
+        guard !manualActionIsBusy(), operationGate.owner == nil else {
+            message = "请等待清理或进程操作结束。"
+            return
+        }
         if let refusal = MemoryTestPolicy.refusal(system: system, usable: usable, pressure: pressure, requested: intensity.bytes) {
             message = refusal
             return
         }
+        guard operationGate.acquire(.memoryTest) else { return }
         isRunning = true
         allocatedBytes = 0
         elapsed = 0
@@ -93,8 +106,10 @@ final class MemoryTestController: ObservableObject {
             })
         }
         self.task = task
+        let operationGate = operationGate
         Task { [weak self] in
             let result = await task.value
+            operationGate.release(.memoryTest)
             guard let self else { return }
             self.message = result.message
             self.allocatedBytes = 0

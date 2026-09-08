@@ -285,6 +285,7 @@ final class MonitorViewModel: ObservableObject {
     @Published private(set) var healthCheckedAt = Date()
 
     let processActions: ProcessActionController
+    let smartCleanup: SmartCleanupController
     let loginLaunch: LoginLaunchCoordinator
     private var refreshTask: Task<Void, Never>?
     private var shutdownTask: Task<Void, Never>?
@@ -362,7 +363,10 @@ final class MonitorViewModel: ObservableObject {
         dateProvider: @escaping @MainActor () -> Date = { Date() },
         startRefreshTask: Bool = true
     ) {
-        self.processActions = processActions ?? ProcessActionController()
+        let actions = processActions ?? ProcessActionController()
+        self.processActions = actions
+        smartCleanup = SmartCleanupController(operationGate: actions.operationGate,
+            manualActionIsBusy: { [weak actions] in actions?.isBusy != false })
         loginLaunch = LoginLaunchCoordinator(runtime: loginLaunchRuntime)
         self.sampler = sampler
         self.historyStore = historyStore
@@ -617,6 +621,7 @@ final class MonitorViewModel: ObservableObject {
 
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
+            await self.smartCleanup.shutdown()
             if let activeRefreshTask {
                 await activeRefreshTask.value
             }

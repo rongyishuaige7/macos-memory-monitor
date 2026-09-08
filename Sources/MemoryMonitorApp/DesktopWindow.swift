@@ -38,12 +38,14 @@ final class DesktopNavigation: ObservableObject {
 @MainActor
 final class DesktopWindowCoordinator: NSObject, NSWindowDelegate {
     let navigation = DesktopNavigation()
-    let memoryTest = MemoryTestController()
+    let memoryTest: MemoryTestController
     private let model: MonitorViewModel
     private(set) var window: NSWindow?
 
     init(model: MonitorViewModel) {
         self.model = model
+        memoryTest = MemoryTestController(operationGate: model.processActions.operationGate,
+            manualActionIsBusy: { [weak model] in model?.processActions.isBusy != false })
     }
 
     func show(_ page: DesktopPage = .overview, process: ProcessIdentity? = nil, audit: Bool = false) {
@@ -79,6 +81,7 @@ final class DesktopWindowCoordinator: NSObject, NSWindowDelegate {
 
     func windowWillClose(_ notification: Notification) {
         memoryTest.stop()
+        model.smartCleanup.cancel()
         model.setDesktopPresented(false)
     }
 
