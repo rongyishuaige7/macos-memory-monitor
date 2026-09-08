@@ -415,6 +415,7 @@ final class AppIntegrationTests: XCTestCase {
             startRefreshTask: false,
             dateProvider: { referenceDate }
         )
+        XCTAssertFalse(model.smartCleanup.canStart, "Fixture mode cannot terminate real applications")
 
         await model.refreshOnce(at: referenceDate)
         await model.shutdown()

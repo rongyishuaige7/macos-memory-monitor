@@ -136,6 +136,7 @@ final class MemoryMonitorApplicationDelegate: NSObject, NSApplicationDelegate {
             sampler: makeSamplingSource(configuration: configuration),
             historyStore: historyStore,
             processActions: ProcessActionController(auditStore: auditStore),
+            cleanupExecutionEnabled: !configuration.usesUIFixture,
             dateProvider: dateProvider,
             startRefreshTask: startRefreshTask
         )
@@ -359,6 +360,7 @@ final class MonitorViewModel: ObservableObject {
         sampler: any MonitorSamplingSource = MonitorSampler(),
         historyStore: HistoryStore = HistoryStore(),
         processActions: ProcessActionController? = nil,
+        cleanupExecutionEnabled: Bool = true,
         recommendationTTL: TimeInterval = 5 * 60,
         dateProvider: @escaping @MainActor () -> Date = { Date() },
         startRefreshTask: Bool = true
@@ -366,6 +368,7 @@ final class MonitorViewModel: ObservableObject {
         let actions = processActions ?? ProcessActionController()
         self.processActions = actions
         smartCleanup = SmartCleanupController(operationGate: actions.operationGate,
+            executionEnabled: cleanupExecutionEnabled,
             manualActionIsBusy: { [weak actions] in actions?.isBusy != false })
         loginLaunch = LoginLaunchCoordinator(runtime: loginLaunchRuntime)
         self.sampler = sampler

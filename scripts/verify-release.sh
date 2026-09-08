@@ -26,7 +26,8 @@ git -C "$project_root" diff --check
 git -C "$project_root" diff --cached --check
 
 print "Running Swift tests..."
-swift test --package-path "$project_root" --parallel
+# Native AppKit tests share activation and window state on the same desktop.
+swift test --package-path "$project_root"
 
 print "Building Debug with strict concurrency..."
 swift build \

@@ -8,6 +8,8 @@ struct DesktopRelease: View {
     @ObservedObject var navigation: DesktopNavigation
     @State private var showsApplications = false
     @State private var showsResults = false
+    @AppStorage("desktopMotionEnabled") private var motionEnabled = true
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         ScrollView {
@@ -85,6 +87,12 @@ struct DesktopRelease: View {
 
     private var instrument: some View {
         ZStack {
+            CleanupParticles(phase: cleanup.phase,
+                tier: .resolve(enabled: motionEnabled && model.systemDataIsUsable && !showsApplications,
+                               reduceMotion: reduceMotion, pressure: model.pressureLevel),
+                pulse: cleanup.completionPulse, measuredBenefit: cleanup.result?.hasMeasuredBenefit == true)
+                .allowsHitTesting(false).accessibilityHidden(true)
+            ZStack {
             Circle().stroke(.primary.opacity(0.05), lineWidth: 16).padding(25)
             Circle().stroke(.cyan.opacity(0.2), style: StrokeStyle(lineWidth: 1, dash: [2, 8])).padding(9)
             Circle().trim(from: 0, to: progress).stroke(.cyan, style: StrokeStyle(lineWidth: 3, lineCap: .round))
@@ -95,17 +103,18 @@ struct DesktopRelease: View {
                     .font(.system(size: 29, weight: .semibold, design: .rounded)).monospacedDigit()
                 Text("可用内存").font(.system(size: 11)).foregroundStyle(.secondary)
             }
-        }.frame(width: 224, height: 224).accessibilityElement(children: .combine)
+            }.frame(width: 224, height: 224)
+        }.frame(maxWidth: .infinity).frame(height: 224).accessibilityElement(children: .combine)
     }
 
     private var progress: CGFloat {
-        guard cleanup.isBusy, cleanup.plannedCount > 0 else { return 0.72 }
-        return CGFloat(cleanup.completedCount) / CGFloat(cleanup.plannedCount)
+        guard model.systemDataIsUsable else { return 0 }
+        return CGFloat(model.system?.availableFraction ?? 0)
     }
 
     private var title: String {
         switch cleanup.phase {
-        case .idle: "让内存轻松一点"
+        case .idle: "准备释放内存"
         case .scanning: "正在检查可清理应用"
         case .quitting: "正在请求退出"
         case .waiting: "等待应用退出"

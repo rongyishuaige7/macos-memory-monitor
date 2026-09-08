@@ -36,7 +36,7 @@ final class DesktopMotionTests: XCTestCase {
         NSApp.setActivationPolicy(.regular)
         window.center()
         window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        try await activate(window)
         try await Task.sleep(for: .seconds(1))
         XCTAssertTrue(window.occlusionState.contains(.visible))
         view.configure(mode: .running, running: true, trigger: 0, allowed: false)
@@ -68,6 +68,7 @@ final class DesktopMotionTests: XCTestCase {
         XCTAssertNil(view.emitter)
         window.deminiaturize(nil)
         window.makeKeyAndOrderFront(nil)
+        try await activate(window)
         try await Task.sleep(for: .milliseconds(400))
         view.configure(mode: .running, running: true, trigger: 0, allowed: true)
         XCTAssertNotNil(view.emitter)
@@ -78,6 +79,7 @@ final class DesktopMotionTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(100))
         XCTAssertNil(view.emitter)
         window.makeKeyAndOrderFront(nil)
+        try await activate(window)
         try await Task.sleep(for: .milliseconds(100))
         view.configure(mode: .burst, running: false, trigger: 0, allowed: true)
         XCTAssertNil(view.emitter, "Merely entering the page cannot emit success particles")
@@ -122,6 +124,16 @@ final class DesktopMotionTests: XCTestCase {
             XCTAssertNotNil(view.emitter)
             print(String(format: "particle-cpu idle=%.3fs active=%.3fs over 3s each", idle, running))
         }
+    }
+
+    private func activate(_ window: NSWindow) async throws {
+        for _ in 0..<20 {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            try await Task.sleep(for: .milliseconds(100))
+            if NSRunningApplication.current.isActive { return }
+        }
+        XCTFail("The native motion test window could not become active")
     }
 
     private func cpuSeconds() -> Double {

@@ -6,6 +6,7 @@ import MemoryMonitorCore
 final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
     private let clock = ContinuousClock()
     private let origin = ContinuousClock.now
+    private let timeProvider: (@MainActor () -> TimeInterval)?
     private let sampler = ProcessSampler()
     private let policy = ProcessActionPolicy(currentUserID: UInt32(getuid()), monitorPID: Int32(getpid()))
     private var activity: [Int32: TimeInterval] = [:]
@@ -13,14 +14,17 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
     private var handles: [ProcessIdentity: NSRunningApplication] = [:]
 
     var now: TimeInterval {
+        if let timeProvider { return timeProvider() }
         let value = origin.duration(to: clock.now).components
         return Double(value.seconds) + Double(value.attoseconds) / 1e18
     }
 
-    override init() {
+    init(timeProvider: (@MainActor () -> TimeInterval)? = nil) {
+        self.timeProvider = timeProvider
         super.init()
         for app in NSWorkspace.shared.runningApplications { activity[app.processIdentifier] = now }
-        for name in [NSWorkspace.didActivateApplicationNotification, NSWorkspace.didLaunchApplicationNotification] {
+        for name in [NSWorkspace.didActivateApplicationNotification, NSWorkspace.didDeactivateApplicationNotification,
+                     NSWorkspace.didLaunchApplicationNotification] {
             NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(activated(_:)), name: name, object: nil)
         }
     }
@@ -61,6 +65,10 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
               process.executablePath.map(Self.canonical) == key.executablePath,
               policy.validate(expected: process, current: process).allowed else { return nil }
         let instant = now
+        if cpuSamples.keys.contains(where: { $0.pid == pid && $0 != process.identity }) {
+            activity[pid] = instant
+            cpuSamples = cpuSamples.filter { $0.key.pid != pid }
+        }
         if activity[pid] == nil { activity[pid] = instant }
         var cpu: Double?
         if let previous = cpuSamples[process.identity], instant - previous.time >= 0.25,

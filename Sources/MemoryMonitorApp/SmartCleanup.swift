@@ -65,7 +65,9 @@ struct CleanupResult: Equatable {
     let cancelled: Bool
     let measurementFailed: Bool
     var exitedCount: Int { entries.filter { $0.outcome == .exited }.count }
-    var hasMeasuredBenefit: Bool { exitedCount > 0 && (observedChangeBytes ?? 0) >= 16 * 1024 * 1024 }
+    var hasMeasuredBenefit: Bool {
+        !cancelled && !measurementFailed && exitedCount > 0 && (observedChangeBytes ?? 0) >= 16 * 1024 * 1024
+    }
     var title: String {
         if cancelled { return "已停止清理" }
         if exitedCount > 0 { return "已退出 \(exitedCount) 个应用" }
@@ -102,6 +104,7 @@ final class SmartCleanupController: ObservableObject {
     private let runtime: any SmartCleanupRuntime
     private let defaults: UserDefaults
     private let manualActionIsBusy: @MainActor () -> Bool
+    private let executionEnabled: Bool
     private let approvalKey = "smartCleanup.authorizedApplications.v1"
     private var task: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
@@ -111,12 +114,14 @@ final class SmartCleanupController: ObservableObject {
 
     init(runtime: (any SmartCleanupRuntime)? = nil, defaults: UserDefaults = .standard,
          operationGate: MonitorOperationGate = MonitorOperationGate(),
+         executionEnabled: Bool = true,
          manualActionIsBusy: @escaping @MainActor () -> Bool = { false }) {
         self.runtime = runtime ?? LiveSmartCleanupRuntime()
         self.defaults = defaults
         self.operationGate = operationGate
         self.manualActionIsBusy = manualActionIsBusy
-        if let data = defaults.data(forKey: approvalKey),
+        self.executionEnabled = executionEnabled
+        if executionEnabled, let data = defaults.data(forKey: approvalKey),
            let saved = try? JSONDecoder().decode([CleanupAuthorization].self, from: data) {
             authorizations = Set(saved)
         } else {
@@ -125,7 +130,7 @@ final class SmartCleanupController: ObservableObject {
     }
 
     var isBusy: Bool { task != nil }
-    var canStart: Bool { !isBusy && !shuttingDown && operationGate.owner == nil && !manualActionIsBusy() }
+    var canStart: Bool { executionEnabled && !isBusy && !shuttingDown && operationGate.owner == nil && !manualActionIsBusy() }
 
     func isAuthorized(_ application: CleanupApplication) -> Bool {
         authorizations.contains(application.authorization)
@@ -143,6 +148,7 @@ final class SmartCleanupController: ObservableObject {
     func revokeAll() { persist([]) }
 
     private func persist(_ next: Set<CleanupAuthorization>) {
+        guard executionEnabled else { return }
         guard let encoded = try? JSONEncoder().encode(Array(next)) else {
             notice = "无法保存清理名单，请重试。"
             return
@@ -152,7 +158,7 @@ final class SmartCleanupController: ObservableObject {
     }
 
     func refreshApplications() {
-        guard !isBusy, !isRefreshing, !shuttingDown else { return }
+        guard executionEnabled, !isBusy, !isRefreshing, !shuttingDown else { return }
         isRefreshing = true
         refreshTask = Task { [weak self] in
             guard let self else { return }
@@ -203,22 +209,28 @@ final class SmartCleanupController: ObservableObject {
         await task?.value
     }
 
-    private func memoryWindow() async throws -> UInt64? {
+    private struct MemoryWindow {
+        let available: UInt64
+        let total: UInt64
+    }
+
+    private func memoryWindow() async throws -> MemoryWindow? {
         var samples: [SystemMemorySnapshot] = []
         for index in 0..<3 {
             try Task.checkCancellation()
             guard let sample = await runtime.sampleMemory(), sample.isStructurallyValid else { return nil }
+            try Task.checkCancellation()
             samples.append(sample)
             if index < 2 { try await runtime.sleep(seconds: 0.35) }
         }
         guard Set(samples.map(\.totalBytes)).count == 1,
               zip(samples, samples.dropFirst()).allSatisfy({ $0.timestamp < $1.timestamp }) else { return nil }
-        return samples.map(\.availableEstimateBytes).sorted()[1]
+        return MemoryWindow(available: samples.map(\.availableEstimateBytes).sorted()[1], total: samples[0].totalBytes)
     }
 
     private func run() async {
-        var before: UInt64?
-        var after: UInt64?
+        var before: MemoryWindow?
+        var after: MemoryWindow?
         var planned: [CleanupApplication] = []
         do {
             before = try await memoryWindow()
@@ -267,12 +279,13 @@ final class SmartCleanupController: ObservableObject {
         finishResult(before: before, after: after)
     }
 
-    private func finishResult(before: UInt64?, after: UInt64?) {
-        let change: Int64? = if let before, let after, before <= UInt64(Int64.max), after <= UInt64(Int64.max) {
-            Int64(after) - Int64(before)
+    private func finishResult(before: MemoryWindow?, after: MemoryWindow?) {
+        let change: Int64? = if let before, let after, before.total == after.total,
+            before.available <= UInt64(Int64.max), after.available <= UInt64(Int64.max) {
+            Int64(after.available) - Int64(before.available)
         } else { nil }
         result = CleanupResult(entries: entries, observedChangeBytes: change, cancelled: Task.isCancelled,
-                               measurementFailed: before == nil || after == nil)
+                               measurementFailed: change == nil)
     }
 
     private func quit(_ app: CleanupApplication) async {

@@ -78,5 +78,63 @@ observed applications receive the same two-minute activity protection.
 Own-process malloc pressure relief is included, without claiming a guaranteed
 benefit or attributing its byte counter to global available-memory change.
 
-Stage 2 native quit integration, visual/motion captures and release verification
-are pending.
+Stage 2 verification:
+
+- All 320 Swift tests passed, including 14 cleanup behavior cases, native
+  AppKit quit/refusal integration, operation exclusion and fixture isolation.
+  The disposable test application received `applicationShouldTerminate`; a
+  refusal kept it running. No user application was a cleanup test target.
+- Debug and Release builds passed with `-strict-concurrency=complete`.
+- Native layout captures cover all six pages in both appearances at default
+  and minimum sizes, plus cleanup scanning/waiting/measurement/results and
+  authorization. The primary cleanup action remains visible at 800 x 560;
+  secondary content can scroll. Captures: `/private/tmp/memory-monitor-v130-layout/`.
+- Actual screen-pixel captures confirmed moving, nonblank particles. Lifecycle
+  tests cover visibility, activation, minimization, scrolling, pressure tiers,
+  bounded layers and no success replay. Captures:
+  `/private/tmp/memory-monitor-v130-motion/`.
+- A short isolated animation-process sample used 0.069 CPU seconds while idle
+  and 0.075 while active, over three seconds each. This excludes WindowServer
+  and GPU work and is not a frame-rate guarantee.
+- Native window tests now reactivate their test application after restoring a
+  minimized/hidden window. Release verification runs these tests serially
+  because they share desktop focus; production activation rules remain intact.
+- Cleanup now tracks departure from the foreground as recent use, checks
+  consistent physical-memory totals across measurement windows, and cannot
+  celebrate cancellation during the final sample. Fixture mode cannot execute
+  cleanup or read/write real cleanup authorizations.
+
+The original release verification completed all tests and Debug strict build,
+then blocked while the compiler read a response file in the Desktop build
+cache. Its test log is
+`/private/tmp/memory-monitor-v130-release-verification-final.log`.
+The successful strict Release build used
+`SWIFTPM_BUILD_DIR=/private/tmp/memory-monitor-v130-build` and
+`SWIFTPM_MODULECACHE_OVERRIDE=/private/tmp/memory-monitor-v130-module-cache`.
+Existing caches and user scratch directories were preserved. The remaining
+release gates passed separately: Release probe, structured compatibility,
+bundle version/architecture and strict signature verification. Log:
+`/private/tmp/memory-monitor-v130-release-remaining.log`. The interrupted script
+is not counted as a successful end-to-end run.
+
+- Built and ad-hoc signed version 1.3.0 (build 130), arm64, at
+  `~/Library/Application Support/MemoryMonitor/releases/1.3.0-final/MemoryMonitor.app`.
+  Desktop integration passed; the existing login item remains enabled.
+  Report: `/private/tmp/memory-monitor-v130-desktop-integration.json`.
+- Live mouse checks passed in light/dark appearances: opening the cleanup list,
+  clicking its search field without dismissal, keeping the primary action
+  visible at minimum size, changing/restoring the percentage setting, retaining
+  settings across deactivation and opening settings from the menu bar.
+  No cleanup authorization changed and no cleanup was started. Screenshots:
+  `/private/tmp/memory-monitor-v130-live/`; log:
+  `/private/tmp/memory-monitor-v130-live-ui.log`.
+- The previous 1.2.1 process exited normally. The verified 1.3.0 bundle is
+  running with `MEMORY_MONITOR_UI_CHECK_FIXTURE=0`, with the original appearance
+  and size restored and the release page selected. Prior bundles are retained.
+  The live system reported critical memory pressure during the UI checks, so
+  particles were appropriately disabled there; motion was verified separately
+  through the controlled native pixel/lifecycle tests above.
+
+Validation was performed on macOS 26.5.1, Apple Silicon. Other supported macOS
+versions were not available for this run. The local package uses ad-hoc signing,
+without Developer ID notarization.

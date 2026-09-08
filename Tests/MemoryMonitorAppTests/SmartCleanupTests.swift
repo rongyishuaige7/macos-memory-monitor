@@ -185,6 +185,19 @@ final class SmartCleanupTests: XCTestCase {
         XCTAssertTrue(controller.result?.cancelled == true)
     }
 
+    func testCancellationDuringFinalMeasurementCannotCelebrate() async {
+        let app = cleanupApp(1)
+        let (controller, runtime, _) = setup([observation(app)])
+        controller.setAuthorized(app, true)
+        runtime.afterBytes = runtime.beforeBytes + 64 * 1024 * 1024
+        runtime.onMemoryRead = { if runtime.memoryReads == 6 { controller.cancel() } }
+        controller.start()
+        await controller.waitUntilFinished()
+        XCTAssertTrue(controller.result?.cancelled == true)
+        XCTAssertNil(controller.result?.observedChangeBytes)
+        XCTAssertFalse(controller.result?.hasMeasuredBenefit == true)
+    }
+
     func testOperationGateBlocksManualAndMemoryTest() async {
         let (controller, _, _) = setup()
         XCTAssertTrue(controller.operationGate.acquire(.memoryTest))
@@ -214,6 +227,11 @@ final class SmartCleanupTests: XCTestCase {
         await second.shutdown()
         second.start()
         XCTAssertFalse(second.isBusy)
+        let disabled = SmartCleanupController(runtime: runtime, defaults: defaults, executionEnabled: false)
+        disabled.start()
+        XCTAssertFalse(disabled.isBusy, "UI fixture launches cannot terminate real applications")
+        disabled.setAuthorized(cleanupApp(1), true)
+        XCTAssertTrue(disabled.authorizations.isEmpty)
     }
 }
 
@@ -228,6 +246,7 @@ final class FakeCleanupRuntime: SmartCleanupRuntime {
     var onRequest: ((CleanupApplication) -> Void)?
     var onExitState: ((CleanupApplication) -> CleanupExitState)?
     var onSleep: (() -> Void)?
+    var onMemoryRead: (() -> Void)?
     var beforeBytes: UInt64 = 2 * 1024 * 1024 * 1024
     var afterBytes: UInt64 = 2 * 1024 * 1024 * 1024
     var memoryReads = 0
@@ -246,6 +265,7 @@ final class FakeCleanupRuntime: SmartCleanupRuntime {
     func exitState(_ app: CleanupApplication) -> CleanupExitState { onExitState?(app) ?? exitResult }
     func sampleMemory() async -> SystemMemorySnapshot? {
         memoryReads += 1
+        onMemoryRead?()
         if memoryReads == failMemoryRead { return nil }
         return cleanupMemory(bytes: memoryReads > 3 ? afterBytes : beforeBytes, timestamp: Double(memoryReads))
     }

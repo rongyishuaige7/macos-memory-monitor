@@ -134,6 +134,56 @@ final class DesktopPresentationTests: XCTestCase {
         await model.shutdown()
     }
 
+    func testCleanupStatesAndAuthorizationSheetRender() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("cleanup-render-" + UUID().uuidString)
+        let dataset = MemoryMonitorUIFixture.makeDataset()
+        let model = MonitorViewModel(sampler: MemoryMonitorUIFixtureSamplingSource(dataset: dataset),
+            historyStore: HistoryStore(fileURL: root.appendingPathComponent("history.json")),
+            processActions: ProcessActionController(auditStore: ProcessActionAuditStore(fileURL: root.appendingPathComponent("audit.jsonl"))),
+            startRefreshTask: false)
+        await model.refreshOnce(at: dataset.referenceDate)
+        let suite = "cleanup-render-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        for appearance in ["dark", "light"] {
+            defaults.set(appearance, forKey: "desktopAppearance")
+            let runtime = FakeCleanupRuntime()
+            runtime.observations = (1...4).map { observation(cleanupApp($0)) }
+            runtime.exitResult = .running
+            runtime.afterBytes = runtime.beforeBytes + 64 * 1024 * 1024
+            let cleanup = SmartCleanupController(runtime: runtime, defaults: defaults)
+            cleanup.setAuthorized(cleanupApp(1), true)
+            cleanup.setAuthorized(cleanupApp(2), true)
+            let navigation = DesktopNavigation()
+            let view = DesktopRelease(model: model, cleanup: cleanup, navigation: navigation)
+                .background(Color(nsColor: .windowBackgroundColor))
+                .defaultAppStorage(defaults).environment(\.colorScheme, appearance == "dark" ? .dark : .light)
+            var recorded: Set<String> = []
+            runtime.onSleep = {
+                let name = String(describing: cleanup.phase)
+                if recorded.insert(name).inserted {
+                    do { try self.render(view, name: "cleanup-\(name)-\(appearance)", size: NSSize(width: 617, height: 458)) }
+                    catch { XCTFail("Cleanup render failed: \(error)") }
+                }
+                if cleanup.phase == .waiting { runtime.exitResult = .exited }
+            }
+            cleanup.start()
+            await cleanup.waitUntilFinished()
+            XCTAssertTrue(recorded.contains("scanning"))
+            XCTAssertTrue(recorded.contains("waiting"))
+            XCTAssertTrue(recorded.contains("measuring"))
+            try render(view, name: "cleanup-result-\(appearance)", size: NSSize(width: 617, height: 458))
+            cleanup.refreshApplications()
+            for _ in 0..<100 where cleanup.isRefreshing { await Task.yield() }
+            XCTAssertFalse(cleanup.applications.isEmpty)
+            try render(CleanupApplicationsSheet(cleanup: cleanup).background(Color(nsColor: .windowBackgroundColor))
+                .environment(\.colorScheme, appearance == "dark" ? .dark : .light),
+                       name: "cleanup-authorization-\(appearance)", size: NSSize(width: 520, height: 480))
+            await cleanup.shutdown()
+        }
+        await model.shutdown()
+    }
+
     private func render<V: View>(_ view: V, name: String, size: NSSize) throws {
         let hosting = NSHostingView(rootView: view.frame(width: size.width, height: size.height))
         hosting.frame = NSRect(origin: .zero, size: size)
