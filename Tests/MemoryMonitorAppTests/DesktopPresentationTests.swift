@@ -108,6 +108,7 @@ final class DesktopPresentationTests: XCTestCase {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("desktop-render-" + UUID().uuidString)
         let dataset = MemoryMonitorUIFixture.makeDataset()
         let history = HistoryStore(fileURL: root.appendingPathComponent("history.json"))
+        _ = try await history.merge(records: dataset.historyRecords, now: dataset.referenceDate)
         let model = MonitorViewModel(sampler: MemoryMonitorUIFixtureSamplingSource(dataset: dataset),
             historyStore: history,
             processActions: ProcessActionController(auditStore: ProcessActionAuditStore(fileURL: root.appendingPathComponent("audit.jsonl"))),

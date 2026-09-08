@@ -1,5 +1,4 @@
 import AppKit
-import Charts
 import MemoryMonitorCore
 import SwiftUI
 
@@ -254,76 +253,6 @@ private struct MemoryMetric: View {
     }
 }
 
-struct MemoryTrend: View {
-    let records: [MemoryHistoryRecord]
-    let hours: Int
-    let now: Date
-    var compact = false
-    var sparkline = false
-    @State private var points: [MemoryHistoryRecord] = []
-    @State private var segments: [Date: Int] = [:]
-    @State private var isolatedPoints = Set<Date>()
-    @State private var selectedDate: Date?
-
-    var body: some View {
-        Group {
-            if points.isEmpty {
-                ContentUnavailableView("还没有历史记录", systemImage: "chart.xyaxis.line")
-            } else {
-                Chart {
-                    ForEach(points) { record in
-                        AreaMark(x: .value("时间", record.timestamp), yStart: .value("基线", 0),
-                                 yEnd: .value("使用率", record.usedFraction * 100),
-                                 series: .value("连续记录", segments[record.timestamp] ?? 0))
-                            .foregroundStyle(LinearGradient(colors: [.cyan.opacity(0.22), .cyan.opacity(0.01)],
-                                                            startPoint: .top, endPoint: .bottom))
-                        LineMark(x: .value("时间", record.timestamp), y: .value("使用率", record.usedFraction * 100),
-                                 series: .value("连续记录", segments[record.timestamp] ?? 0))
-                            .foregroundStyle(.cyan).lineStyle(StrokeStyle(lineWidth: 2))
-                        if isolatedPoints.contains(record.timestamp) {
-                            PointMark(x: .value("时间", record.timestamp), y: .value("使用率", record.usedFraction * 100))
-                                .foregroundStyle(.cyan)
-                        }
-                    }
-                    if let selectedDate, let nearest = points.min(by: {
-                        abs($0.timestamp.timeIntervalSince(selectedDate)) < abs($1.timestamp.timeIntervalSince(selectedDate))
-                    }) {
-                        RuleMark(x: .value("时间", nearest.timestamp)).foregroundStyle(.secondary.opacity(0.4))
-                            .annotation(position: .top, overflowResolution: .init(x: .fit(to: .chart), y: .fit(to: .chart))) {
-                                Text("\(nearest.timestamp.formatted(date: .omitted, time: .shortened)) · \(Int(nearest.usedFraction * 100))%")
-                                    .font(.caption).padding(6).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 5))
-                            }
-                    }
-                }
-                .chartXScale(domain: now.addingTimeInterval(-Double(hours) * 3600)...now)
-                .chartYScale(domain: 0...100)
-                .chartXAxis { AxisMarks(values: .automatic(desiredCount: compact ? 3 : 5)) {
-                    AxisValueLabel(format: .dateTime.hour().minute())
-                } }
-                .chartYAxis {
-                    AxisMarks(position: .leading, values: compact ? [0, 50, 100] : [0, 25, 50, 75, 100]) { value in
-                        AxisGridLine().foregroundStyle(.secondary.opacity(0.12))
-                        AxisValueLabel { if let number = value.as(Int.self) { Text("\(number)%") } }
-                    }
-                }
-                .chartXSelection(value: $selectedDate)
-                .chartXAxis(sparkline ? .hidden : .automatic)
-                .chartYAxis(sparkline ? .hidden : .automatic)
-            }
-        }
-        .onChange(of: records, initial: true) { rebuild() }
-        .onChange(of: hours) { rebuild() }
-        .onChange(of: now) { rebuild() }
-    }
-
-    private func rebuild() {
-        points = DesktopPresentation.chartRecords(records, hours: hours, now: now)
-        segments = DesktopPresentation.chartSegments(records, hours: hours, now: now)
-        let counts = Dictionary(grouping: points, by: { segments[$0.timestamp] ?? 0 }).mapValues(\.count)
-        isolatedPoints = Set(points.filter { counts[segments[$0.timestamp] ?? 0] == 1 }.map(\.timestamp))
-    }
-}
-
 struct ProcessAppIcon: View {
     let process: ProcessSnapshot
     var body: some View {
@@ -448,43 +377,6 @@ struct DesktopProcesses: View {
     private func rebuild() {
         rows = DesktopPresentation.groupedProcesses(model.groups, processes: model.processes, query: query,
             includeSystem: includesSystem, sort: sort, cpu: model.processCPUPercent)
-    }
-}
-
-struct DesktopHistory: View {
-    @ObservedObject var model: MonitorViewModel
-    @State private var hours = 1
-    @State private var initializedRange = false
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 26) {
-                Picker("时间范围", selection: $hours) {
-                    Text("1 小时").tag(1)
-                    Text("6 小时").tag(6)
-                    Text("24 小时").tag(24)
-                }.pickerStyle(.segmented).labelsHidden()
-                MemoryTrend(records: model.history, hours: hours, now: model.updatedAt ?? Date())
-                    .frame(height: 245)
-                HStack {
-                    Label("内存使用率", systemImage: "circle.fill").foregroundStyle(.cyan)
-                    Spacer()
-                    Text("\(model.history.count) 条记录").foregroundStyle(.secondary)
-                }.font(.caption)
-                Divider()
-                Text("当前内存").font(.headline)
-                MemoryMetrics(system: model.systemDataIsUsable ? model.system : nil)
-                if model.historyError != nil {
-                    Label("历史记录暂时无法保存", systemImage: "exclamationmark.triangle")
-                        .font(.caption).foregroundStyle(.orange)
-                }
-            }.padding(28)
-        }
-        .onChange(of: model.history, initial: true) {
-            guard !initializedRange, !model.history.isEmpty else { return }
-            hours = DesktopPresentation.initialHistoryHours(model.history, now: model.updatedAt ?? Date())
-            initializedRange = true
-        }
     }
 }
 
