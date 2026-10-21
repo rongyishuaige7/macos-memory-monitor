@@ -42,10 +42,11 @@ final class DesktopWindowCoordinator: NSObject, NSWindowDelegate {
     private let model: MonitorViewModel
     private(set) var window: NSWindow?
 
-    init(model: MonitorViewModel) {
+    init(model: MonitorViewModel, allowsMemoryTest: Bool = false) {
         self.model = model
         memoryTest = MemoryTestController(operationGate: model.processActions.operationGate,
-            manualActionIsBusy: { [weak model] in model?.processActions.isBusy != false })
+            manualActionIsBusy: { [weak model] in model?.processActions.isBusy != false },
+            executionEnabled: allowsMemoryTest)
     }
 
     func show(_ page: DesktopPage = .overview, process: ProcessIdentity? = nil, audit: Bool = false) {

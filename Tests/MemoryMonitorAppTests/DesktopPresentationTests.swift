@@ -90,6 +90,19 @@ final class DesktopPresentationTests: XCTestCase {
         XCTAssertNil(MemoryTestPolicy.refusal(system: system, usable: true, pressure: .normal, requested: 128 * 1024 * 1024))
     }
 
+    func testMemoryTestControllerIsDisabledByDefault() {
+        let test = MemoryTestController()
+        XCTAssertFalse(test.isEnabled)
+        test.start(
+            system: nil,
+            usable: false,
+            pressure: nil,
+            intensity: .light
+        )
+        XCTAssertFalse(test.isRunning)
+        XCTAssertTrue(test.message?.contains("不允许") == true)
+    }
+
     func testWorkerCancelsAndRefusesPressureWithoutLargeAllocations() async {
         let refused = await MemoryTestWorker.run(bytes: 1024, check: { false }, progress: { _, _ in })
         XCTAssertFalse(refused.completed)

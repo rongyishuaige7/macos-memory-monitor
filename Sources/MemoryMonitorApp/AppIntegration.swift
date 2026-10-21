@@ -133,6 +133,32 @@ final class LiveLoginLaunchRuntime: LoginLaunchRuntime {
     }
 }
 
+/// Read-only login-item runtime used by UI-check fixtures. It reports an
+/// explicit unavailable state and refuses registration instead of touching the
+/// user's real Login Items database.
+@MainActor
+final class ReadOnlyLoginLaunchRuntime: LoginLaunchRuntime {
+    private let statusValue: LoginLaunchStatus
+
+    init(
+        status: LoginLaunchStatus = .unavailable("UI check 模式：登录启动已禁用")
+    ) {
+        statusValue = status
+    }
+
+    func status() -> LoginLaunchStatus { statusValue }
+
+    func register() async throws {
+        throw LoginLaunchRuntimeError.unavailable("UI check 模式不允许修改登录项")
+    }
+
+    func unregister() async throws {
+        throw LoginLaunchRuntimeError.unavailable("UI check 模式不允许修改登录项")
+    }
+
+    func openSystemSettings() {}
+}
+
 @MainActor
 final class LoginLaunchCoordinator: ObservableObject {
     @Published private(set) var status: LoginLaunchStatus = .unavailable("正在检查…")

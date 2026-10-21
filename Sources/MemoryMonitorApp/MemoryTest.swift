@@ -72,17 +72,27 @@ final class MemoryTestController: ObservableObject {
     @Published private(set) var allocatedBytes = 0
     @Published private(set) var elapsed = 0
     @Published private(set) var message: String?
+    /// Destructive features default to disabled. Production creates this
+    /// controller with execution enabled; UI-check fixtures and previews must
+    /// opt in explicitly instead of allocating real memory by accident.
+    let isEnabled: Bool
     private var task: Task<MemoryTestResult, Never>?
     private let operationGate: MonitorOperationGate
     private let manualActionIsBusy: @MainActor () -> Bool
 
     init(operationGate: MonitorOperationGate = MonitorOperationGate(),
-         manualActionIsBusy: @escaping @MainActor () -> Bool = { false }) {
+         manualActionIsBusy: @escaping @MainActor () -> Bool = { false },
+         executionEnabled: Bool = false) {
         self.operationGate = operationGate
         self.manualActionIsBusy = manualActionIsBusy
+        self.isEnabled = executionEnabled
     }
 
     func start(system: SystemMemorySnapshot?, usable: Bool, pressure: MemoryPressureLevel?, intensity: MemoryTestIntensity) {
+        guard isEnabled else {
+            message = "当前模式不允许运行内存测试。"
+            return
+        }
         guard !isRunning else { return }
         guard !manualActionIsBusy(), operationGate.owner == nil else {
             message = "请等待清理或进程操作结束。"

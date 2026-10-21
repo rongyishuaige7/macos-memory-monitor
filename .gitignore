@@ -5,3 +5,10 @@ DerivedData/
 *.xcodeproj/xcuserdata/
 *.xcworkspace/xcuserdata/
 .DS_Store
+
+# Local scratch probes, editor duplicate files and test leftovers. These are
+# preserved on disk but must not participate in package builds or reviews.
+Scratch/
+TemporaryDirectory.*/
+* 2.swift
+*.log

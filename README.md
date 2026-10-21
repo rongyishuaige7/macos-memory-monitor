@@ -47,8 +47,10 @@ UI fixture 模式禁用智能清理执行，避免演示数据触发真实应用
 [1.2.0 界面优化](docs/visual-refinement-v1.2.0.md)、
 [1.2.1 应用标识](docs/brand-identity-v1.2.1.md)、
 [1.3.0 智能清理](docs/smart-cleanup-v1.3.0.md) 和
-[1.3.1 统计图优化](docs/history-chart-v1.3.1.md)。以下章节保留早期设计
-与历次实现背景，当前界面以上述文档为准。
+[1.3.1 统计图优化](docs/history-chart-v1.3.1.md)。当前 v1.4.0 稳定化
+工作的范围、风险和分阶段验收见
+[stabilization-v1.4.0.md](docs/stabilization-v1.4.0.md)。以下章节保留
+早期设计与历次实现背景，当前界面以上述文档为准。
 
 ## 1. 产品定位
 

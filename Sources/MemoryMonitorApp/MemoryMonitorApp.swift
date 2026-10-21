@@ -68,26 +68,57 @@ struct MemoryMonitorApp: App {
 
 struct MemoryMonitorLaunchConfiguration: Equatable {
     let usesUIFixture: Bool
+    /// True whenever the explicit UI-check switch was present, even if its
+    /// storage root was missing or untrusted. Destructive capabilities are
+    /// disabled for both the valid and the fail-closed fallback launch.
+    let fixtureRequested: Bool
     let storageRoot: URL
 
     static func resolve(environment: [String: String]) -> Self {
-        guard let isolatedRoot = MemoryMonitorUIFixture.isolatedStorageRootURL(
+        let fixtureRequested = MemoryMonitorUIFixture.isEnabled(environment: environment)
+        if let isolatedRoot = MemoryMonitorUIFixture.isolatedStorageRootURL(
             environment: environment
-        ) else {
+        ) {
             return Self(
-                usesUIFixture: false,
-                storageRoot: MemoryMonitorStoragePaths.defaultRootURL
+                usesUIFixture: true,
+                fixtureRequested: true,
+                storageRoot: isolatedRoot
             )
         }
-        return Self(usesUIFixture: true, storageRoot: isolatedRoot)
+        if fixtureRequested {
+            // The fixture switch was supplied without a trustworthy storage
+            // root. Keep the synthetic sampler and disable destructive
+            // capabilities instead of silently falling back to the user's
+            // production store. The generated root is a Darwin user temp
+            // directory and is safe to recreate on every launch.
+            let fallbackRoot = FileManager.default.temporaryDirectory
+                .appendingPathComponent(
+                    "MemoryMonitorFixtureFallback-\(UUID().uuidString)",
+                    isDirectory: true
+                )
+            return Self(
+                usesUIFixture: true,
+                fixtureRequested: true,
+                storageRoot: fallbackRoot
+            )
+        }
+        return Self(
+            usesUIFixture: false,
+            fixtureRequested: false,
+            storageRoot: MemoryMonitorStoragePaths.defaultRootURL
+        )
     }
 }
 
 @MainActor
 final class MemoryMonitorApplicationDelegate: NSObject, NSApplicationDelegate {
     let model: MonitorViewModel
-    lazy var desktop = DesktopWindowCoordinator(model: model)
+    lazy var desktop = DesktopWindowCoordinator(
+        model: model,
+        allowsMemoryTest: allowsMemoryTest
+    )
     let terminationAction = ApplicationTerminationAction()
+    private let allowsMemoryTest: Bool
     private let terminationCoordinator: ApplicationTerminationCoordinator
 
     /// Selects the sampling source without reading global state in tests.
@@ -121,7 +152,18 @@ final class MemoryMonitorApplicationDelegate: NSObject, NSApplicationDelegate {
         startRefreshTask: Bool = true,
         dateProvider: @escaping @MainActor () -> Date = { Date() }
     ) -> MonitorViewModel {
-        let configuration = resolveLaunchConfiguration(environment: environment)
+        makeModel(
+            configuration: resolveLaunchConfiguration(environment: environment),
+            startRefreshTask: startRefreshTask,
+            dateProvider: dateProvider
+        )
+    }
+
+    static func makeModel(
+        configuration: MemoryMonitorLaunchConfiguration,
+        startRefreshTask: Bool = true,
+        dateProvider: @escaping @MainActor () -> Date = { Date() }
+    ) -> MonitorViewModel {
         let historyStore = HistoryStore(
             fileURL: MemoryMonitorStoragePaths.historyFileURL(
                 root: configuration.storageRoot
@@ -133,6 +175,9 @@ final class MemoryMonitorApplicationDelegate: NSObject, NSApplicationDelegate {
             )
         )
         return MonitorViewModel(
+            loginLaunchRuntime: configuration.fixtureRequested
+                ? ReadOnlyLoginLaunchRuntime()
+                : nil,
             sampler: makeSamplingSource(configuration: configuration),
             historyStore: historyStore,
             processActions: ProcessActionController(auditStore: auditStore),
@@ -143,14 +188,22 @@ final class MemoryMonitorApplicationDelegate: NSObject, NSApplicationDelegate {
     }
 
     override convenience init() {
-        self.init(model: Self.makeModel(environment: ProcessInfo.processInfo.environment))
+        let configuration = Self.resolveLaunchConfiguration(
+            environment: ProcessInfo.processInfo.environment
+        )
+        self.init(
+            model: Self.makeModel(configuration: configuration),
+            allowsMemoryTest: !configuration.fixtureRequested
+        )
     }
 
     init(
         model: MonitorViewModel,
-        terminationTimeoutSeconds: TimeInterval = 5
+        terminationTimeoutSeconds: TimeInterval = 5,
+        allowsMemoryTest: Bool = false
     ) {
         self.model = model
+        self.allowsMemoryTest = allowsMemoryTest
         terminationCoordinator = ApplicationTerminationCoordinator(
             timeoutSeconds: terminationTimeoutSeconds
         )
@@ -358,18 +411,17 @@ final class MonitorViewModel: ObservableObject {
     init(
         loginLaunchRuntime: (any LoginLaunchRuntime)? = nil,
         sampler: any MonitorSamplingSource = MonitorSampler(),
-        historyStore: HistoryStore = HistoryStore(),
-        processActions: ProcessActionController? = nil,
-        cleanupExecutionEnabled: Bool = true,
+        historyStore: HistoryStore,
+        processActions: ProcessActionController,
+        cleanupExecutionEnabled: Bool = false,
         recommendationTTL: TimeInterval = 5 * 60,
         dateProvider: @escaping @MainActor () -> Date = { Date() },
         startRefreshTask: Bool = true
     ) {
-        let actions = processActions ?? ProcessActionController()
-        self.processActions = actions
-        smartCleanup = SmartCleanupController(operationGate: actions.operationGate,
+        self.processActions = processActions
+        smartCleanup = SmartCleanupController(operationGate: processActions.operationGate,
             executionEnabled: cleanupExecutionEnabled,
-            manualActionIsBusy: { [weak actions] in actions?.isBusy != false })
+            manualActionIsBusy: { [weak processActions] in processActions?.isBusy != false })
         loginLaunch = LoginLaunchCoordinator(runtime: loginLaunchRuntime)
         self.sampler = sampler
         self.historyStore = historyStore

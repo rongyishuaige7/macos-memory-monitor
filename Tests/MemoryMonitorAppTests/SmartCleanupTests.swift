@@ -210,7 +210,7 @@ final class SmartCleanupTests: XCTestCase {
         XCTAssertTrue(actions.operationGate.acquire(.cleanup))
         actions.requestGracefulExit(for: cleanupApp(1).process)
         guard case .denied = actions.state else { return XCTFail("Manual requests must be denied during cleanup") }
-        let test = MemoryTestController(operationGate: actions.operationGate)
+        let test = MemoryTestController(operationGate: actions.operationGate, executionEnabled: true)
         test.start(system: cleanupMemory(bytes: 4 * 1024 * 1024 * 1024, timestamp: 1), usable: true, pressure: .normal, intensity: .light)
         XCTAssertFalse(test.isRunning)
         XCTAssertTrue(test.message?.contains("等待") == true)

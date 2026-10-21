@@ -5,7 +5,11 @@ import XCTest
 @MainActor
 final class DesktopWindowTests: XCTestCase {
     func testClosingPopoverKeepsDesktopSamplingActive() async {
-        let model = MonitorViewModel(startRefreshTask: false)
+        let model = MonitorViewModel(
+            historyStore: makeTemporaryHistoryStore("desktop-window-history"),
+            processActions: makeTemporaryProcessActions("desktop-window-actions"),
+            startRefreshTask: false
+        )
         model.setDesktopPresented(true)
         model.setPanelPresented(true)
         model.setPanelPresented(false)
@@ -20,7 +24,11 @@ final class DesktopWindowTests: XCTestCase {
     }
 
     func testSettingsWindowSurvivesPopoverDismissalAndReusesWindow() async throws {
-        let model = MonitorViewModel(startRefreshTask: false)
+        let model = MonitorViewModel(
+            historyStore: makeTemporaryHistoryStore("desktop-window-settings-history"),
+            processActions: makeTemporaryProcessActions("desktop-window-settings-actions"),
+            startRefreshTask: false
+        )
         let coordinator = DesktopWindowCoordinator(model: model)
         coordinator.show(.settings)
         let window = try XCTUnwrap(coordinator.window)

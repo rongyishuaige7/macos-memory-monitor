@@ -93,6 +93,29 @@ final class AppIntegrationTests: XCTestCase {
         XCTAssertEqual(coordinator.status, .notRegistered)
     }
 
+    func testReadOnlyLoginRuntimeRefusesRegistration() async {
+        let runtime = ReadOnlyLoginLaunchRuntime()
+        XCTAssertFalse(runtime.status().isRegistered)
+
+        do {
+            try await runtime.register()
+            XCTFail("read-only login runtime must refuse registration")
+        } catch let error as LoginLaunchRuntimeError {
+            XCTAssertTrue(error.localizedDescription.contains("不允许"))
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+
+        do {
+            try await runtime.unregister()
+            XCTFail("read-only login runtime must refuse unregistration")
+        } catch let error as LoginLaunchRuntimeError {
+            XCTAssertTrue(error.localizedDescription.contains("不允许"))
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+
     func testLoginCoordinatorCancelsInFlightUpdateAndClearsBusyState() async {
         let runtime = BlockingLoginLaunchRuntime()
         let coordinator = LoginLaunchCoordinator(runtime: runtime)
@@ -340,10 +363,12 @@ final class AppIntegrationTests: XCTestCase {
             XCTAssertTrue(source is MonitorSampler, "unexpected source for \(value)")
         }
 
+        // A lone fixture switch must fail closed into synthetic data rather
+        // than silently launching the production sampler.
         XCTAssertTrue(
             MemoryMonitorApplicationDelegate.makeSamplingSource(
                 environment: [MemoryMonitorUIFixture.environmentKey: "1"]
-            ) is MonitorSampler
+            ) is MemoryMonitorUIFixtureSamplingSource
         )
         XCTAssertTrue(
             MemoryMonitorApplicationDelegate.makeSamplingSource(
@@ -364,6 +389,7 @@ final class AppIntegrationTests: XCTestCase {
             environment: fixtureEnvironment
         )
         XCTAssertTrue(fixtureConfiguration.usesUIFixture)
+        XCTAssertTrue(fixtureConfiguration.fixtureRequested)
         XCTAssertEqual(
             fixtureConfiguration.storageRoot,
             URL(fileURLWithPath: "/tmp/paired", isDirectory: true)
@@ -371,18 +397,36 @@ final class AppIntegrationTests: XCTestCase {
                 .standardizedFileURL
         )
 
-        let fallbackRoot = MemoryMonitorStoragePaths.defaultRootURL
+        let productionRoot = MemoryMonitorStoragePaths.defaultRootURL
         for environment in [
             [:],
-            [MemoryMonitorUIFixture.environmentKey: "1"],
-            [storageKey: "/tmp/memory-monitor-ui-check/paired"],
-            [MemoryMonitorUIFixture.environmentKey: "1", storageKey: "/Users/example/production"]
+            [storageKey: "/tmp/memory-monitor-ui-check/paired"]
         ] {
             let configuration = MemoryMonitorApplicationDelegate.resolveLaunchConfiguration(
                 environment: environment
             )
             XCTAssertFalse(configuration.usesUIFixture, "unexpected fixture mode: \(environment)")
-            XCTAssertEqual(configuration.storageRoot, fallbackRoot)
+            XCTAssertFalse(configuration.fixtureRequested)
+            XCTAssertEqual(configuration.storageRoot, productionRoot)
+        }
+
+        // A fixture switch without a trustworthy root must fail closed:
+        // synthetic sampler, temporary storage, no production path.
+        for environment in [
+            [MemoryMonitorUIFixture.environmentKey: "1"],
+            [MemoryMonitorUIFixture.environmentKey: "1", storageKey: "/Users/example/production"]
+        ] {
+            let configuration = MemoryMonitorApplicationDelegate.resolveLaunchConfiguration(
+                environment: environment
+            )
+            XCTAssertTrue(configuration.usesUIFixture, "fixture must fail closed: \(environment)")
+            XCTAssertTrue(configuration.fixtureRequested)
+            XCTAssertNotEqual(configuration.storageRoot, productionRoot)
+            XCTAssertTrue(
+                configuration.storageRoot.lastPathComponent
+                    .hasPrefix("MemoryMonitorFixtureFallback-"),
+                "unexpected fallback root: \(configuration.storageRoot.path)"
+            )
         }
     }
 
@@ -416,6 +460,8 @@ final class AppIntegrationTests: XCTestCase {
             dateProvider: { referenceDate }
         )
         XCTAssertFalse(model.smartCleanup.canStart, "Fixture mode cannot terminate real applications")
+        XCTAssertFalse(model.loginLaunch.status.isRegistered)
+        XCTAssertEqual(model.loginLaunch.status.title, "不可用")
 
         await model.refreshOnce(at: referenceDate)
         await model.shutdown()
@@ -603,6 +649,7 @@ final class AppIntegrationTests: XCTestCase {
         let model = MonitorViewModel(
             sampler: source,
             historyStore: HistoryStore(fileURL: url),
+            processActions: makeTemporaryProcessActions(),
             startRefreshTask: false
         )
         model.setPanelPresented(true)
@@ -654,6 +701,7 @@ final class AppIntegrationTests: XCTestCase {
         let model = MonitorViewModel(
             sampler: source,
             historyStore: HistoryStore(fileURL: url),
+            processActions: makeTemporaryProcessActions(),
             startRefreshTask: false
         )
         model.setPanelPresented(true)
@@ -695,6 +743,7 @@ final class AppIntegrationTests: XCTestCase {
         let model = MonitorViewModel(
             sampler: source,
             historyStore: HistoryStore(fileURL: url),
+            processActions: makeTemporaryProcessActions(),
             startRefreshTask: false
         )
         model.setPanelPresented(true)
@@ -745,6 +794,7 @@ final class AppIntegrationTests: XCTestCase {
         let model = MonitorViewModel(
             sampler: source,
             historyStore: HistoryStore(fileURL: url),
+            processActions: makeTemporaryProcessActions(),
             startRefreshTask: false
         )
 
@@ -957,6 +1007,7 @@ final class AppIntegrationTests: XCTestCase {
         var model: MonitorViewModel? = MonitorViewModel(
             sampler: source,
             historyStore: HistoryStore(fileURL: url),
+            processActions: makeTemporaryProcessActions(),
             startRefreshTask: true
         )
         weakModel = model
@@ -1006,6 +1057,7 @@ final class AppIntegrationTests: XCTestCase {
         let model = MonitorViewModel(
             sampler: source,
             historyStore: HistoryStore(fileURL: url),
+            processActions: makeTemporaryProcessActions(),
             startRefreshTask: false
         )
 
@@ -1044,6 +1096,7 @@ final class AppIntegrationTests: XCTestCase {
         let model = MonitorViewModel(
             sampler: source,
             historyStore: HistoryStore(fileURL: url),
+            processActions: makeTemporaryProcessActions(),
             startRefreshTask: false
         )
 
@@ -1093,6 +1146,7 @@ final class AppIntegrationTests: XCTestCase {
         let model = MonitorViewModel(
             sampler: source,
             historyStore: HistoryStore(fileURL: url),
+            processActions: makeTemporaryProcessActions(),
             startRefreshTask: false
         )
 
@@ -1136,6 +1190,7 @@ final class AppIntegrationTests: XCTestCase {
             let model = MonitorViewModel(
                 sampler: source,
                 historyStore: HistoryStore(fileURL: url),
+                processActions: makeTemporaryProcessActions(),
                 startRefreshTask: false
             )
 
@@ -1175,6 +1230,7 @@ final class AppIntegrationTests: XCTestCase {
         let model = MonitorViewModel(
             sampler: source,
             historyStore: HistoryStore(fileURL: url),
+            processActions: makeTemporaryProcessActions(),
             startRefreshTask: false
         )
         model.setPanelPresented(true)
@@ -1227,6 +1283,7 @@ final class AppIntegrationTests: XCTestCase {
         let model = MonitorViewModel(
             sampler: source,
             historyStore: HistoryStore(fileURL: url),
+            processActions: makeTemporaryProcessActions(),
             dateProvider: { clock.now },
             startRefreshTask: false
         )
@@ -1292,6 +1349,7 @@ final class AppIntegrationTests: XCTestCase {
         let model = MonitorViewModel(
             sampler: source,
             historyStore: HistoryStore(fileURL: url),
+            processActions: makeTemporaryProcessActions(),
             startRefreshTask: false
         )
         model.setPanelPresented(true)
@@ -1337,6 +1395,7 @@ final class AppIntegrationTests: XCTestCase {
         let model = MonitorViewModel(
             sampler: source,
             historyStore: HistoryStore(fileURL: url),
+            processActions: makeTemporaryProcessActions(),
             startRefreshTask: false
         )
         model.setPanelPresented(true)
@@ -1374,6 +1433,7 @@ final class AppIntegrationTests: XCTestCase {
         let model = MonitorViewModel(
             sampler: source,
             historyStore: HistoryStore(fileURL: url),
+            processActions: makeTemporaryProcessActions(),
             startRefreshTask: false
         )
         let before = model.healthCheckedAt
@@ -1473,6 +1533,7 @@ final class AppIntegrationTests: XCTestCase {
         let model = MonitorViewModel(
             sampler: source,
             historyStore: HistoryStore(fileURL: url),
+            processActions: makeTemporaryProcessActions(),
             startRefreshTask: false
         )
         model.setPanelPresented(true)
@@ -1524,6 +1585,7 @@ final class AppIntegrationTests: XCTestCase {
         let model = MonitorViewModel(
             sampler: source,
             historyStore: HistoryStore(fileURL: url),
+            processActions: makeTemporaryProcessActions(),
             startRefreshTask: false
         )
         model.setPanelPresented(true)
@@ -1584,6 +1646,7 @@ final class AppIntegrationTests: XCTestCase {
         let model = MonitorViewModel(
             sampler: source,
             historyStore: HistoryStore(fileURL: url),
+            processActions: makeTemporaryProcessActions(),
             startRefreshTask: false
         )
         model.setPanelPresented(true)
@@ -1662,6 +1725,7 @@ final class AppIntegrationTests: XCTestCase {
         let model = MonitorViewModel(
             sampler: source,
             historyStore: HistoryStore(fileURL: paths.url),
+            processActions: makeTemporaryProcessActions(),
             startRefreshTask: false
         )
         model.setPanelPresented(true)
@@ -1730,6 +1794,7 @@ final class AppIntegrationTests: XCTestCase {
         let model = MonitorViewModel(
             sampler: source,
             historyStore: HistoryStore(fileURL: paths.url),
+            processActions: makeTemporaryProcessActions(),
             recommendationTTL: 30,
             startRefreshTask: false
         )
@@ -1788,6 +1853,7 @@ final class AppIntegrationTests: XCTestCase {
         let model = MonitorViewModel(
             sampler: source,
             historyStore: HistoryStore(fileURL: paths.url),
+            processActions: makeTemporaryProcessActions(),
             startRefreshTask: false
         )
         model.setPanelPresented(true)
@@ -1853,6 +1919,7 @@ final class AppIntegrationTests: XCTestCase {
         let model = MonitorViewModel(
             sampler: source,
             historyStore: HistoryStore(fileURL: url),
+            processActions: makeTemporaryProcessActions(),
             startRefreshTask: false
         )
         model.setPanelPresented(true)
@@ -1920,6 +1987,7 @@ final class AppIntegrationTests: XCTestCase {
         let model = MonitorViewModel(
             sampler: source,
             historyStore: HistoryStore(fileURL: url),
+            processActions: makeTemporaryProcessActions(),
             startRefreshTask: false
         )
 
@@ -2002,6 +2070,7 @@ final class AppIntegrationTests: XCTestCase {
         let model = MonitorViewModel(
             sampler: source,
             historyStore: HistoryStore(fileURL: url),
+            processActions: makeTemporaryProcessActions(),
             startRefreshTask: false
         )
 

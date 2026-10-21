@@ -410,16 +410,21 @@ struct DesktopTestInstrument: View {
                 Text("测试强度").font(.headline)
                 Picker("测试强度", selection: $intensity) {
                     ForEach(MemoryTestIntensity.allCases) { Text("\($0.title) · \($0.rawValue) MB").tag($0) }
-                }.pickerStyle(.segmented).labelsHidden().disabled(test.isRunning)
+                }.pickerStyle(.segmented).labelsHidden().disabled(test.isRunning || !test.isEnabled)
                 HStack {
                     Label("自动释放", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
                     Spacer()
                     Label("压力过高时自动停止", systemImage: "shield.checkered").foregroundStyle(.secondary)
                 }.font(.subheadline)
+                if !test.isEnabled {
+                    Label("当前模式不允许运行内存测试。", systemImage: "lock")
+                        .font(.subheadline).foregroundStyle(.secondary)
+                        .accessibilityIdentifier("memory-test-disabled")
+                }
                 if let message = test.message {
                     Text(message).font(.subheadline).foregroundStyle(.secondary)
                 }
-                if !test.isRunning, let refusal = MemoryTestPolicy.refusal(
+                if test.isEnabled, !test.isRunning, let refusal = MemoryTestPolicy.refusal(
                     system: model.system, usable: model.systemDataIsUsable,
                     pressure: model.pressureLevel, requested: intensity.bytes
                 ) {
@@ -435,8 +440,10 @@ struct DesktopTestInstrument: View {
                                        pressure: model.pressureLevel, intensity: intensity)
                         }
                         .buttonStyle(MonitorPrimaryButtonStyle())
-                        .disabled(MemoryTestPolicy.refusal(system: model.system, usable: model.systemDataIsUsable,
-                                                          pressure: model.pressureLevel, requested: intensity.bytes) != nil)
+                        .disabled(!test.isEnabled || MemoryTestPolicy.refusal(
+                            system: model.system, usable: model.systemDataIsUsable,
+                            pressure: model.pressureLevel, requested: intensity.bytes
+                        ) != nil)
                     }
                     Spacer()
                 }.controlSize(.large)
