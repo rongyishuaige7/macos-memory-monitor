@@ -267,8 +267,8 @@ swift test --disable-sandbox --package-path . --scratch-path /tmp/memory-monitor
   修正默认 bundle 版本为 1.3.1 / 131；兼容性矩阵增加 macOS 14 退役与
   macOS 15 CI 说明。
 - GitHub Actions 计费已恢复；`macos-15` / Xcode 16.4 CI 两次通过：
-  run `39596314922`（ScreenCaptureKit 兼容修复）和 `39598034930`
-  （死代码清理后）。产物 `compatibility-macos-15-arm64` 显示
+  run `39596314922`（ScreenCaptureKit 兼容修复）、`39598034930`
+  （死代码清理后）和 `39599217590`（1.4.0 / 140）。产物 `compatibility-macos-15-arm64` 显示
   macOS 15.7.9 arm64、system estimated、CPU available、GPU unavailable
   （hosted VM），进程 283/525（53.9%）。
 - 旧 bundle 清理与 1.4.0 本地部署已完成；Developer ID/notarization 仍未执行。
@@ -285,6 +285,8 @@ swift test --disable-sandbox --package-path . --scratch-path /tmp/memory-monitor
 - `swift test`：307 项，305 通过；失败仅 `DesktopMotionTests` 与
   `SmartCleanupNativeTests`（无前台桌面/LaunchServices）。
 - Debug/Release 严格并发构建通过；CI run `39598034930` 通过。
+- 1.4.0 版本提交后 CI run `39599217590` 通过；产物为 1.4.0 (140)，
+  macOS 15.7.9，进程 262/490（53.47%），CPU available、GPU unavailable。
 
 ## Local 1.4.0 release verification
 
