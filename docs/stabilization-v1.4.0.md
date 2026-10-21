@@ -139,7 +139,8 @@ swift test --disable-sandbox --package-path . --scratch-path /tmp/memory-monitor
    内存测试/登录运行时安全开关；scratch 移入 `Scratch/`；设计文档。
 2. **Slice 2（已完成）**：隐藏/遮挡/最小化/关闭/切 Space 采样降频；
    `DesktopPresentationPolicy` 纯策略与窗口生命周期观察。
-3. **Slice 3**：死功能取舍与 `@Published` 成本收敛。
+3. **Slice 3（已完成）**：未使用 `@Published` 状态收敛；删除不可达的
+   `lastError`/采样描述属性；推荐与 CPU/GPU fraction 保留但不再发布。
 4. **Slice 4**：归因优先级/MaiBot/VM 识别与测试。
 5. **Slice 5**：历史持久化/时钟回拨/文本清洗硬化。
 6. **Slice 6**：Dynamic Type、滚动可达性、诊断/审计/登录 UX。
@@ -169,3 +170,16 @@ swift test --disable-sandbox --package-path . --scratch-path /tmp/memory-monitor
 - `swift test`：328 项，326 通过；失败仅 `DesktopMotionTests` 与
   `SmartCleanupNativeTests` 两个原生 GUI 用例，原因同上。
 - Release 严格并发构建通过。
+
+## Slice 3 verification
+
+- `recommendation`、`cpuUsageFraction`、`gpuUsageFraction` 和
+  `isPanelPresented` 改为非 `@Published` 状态：仍可供测试/未来 UI 读取，
+  但不再每轮触发整棵 SwiftUI 视图失效。
+- 删除无生产调用的 `lastError`、`processObservationDescription`、
+  `samplingIssueDescription`、`samplingNoticeDescription`、
+  `samplingCadenceDescription`、`samplingDiagnosticsDescription`。
+- `swift test`：328 项，逻辑测试全部通过；失败仅三个原生 GUI 用例
+  （`CleanupMotionTests`、`DesktopMotionTests`、`SmartCleanupNativeTests`），
+  均为当前 shell 无前台桌面/LaunchServices 能力导致。
+- Debug 与 Release 严格并发构建通过。

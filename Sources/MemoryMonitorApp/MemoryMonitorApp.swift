@@ -307,9 +307,12 @@ final class MonitorViewModel: ObservableObject {
     /// failures so the UI can avoid destructive resets, but must not be
     /// presented as current data when this flag is false.
     @Published private(set) var systemDataIsUsable = false
-    @Published private(set) var cpuUsageFraction: Double?
+    /// Kept for diagnostics/tests; no current production view reads these
+    /// fractions. They must not invalidate every observing SwiftUI view on
+    /// each sampling pass.
+    private(set) var cpuUsageFraction: Double?
     @Published private(set) var cpuStatus = SampleStatus.unavailable(message: "等待首次采样")
-    @Published private(set) var gpuUsageFraction: Double?
+    private(set) var gpuUsageFraction: Double?
     @Published private(set) var gpuStatus = SampleStatus.unavailable(message: "等待首次采样")
     @Published private(set) var processes: [ProcessSnapshot] = []
     @Published private(set) var processCPUPercent: [ProcessIdentity: Double] = [:]
@@ -319,11 +322,12 @@ final class MonitorViewModel: ObservableObject {
     @Published private(set) var observedProcessCount = 0
     @Published private(set) var listedProcessCount = 0
     @Published private(set) var history: [MemoryHistoryRecord] = []
-    @Published private(set) var lastError: String?
     @Published private(set) var historyError: String?
     @Published private(set) var historyDiagnostics: HistoryStoreDiagnostics?
     @Published private(set) var updatedAt: Date?
-    @Published private(set) var isPanelPresented = false
+    /// Cadence input only; no view observes it, so it must not trigger a
+    /// full SwiftUI invalidation when the panel opens or closes.
+    private(set) var isPanelPresented = false
     private var isPopoverPresented = false
     private var isDesktopPresented = false
     @Published private(set) var pressureLevel: MemoryPressureLevel?
@@ -335,7 +339,9 @@ final class MonitorViewModel: ObservableObject {
         processCount: 0,
         listedProcessCount: 0
     )
-    @Published private(set) var recommendation: MemoryRecommendation?
+    /// Retained for the read-only probe/future surface, but no current
+    /// production view consumes it. Do not republish it every pass.
+    private(set) var recommendation: MemoryRecommendation?
     @Published private(set) var healthCheckedAt = Date()
 
     let processActions: ProcessActionController
@@ -459,66 +465,6 @@ final class MonitorViewModel: ObservableObject {
     var pressure: PressureState {
         guard systemDataIsUsable, let pressureLevel else { return .unknown }
         return PressureState(level: pressureLevel)
-    }
-
-    var processObservationDescription: String {
-        switch processStatus.quality {
-        case .available:
-            return "已采集 \(observedProcessCount) 个进程"
-        case .estimated:
-            let observed = observedProcessCount > 0
-                ? observedProcessCount
-                : samplingDiagnostics.processCount
-            let listed = listedProcessCount > 0
-                ? listedProcessCount
-                : samplingDiagnostics.listedProcessCount
-            return observed > 0
-                ? "已采集 \(observed)/\(listed) 个进程"
-                : "进程数据部分可用"
-        case .unavailable, .error:
-            return observedProcessCount > 0
-                ? "上次采样 \(observedProcessCount) 个进程"
-                : "进程数据 \(processStatus.quality.displayName)"
-        }
-    }
-
-    var samplingIssueDescription: String? {
-        if !systemDataIsUsable, systemStatus.quality.isUsable {
-            return "系统采样时间无效或与当前采样不一致"
-        }
-        let statuses = [systemStatus, cpuStatus, gpuStatus, processStatus]
-        let issues = statuses.compactMap { status -> String? in
-            guard status.quality == .error else { return nil }
-            return status.message
-        }
-        return issues.isEmpty ? nil : issues.joined(separator: "；")
-    }
-
-    var samplingNoticeDescription: String? {
-        if samplingIssueDescription != nil {
-            return "部分采样源失败，未用 0 覆盖已有数据"
-        }
-        if !samplingDiagnostics.processSamplingPerformed, !processes.isEmpty {
-            return "后台低频观察中，进程排行显示最近一次成功采样"
-        }
-        return processStatus.quality == .estimated
-            ? "进程列表部分可用，已保留成功读取的条目"
-            : nil
-    }
-
-    var samplingCadenceDescription: String {
-        return samplingPolicy.cadenceDescription(
-            panelPresented: isPanelPresented,
-            pressureActive: pressureEvaluator.pressureActiveForSampling
-        )
-    }
-
-    var samplingDiagnosticsDescription: String {
-        let duration = String(format: "%.0f ms", samplingDiagnostics.totalDurationMilliseconds)
-        if samplingDiagnostics.processSamplingPerformed {
-            return "\(samplingDiagnostics.mode.displayName) · 本轮 \(duration)"
-        }
-        return "\(samplingDiagnostics.mode.displayName) · 本轮 \(duration) · 进程未刷新"
     }
 
     var healthSnapshot: MonitorHealthSnapshot {
@@ -743,10 +689,7 @@ final class MonitorViewModel: ObservableObject {
 
     private func refreshOnce(at timestamp: Date, usesLiveClock: Bool) async {
         guard !isShuttingDown else { return }
-        guard timestamp.timeIntervalSince1970.isFinite else {
-            lastError = "采样时间无效"
-            return
-        }
+        guard timestamp.timeIntervalSince1970.isFinite else { return }
 
         let requestSequence = nextRefreshSequence
         nextRefreshSequence &+= 1
@@ -818,10 +761,7 @@ final class MonitorViewModel: ObservableObject {
         let historyLoadNow = usesLiveClock ? dateProvider() : timestamp
         await loadHistoryIfNeeded(at: historyLoadNow)
         let samplingTimestamp = usesLiveClock ? dateProvider() : timestamp
-        guard samplingTimestamp.timeIntervalSince1970.isFinite else {
-            lastError = "采样时间无效"
-            return
-        }
+        guard samplingTimestamp.timeIntervalSince1970.isFinite else { return }
         let mode = samplingPolicy.samplingMode(
             panelPresented: isPanelPresented,
             pressureActive: pressureEvaluator.pressureActiveForSampling,
@@ -829,10 +769,7 @@ final class MonitorViewModel: ObservableObject {
             lastProcessSampleAt: lastUsableProcessSampleAt
         )
         let snapshot = await sampler.sample(mode: mode, at: samplingTimestamp)
-        guard snapshot.timestamp.timeIntervalSince1970.isFinite else {
-            lastError = "采样源返回了无效时间"
-            return
-        }
+        guard snapshot.timestamp.timeIntervalSince1970.isFinite else { return }
         await apply(
             snapshot: snapshot,
             persistenceNow: snapshot.timestamp,
@@ -1120,7 +1057,6 @@ final class MonitorViewModel: ObservableObject {
         }
 
         updatedAt = snapshot.timestamp
-        lastError = samplingIssueDescription
     }
 
     /// Orders queued refreshes by clock generation, wall-clock sample time,
