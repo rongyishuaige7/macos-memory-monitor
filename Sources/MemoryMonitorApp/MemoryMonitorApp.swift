@@ -2132,60 +2132,72 @@ struct ProcessDetailView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            HStack(alignment: .top) {
-                Text(model.process(for: identity).map {
-                    $0.applicationName ?? processDisplayName($0)
-                } ?? "进程已不可用")
-                    .font(.system(size: 18, weight: .semibold))
-                    .fixedSize(horizontal: false, vertical: true)
-                Spacer(minLength: 12)
-                Button { dismiss() } label: {
-                    Image(systemName: "xmark")
-                        .frame(width: 28, height: 28)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                HStack(alignment: .top) {
+                    Text(model.process(for: identity).map {
+                        $0.applicationName ?? processDisplayName($0)
+                    } ?? "进程已不可用")
+                        .font(.title3.weight(.semibold))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 12)
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark")
+                            .frame(width: 28, height: 28)
+                    }
+                    .buttonStyle(.plain)
+                    .help("关闭")
+                    .accessibilityLabel("关闭进程详情")
                 }
-                .buttonStyle(.plain)
-                .help("关闭")
-                .accessibilityLabel("关闭进程详情")
-            }
-            if let notice = SimpleMonitorPresentation.listNotice(status: dataStatus) {
-                Text(notice)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            if let process = model.process(for: identity) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text("内存占用")
+                if let notice = SimpleMonitorPresentation.listNotice(status: dataStatus) {
+                    Text(notice)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
-                    Spacer()
-                    Text((process.physicalFootprintIsEstimated ? "约 " : "")
-                        + SimpleMonitorPresentation.memory(process.physicalFootprintBytes))
-                        .font(.system(size: 24, weight: .semibold, design: .rounded))
-                        .monospacedDigit()
                 }
-                Text("进程编号 " + String(process.identity.pid))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Divider()
-                actionsContent(process)
-            } else {
-                Text("它可能已退出，或暂时无法读取。")
-                    .foregroundStyle(.secondary)
-                actionStatus
-                if actions.canCancel(for: identity) {
-                    Button("停止等待", systemImage: "stop.circle") {
-                        actions.cancel(for: identity)
+                if let process = model.process(for: identity) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("内存占用")
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text((process.physicalFootprintIsEstimated ? "约 " : "")
+                            + SimpleMonitorPresentation.memory(process.physicalFootprintBytes))
+                            .font(.system(.title2, design: .rounded, weight: .semibold))
+                            .monospacedDigit()
+                            .minimumScaleFactor(0.7)
+                    }
+                    Text("进程编号 " + String(process.identity.pid))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Divider()
+                    actionsContent(process)
+                } else {
+                    Text("它可能已退出，或暂时无法读取。")
+                        .foregroundStyle(.secondary)
+                    actionStatus
+                    if actions.canCancel(for: identity) {
+                        Button("停止等待", systemImage: "stop.circle") {
+                            actions.cancel(for: identity)
+                        }
                     }
                 }
+                if actions.auditError != nil {
+                    Label("操作记录暂时无法保存", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
             }
-            if actions.auditError != nil {
-                Label("操作记录暂时无法保存", systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-            }
+            .padding(24)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(24)
-        .frame(width: 380, alignment: .leading)
+        .frame(
+            minWidth: 380,
+            idealWidth: 380,
+            maxWidth: 380,
+            minHeight: 240,
+            idealHeight: 420,
+            maxHeight: 560,
+            alignment: .leading
+        )
         .confirmationDialog(
             "退出这个进程？",
             isPresented: $showGracefulConfirmation,
@@ -2224,6 +2236,28 @@ struct ProcessDetailView: View {
     }
 
     @ViewBuilder
+    private var actionButtons: some View {
+        Button("退出进程", systemImage: "rectangle.portrait.and.arrow.right") {
+            showGracefulConfirmation = true
+        }
+        .disabled(actions.isBusy || actions.canForceTerminate(for: identity))
+        if actions.canForceTerminate(for: identity) {
+            Button("强制结束", systemImage: "xmark.octagon", role: .destructive) {
+                showForceConfirmation = true
+            }
+        }
+        if actions.canCancel(for: identity) {
+            Button {
+                actions.cancel(for: identity)
+            } label: {
+                Image(systemName: "stop.circle")
+            }
+            .help("停止等待")
+            .accessibilityLabel("停止等待")
+        }
+    }
+
+    @ViewBuilder
     private func actionsContent(_ process: ProcessSnapshot) -> some View {
         let validation = actions.eligibility(for: process)
         actionStatus
@@ -2233,25 +2267,9 @@ struct ProcessDetailView: View {
                 .foregroundStyle(.secondary)
         }
         if validation.allowed {
-            HStack(spacing: 10) {
-                Button("退出进程", systemImage: "rectangle.portrait.and.arrow.right") {
-                    showGracefulConfirmation = true
-                }
-                .disabled(actions.isBusy || actions.canForceTerminate(for: identity))
-                if actions.canForceTerminate(for: identity) {
-                    Button("强制结束", systemImage: "xmark.octagon", role: .destructive) {
-                        showForceConfirmation = true
-                    }
-                }
-                if actions.canCancel(for: identity) {
-                    Button {
-                        actions.cancel(for: identity)
-                    } label: {
-                        Image(systemName: "stop.circle")
-                    }
-                    .help("停止等待")
-                    .accessibilityLabel("停止等待")
-                }
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) { actionButtons }
+                VStack(alignment: .leading, spacing: 8) { actionButtons }
             }
             .buttonStyle(.bordered)
         } else {

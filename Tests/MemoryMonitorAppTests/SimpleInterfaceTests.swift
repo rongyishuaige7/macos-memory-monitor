@@ -54,6 +54,11 @@ final class SimpleInterfaceTests: XCTestCase {
             name: "detail", width: 380, maximumHeight: 480
         )
         try render(
+            ProcessDetailView(model: model, actions: actions, identity: process.identity)
+                .environment(\.dynamicTypeSize, .accessibility3),
+            name: "detail-accessibility", width: 380, maximumHeight: 560
+        )
+        try render(
             MonitorHealthPanel(model: model, processActions: actions, loginLaunch: model.loginLaunch),
             name: "settings", width: 420, maximumHeight: 380
         )

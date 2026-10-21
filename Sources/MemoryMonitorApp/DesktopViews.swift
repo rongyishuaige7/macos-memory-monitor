@@ -18,15 +18,15 @@ struct DesktopShell: View {
             VStack(alignment: .leading, spacing: 0) {
                 HStack {
                     VStack(alignment: .leading, spacing: 6) {
-                        Text(pageTitle).font(.system(size: 24, weight: .semibold))
-                        Text(pageSubtitle).font(.system(size: 12)).foregroundStyle(.secondary)
+                        Text(pageTitle).font(.title2.weight(.semibold))
+                        Text(pageSubtitle).font(.subheadline).foregroundStyle(.secondary)
                     }
                     Spacer()
                     if memoryTest.isRunning {
                         Label("测试中", systemImage: "cpu").font(.caption).foregroundStyle(.orange)
                     }
                     Label(model.pressure.title, systemImage: "circle.fill")
-                        .font(.system(size: 12, weight: .medium)).foregroundStyle(model.pressure.color)
+                        .font(.subheadline.weight(.medium)).foregroundStyle(model.pressure.color)
                     Button { model.refreshHealth() } label: {
                         Image(systemName: "arrow.clockwise").frame(width: 28, height: 28)
                     }
@@ -65,7 +65,7 @@ struct DesktopShell: View {
             HStack(spacing: 9) {
                 MemoryMonitorMark().fill(.cyan).frame(width: 28, height: 28).accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Memory Monitor").font(.system(size: 13, weight: .semibold)).lineLimit(1).minimumScaleFactor(0.8)
+                    Text("Memory Monitor").font(.callout.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.8)
                     Text("Mac 内存管理").font(.caption2).foregroundStyle(.secondary)
                 }
             }
@@ -75,7 +75,7 @@ struct DesktopShell: View {
                     navigation.page = page
                 } label: {
                     Label(page.title, systemImage: page.symbol)
-                        .font(.system(size: 14, weight: navigation.page == page ? .semibold : .regular))
+                        .font(.callout.weight(navigation.page == page ? .semibold : .regular))
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 13).frame(height: 42)
                         .contentShape(Rectangle())
@@ -138,7 +138,7 @@ struct DesktopOverview: View {
                         .frame(width: 216, height: 216)
                     VStack(alignment: .leading, spacing: 12) {
                         HStack {
-                            Text("最近 1 小时").font(.system(size: 13, weight: .medium))
+                            Text("最近 1 小时").font(.subheadline.weight(.medium))
                             Spacer()
                             Button { navigation.page = .history } label: {
                                 Image(systemName: "arrow.up.right")
@@ -167,7 +167,7 @@ struct DesktopOverview: View {
                     if let updated = model.updatedAt {
                         Text("更新于 " + updated.formatted(date: .omitted, time: .standard))
                     }
-                }.font(.system(size: 12)).foregroundStyle(.secondary)
+                }.font(.caption).foregroundStyle(.secondary)
                 if let notice = SimpleMonitorPresentation.listNotice(status: model.detailDataStatus(
                     retainedItemCount: model.processes.count, targetPresent: !model.processes.isEmpty
                 )) {
@@ -182,6 +182,7 @@ struct DesktopOverview: View {
 struct MemoryUsageRing: View {
     let system: SystemMemorySnapshot?
     @Environment(\.monitorMotionAllowed) private var motion
+    @ScaledMetric(relativeTo: .largeTitle) private var valueSize: CGFloat = 44
 
     var body: some View {
         ZStack {
@@ -197,9 +198,11 @@ struct MemoryUsageRing: View {
                 .stroke(.white.opacity(0.28), style: StrokeStyle(lineWidth: 1, lineCap: .round))
                 .padding(-6).rotationEffect(.degrees(-90))
             VStack(spacing: 9) {
-                Text("内存使用率").font(.system(size: 13)).foregroundStyle(.secondary)
+                Text("内存使用率").font(.subheadline).foregroundStyle(.secondary)
                 Text(system.map { "\(Int($0.usedFraction * 100))%" } ?? "--")
-                    .font(.system(size: 44, weight: .semibold, design: .rounded)).monospacedDigit()
+                    .font(.system(size: valueSize, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .minimumScaleFactor(0.6)
                     .contentTransition(.numericText())
                 Text(system.map {
                     "\(SimpleMonitorPresentation.memory($0.usedEstimateBytes)) / \(SimpleMonitorPresentation.memory($0.totalBytes))"
@@ -241,10 +244,10 @@ private struct MemoryMetric: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 6) {
                 Circle().fill(color).frame(width: 7, height: 7)
-                Text(title).font(.system(size: 12)).foregroundStyle(.secondary)
+                Text(title).font(.caption).foregroundStyle(.secondary)
             }
             Text(bytes.map(SimpleMonitorPresentation.memory) ?? "--")
-                .font(.system(size: 20, weight: .semibold, design: .rounded))
+                .font(.system(.title3, design: .rounded, weight: .semibold))
                 .monospacedDigit().lineLimit(1).minimumScaleFactor(0.75)
                 .contentTransition(.numericText()).animation(motion ? .easeOut(duration: 0.2) : nil, value: bytes)
         }
@@ -342,18 +345,20 @@ struct DesktopProcesses: View {
         HStack(spacing: 8) {
             if let process = group.members.first { ProcessAppIcon(process: process) }
             VStack(alignment: .leading, spacing: 4) {
-                Text(group.title).font(.system(size: 14, weight: .medium)).lineLimit(1)
+                Text(group.title).font(.subheadline.weight(.medium)).lineLimit(1)
                 Text(group.members.count > 1 ? "\(group.members.count) 个进程" : "PID \(group.members.first?.identity.pid ?? 0)")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .font(.caption2).foregroundStyle(.secondary)
             }.frame(maxWidth: .infinity, alignment: .leading)
             Text((group.estimated ? "≈ " : "") + SimpleMonitorPresentation.memory(group.bytes))
-                .frame(width: 86, alignment: .trailing).help("各成员内存占用之和，可能含共享部分")
+                .frame(width: 86, alignment: .trailing).lineLimit(1).minimumScaleFactor(0.8)
+                .help("各成员内存占用之和，可能含共享部分")
             Text(group.cpu(model.processCPUPercent).map { String(format: "%.1f%%", $0) } ?? "--")
                 .foregroundStyle(.secondary).frame(width: 64, alignment: .trailing)
+                .lineLimit(1).minimumScaleFactor(0.8)
             Image(systemName: group.members.count == 1 ? "ellipsis.circle" : expanded.contains(group.id) ? "chevron.down" : "chevron.right")
                 .foregroundStyle(.secondary).frame(width: 32)
-        }.font(.system(size: 13)).monospacedDigit().padding(.horizontal, 10)
-            .frame(height: 62).contentShape(Rectangle())
+        }.font(.callout).monospacedDigit().padding(.horizontal, 10)
+            .frame(minHeight: 62).contentShape(Rectangle())
     }
 
     private func processRow(_ process: ProcessSnapshot) -> some View {
@@ -364,14 +369,15 @@ struct DesktopProcesses: View {
                 Text("\(process.name) · PID \(process.identity.pid)").font(.caption2).foregroundStyle(.secondary).lineLimit(1)
             }.frame(maxWidth: .infinity, alignment: .leading)
             Text((process.physicalFootprintIsEstimated ? "≈ " : "") + SimpleMonitorPresentation.memory(process.physicalFootprintBytes))
-                .frame(width: 86, alignment: .trailing)
+                .frame(width: 86, alignment: .trailing).lineLimit(1).minimumScaleFactor(0.8)
             Text(model.processCPUPercent[process.identity].map { String(format: "%.1f%%", $0) } ?? "--")
                 .foregroundStyle(.secondary).frame(width: 64, alignment: .trailing)
+                .lineLimit(1).minimumScaleFactor(0.8)
             Image(systemName: "ellipsis.circle").font(.system(size: 19)).foregroundStyle(.secondary)
                 .frame(width: 32).help("进程详情与操作")
         }
-        .font(.system(size: 12)).monospacedDigit()
-        .padding(.horizontal, 10).frame(height: 53).contentShape(Rectangle())
+        .font(.callout).monospacedDigit()
+        .padding(.horizontal, 10).frame(minHeight: 53).contentShape(Rectangle())
     }
 
     private func rebuild() {
@@ -402,9 +408,9 @@ struct DesktopTestInstrument: View {
                     VStack(alignment: .leading, spacing: 10) {
                         Text(test.isRunning ? "测试进行中" : "30 秒内存测试").font(.title2.weight(.semibold))
                         Text(test.isRunning ? "已分配 " + SimpleMonitorPresentation.memory(UInt64(test.allocatedBytes)) : "测试分配量")
-                            .font(.system(size: 13)).foregroundStyle(.secondary)
+                            .font(.subheadline).foregroundStyle(.secondary)
                         Text(test.isRunning ? "\(test.elapsed) / 30 秒" : "\(intensity.rawValue) MB")
-                            .font(.system(size: 28, weight: .medium, design: .rounded)).monospacedDigit()
+                            .font(.system(.title, design: .rounded, weight: .medium)).monospacedDigit()
                     }
                 }
                 Text("测试强度").font(.headline)
@@ -535,7 +541,7 @@ struct DesktopPreferences: View {
                     }
                     Spacer()
                 }
-            }.font(.system(size: 14)).frame(maxWidth: 620, alignment: .leading)
+            }.font(.body).frame(maxWidth: 620, alignment: .leading)
                 .padding(28).frame(maxWidth: .infinity, alignment: .leading)
         }
         .onAppear { login.refreshStatus() }
@@ -606,7 +612,7 @@ struct DesktopPreferences: View {
                 HStack(spacing: 4) {
                     Image(systemName: appearance == value ? "checkmark.circle.fill" : "circle").foregroundStyle(appearance == value ? .blue : .secondary)
                     Text(title)
-                }.font(.system(size: 12))
+                }.font(.caption)
             }
         }.buttonStyle(.plain).accessibilityLabel(title + "外观")
             .accessibilityIdentifier("desktop-appearance-" + value)

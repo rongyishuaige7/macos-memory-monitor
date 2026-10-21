@@ -93,9 +93,9 @@ struct MemoryTrend: View {
 
     private func reading(_ title: String, value: Double?, color: Color) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(title).font(.system(size: 12)).foregroundStyle(.secondary)
+            Text(title).font(.caption).foregroundStyle(.secondary)
             Text(HistoryTrendData.percentage(value))
-                .font(.system(size: 26, weight: .semibold, design: .rounded)).monospacedDigit()
+                .font(.system(.title2, design: .rounded, weight: .semibold)).monospacedDigit()
                 .foregroundStyle(color).lineLimit(1).minimumScaleFactor(0.8)
         }.frame(maxWidth: .infinity, alignment: .leading)
             .accessibilityElement(children: .combine)
@@ -149,7 +149,7 @@ struct MemoryTrend: View {
                         if let date = value.as(Date.self) {
                             Text(date.formatted(hours == 24 && (value.index == 0 || value.index == value.count - 1)
                                                 ? .dateTime.month().day().hour().minute() : .dateTime.hour().minute()))
-                                .font(.system(size: 10)).foregroundStyle(Color.secondary)
+                                .font(.caption2).foregroundStyle(Color.secondary)
                         }
                     }
                 }
@@ -160,7 +160,7 @@ struct MemoryTrend: View {
                 AxisMarks(position: .leading, values: compact ? [0, 50, 100] : [0, 25, 50, 75, 100]) { value in
                     AxisGridLine(stroke: StrokeStyle(lineWidth: 0.7, dash: [3, 4])).foregroundStyle(Color.secondary.opacity(0.16))
                     AxisValueLabel {
-                        if let number = value.as(Int.self) { Text("\(number)%").font(.system(size: 10)).monospacedDigit() }
+                        if let number = value.as(Int.self) { Text("\(number)%").font(.caption2).monospacedDigit() }
                     }.foregroundStyle(Color.secondary)
                 }
             }
@@ -183,11 +183,20 @@ struct MemoryTrend: View {
             if data.records.isEmpty {
                 VStack(spacing: 8) {
                     Image(systemName: "chart.xyaxis.line").font(.system(size: compact ? 18 : 26)).foregroundStyle(accent.opacity(0.65))
-                    if !sparkline { Text("此时段暂无记录").font(.system(size: compact ? 11 : 13)).foregroundStyle(.secondary) }
+                    if !sparkline { Text("此时段暂无记录").font(.caption).foregroundStyle(.secondary) }
                 }.allowsHitTesting(false)
             }
         }
+        .accessibilityLabel("内存使用率趋势")
+        .accessibilityValue(accessibilitySummary)
         .accessibilityIdentifier(detailed ? "history-trend-chart" : "memory-trend-compact")
+    }
+
+    private var accessibilitySummary: String {
+        guard !data.records.isEmpty else { return "暂无记录" }
+        let average = HistoryTrendData.percentage(data.average)
+        let peak = HistoryTrendData.percentage(data.peak?.usedFraction)
+        return "共 \(data.records.count) 个样本，平均 \(average)，最高 \(peak)"
     }
 
     private var inspection: some View {
@@ -202,7 +211,7 @@ struct MemoryTrend: View {
                 Spacer()
                 Text("--").foregroundStyle(.secondary)
             }
-        }.font(.system(size: 12)).monospacedDigit().frame(height: 30)
+        }.font(.caption).monospacedDigit().frame(minHeight: 30)
             .padding(.horizontal, 12).background(.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 6))
             .accessibilityElement(children: .combine).accessibilityIdentifier("history-inspection")
     }
@@ -232,7 +241,7 @@ struct DesktopHistory: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     HStack {
-                        Label("内存使用率", systemImage: "waveform.path").font(.system(size: 13, weight: .medium))
+                        Label("内存使用率", systemImage: "waveform.path").font(.subheadline.weight(.medium))
                         Spacer(minLength: 16)
                         Picker("时间范围", selection: $hours) {
                             Text("1 小时").tag(1)
@@ -254,7 +263,7 @@ struct DesktopHistory: View {
                         }
                         Spacer(minLength: 0)
                         Text("每分钟记录").foregroundStyle(.tertiary)
-                    }.font(.system(size: 11)).foregroundStyle(.secondary).frame(height: 22)
+                    }.font(.caption2).foregroundStyle(.secondary).frame(minHeight: 22)
                     if model.historyError != nil {
                         Label("历史记录暂时无法保存", systemImage: "exclamationmark.triangle")
                             .font(.caption).foregroundStyle(.orange)

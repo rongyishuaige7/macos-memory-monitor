@@ -20,11 +20,11 @@ struct DesktopRelease: View {
                     Button { showsApplications = true } label: {
                         Label("清理名单 · \(cleanup.authorizations.count)", systemImage: "slider.horizontal.3")
                     }.buttonStyle(.borderless).accessibilityIdentifier("cleanup-applications")
-                }.font(.system(size: 12))
+                }.font(.caption)
                 instrument
                 VStack(spacing: 6) {
-                    Text(title).font(.system(size: 21, weight: .semibold))
-                    Text(detail).font(.system(size: 12)).foregroundStyle(.secondary)
+                    Text(title).font(.title2.weight(.semibold))
+                    Text(detail).font(.caption).foregroundStyle(.secondary)
                         .multilineTextAlignment(.center).frame(minHeight: 18)
                 }.frame(maxWidth: .infinity)
                 HStack(spacing: 16) {
@@ -48,20 +48,20 @@ struct DesktopRelease: View {
                     Text(notice).font(.caption).foregroundStyle(.orange).multilineTextAlignment(.center)
                 }
                 if let result = cleanup.result {
-                    Text(changeDescription(result)).font(.system(size: 13, weight: .medium))
+                    Text(changeDescription(result)).font(.subheadline.weight(.medium))
                         .foregroundStyle(result.hasMeasuredBenefit ? Color.green : .secondary)
                         .multilineTextAlignment(.center)
                 }
                 Divider().padding(.top, 4)
                 HStack(alignment: .top, spacing: 24) {
                     VStack(alignment: .leading, spacing: 5) {
-                        Text("自动保护").font(.system(size: 12, weight: .medium))
-                        Text("前台、近期使用与检测到忙碌的应用").font(.system(size: 11)).foregroundStyle(.secondary)
+                        Text("自动保护").font(.caption.weight(.medium))
+                        Text("前台、近期使用与检测到忙碌的应用").font(.caption2).foregroundStyle(.secondary)
                     }
                     Spacer(minLength: 0)
                     Button { navigation.page = .processes } label: {
                         Label("查看应用占用", systemImage: "list.bullet.rectangle")
-                    }.buttonStyle(.borderless).font(.system(size: 12))
+                    }.buttonStyle(.borderless).font(.caption)
                 }
                 if !cleanup.entries.isEmpty {
                     DisclosureGroup("本次记录 · \(cleanup.entries.count)", isExpanded: $showsResults) {
@@ -73,10 +73,10 @@ struct DesktopRelease: View {
                                     Text(entry.name).lineLimit(1)
                                     Spacer(minLength: 8)
                                     Text(entry.detail).foregroundStyle(.secondary).multilineTextAlignment(.trailing)
-                                }.font(.system(size: 12)).padding(.vertical, 9)
+                                }.font(.caption).padding(.vertical, 9)
                             }
                         }.padding(.top, 8)
-                    }.font(.system(size: 12))
+                    }.font(.caption)
                 }
             }.padding(.horizontal, 28).padding(.vertical, 20)
                 .frame(maxWidth: 760).frame(maxWidth: .infinity)
@@ -100,8 +100,8 @@ struct DesktopRelease: View {
             VStack(spacing: 9) {
                 MemoryMonitorMark().fill(.cyan).frame(width: 56, height: 56)
                 Text(model.systemDataIsUsable ? model.system.map { SimpleMonitorPresentation.memory($0.availableEstimateBytes) } ?? "--" : "--")
-                    .font(.system(size: 29, weight: .semibold, design: .rounded)).monospacedDigit()
-                Text("可用内存").font(.system(size: 11)).foregroundStyle(.secondary)
+                    .font(.system(.title, design: .rounded, weight: .semibold)).monospacedDigit()
+                Text("可用内存").font(.caption2).foregroundStyle(.secondary)
             }
             }.frame(width: 224, height: 224)
         }.frame(maxWidth: .infinity).frame(height: 224).accessibilityElement(children: .combine)
@@ -152,13 +152,13 @@ struct CleanupApplicationsSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
-                Text("清理名单").font(.system(size: 20, weight: .semibold))
+                Text("清理名单").font(.title3.weight(.semibold))
                 Spacer()
                 Button { dismiss() } label: { Image(systemName: "xmark").frame(width: 24, height: 24) }
                     .buttonStyle(.borderless).help("关闭").accessibilityLabel("关闭清理名单")
             }
             Text("仅勾选可以随时退出的应用。清理会请求正常退出，可能询问是否保存；正在使用和近期使用的应用会自动跳过。")
-                .font(.system(size: 12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             HStack {
                 TextField("搜索应用", text: $query).textFieldStyle(.roundedBorder)
                 Button { cleanup.refreshApplications() } label: { Image(systemName: "arrow.clockwise") }
@@ -172,13 +172,13 @@ struct CleanupApplicationsSheet: View {
                             HStack(spacing: 10) {
                                 ProcessAppIcon(process: app.process)
                                 VStack(alignment: .leading, spacing: 4) {
-                                    Text(app.name).font(.system(size: 13)).lineLimit(1)
+                                    Text(app.name).font(.subheadline).lineLimit(1)
                                     Text(observation.protection ?? "允许后可正常退出")
-                                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                                        .font(.caption2).foregroundStyle(.secondary)
                                 }
                                 Spacer()
                                 Text(SimpleMonitorPresentation.memory(app.process.physicalFootprintBytes))
-                                    .font(.system(size: 12)).monospacedDigit().foregroundStyle(.secondary)
+                                    .font(.caption).monospacedDigit().foregroundStyle(.secondary)
                             }
                         }.toggleStyle(.checkbox).padding(.vertical, 10).disabled(cleanup.isBusy)
                             .accessibilityIdentifier("cleanup-allow-\(app.authorization.bundleIdentifier)")
@@ -186,7 +186,7 @@ struct CleanupApplicationsSheet: View {
                     }
                     if cleanup.applications.isEmpty {
                         Text(cleanup.isRefreshing ? "正在读取应用…" : "没有可添加的应用")
-                            .font(.system(size: 13)).foregroundStyle(.secondary).padding(.vertical, 40)
+                            .font(.subheadline).foregroundStyle(.secondary).padding(.vertical, 40)
                     }
                 }
             }.frame(minHeight: 180, maxHeight: .infinity)

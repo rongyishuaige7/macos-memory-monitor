@@ -149,7 +149,9 @@ swift test --disable-sandbox --package-path . --scratch-path /tmp/memory-monitor
    锁文件 `O_CLOEXEC`。
 6. **Slice 6a（已完成）**：设置诊断详情/整体状态/检查时间、登录项与隐私
    快捷入口、登录取消、审计刷新与重试、审计搜索/时间、进程详情原因可见。
-   **Slice 6b**：Dynamic Type 与滚动可达性。
+   **Slice 6b（已完成）**：Dynamic Type/相对字号、进程详情滚动与操作
+   按钮回退、菜单面板滚动与固定退出 footer、进程/历史/释放/测试页字号
+   与行高收敛、图表可访问性摘要。
 7. **Slice 7**：CI、macOS 14 迁移、发布门禁、部署版本与文档收口。
 
 ## Slice 1 verification
@@ -228,4 +230,19 @@ swift test --disable-sandbox --package-path . --scratch-path /tmp/memory-monitor
   “不支持退出”的具体原因和跨进程忙碌提示；菜单栏面板增加“统计”入口和
   审计错误提示。
 - `swift test`：339 项，338 通过；失败仅 `SmartCleanupNativeTests`。
+- Debug/Release 严格并发构建通过。
+
+## Slice 6b verification
+
+- 生产视图从大量固定 point size 改为 `.title2/.headline/.subheadline/
+  .caption/.caption2` 等相对样式；内存仪表百分比使用
+  `@ScaledMetric`；进程行由固定高度改为 `minHeight`，避免大字号裁切。
+- `ProcessDetailView` 改为 ScrollView + 240/420/560 高度边界；操作按钮
+  使用 `ViewThatFits` 在窄宽度/大字号下回退为纵向排列。
+- `DesktopMenuPanel` 主体可滚动、退出 footer 固定；菜单面板字号改为
+  `.callout`。
+- `MemoryTrend` 增加“内存使用率趋势”可访问性标签与样本/平均/最高摘要。
+- 新增 `detail-accessibility` 和 `desktop-menu-accessibility` 渲染检查。
+- `swift test`：339 项，338 通过；失败仅 `SmartCleanupNativeTests`
+  原生 GUI 用例。
 - Debug/Release 严格并发构建通过。

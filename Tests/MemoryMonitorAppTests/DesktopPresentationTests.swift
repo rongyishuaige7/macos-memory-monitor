@@ -145,6 +145,16 @@ final class DesktopPresentationTests: XCTestCase {
         }
         try render(DesktopMenuPanel(model: model, openDesktop: { _ in }, terminationAction: ApplicationTerminationAction(handler: {})),
                    name: "desktop-menu", size: NSSize(width: 290, height: 520))
+        try render(
+            DesktopMenuPanel(
+                model: model,
+                openDesktop: { _ in },
+                terminationAction: ApplicationTerminationAction(handler: {})
+            )
+            .environment(\.dynamicTypeSize, .accessibility3),
+            name: "desktop-menu-accessibility",
+            size: NSSize(width: 290, height: 620)
+        )
         await model.shutdown()
     }
 
