@@ -741,6 +741,33 @@ final class ProcessActionControllerTests: XCTestCase {
         )
     }
 
+    func testRefreshAuditLoadsPersistedEvents() async throws {
+        let paths = makeActionPaths()
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let now = Date().addingTimeInterval(-1)
+        let store = ProcessActionAuditStore(fileURL: paths.file)
+        let event = ProcessActionAuditEvent(
+            id: "refresh-audit",
+            timestamp: now,
+            action: .gracefulExit,
+            outcome: .completed,
+            processLabel: "worker",
+            detail: "done"
+        )
+        _ = try await store.append(event, now: now)
+
+        let controller = ProcessActionController(
+            currentUserID: 501,
+            monitorPID: 9999,
+            auditStore: store
+        )
+        await controller.refreshAudit()
+
+        XCTAssertTrue(controller.recentEvents.contains { $0.id == "refresh-audit" })
+        XCTAssertNil(controller.auditError)
+        await controller.shutdown()
+    }
+
     private func makeActionPaths() -> (file: URL, directory: URL) {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("MemoryMonitorActionController-" + UUID().uuidString, isDirectory: true)

@@ -147,7 +147,9 @@ swift test --disable-sandbox --package-path . --scratch-path /tmp/memory-monitor
    idempotent；persisted title/id 清洗 bidi/控制符；analyzer 过滤无效
    availableFraction；时钟回拨时丢弃无法被新时钟接受的 fallback 记录；
    锁文件 `O_CLOEXEC`。
-6. **Slice 6**：Dynamic Type、滚动可达性、诊断/审计/登录 UX。
+6. **Slice 6a（已完成）**：设置诊断详情/整体状态/检查时间、登录项与隐私
+   快捷入口、登录取消、审计刷新与重试、审计搜索/时间、进程详情原因可见。
+   **Slice 6b**：Dynamic Type 与滚动可达性。
 7. **Slice 7**：CI、macOS 14 迁移、发布门禁、部署版本与文档收口。
 
 ## Slice 1 verification
@@ -214,4 +216,16 @@ swift test --disable-sandbox --package-path . --scratch-path /tmp/memory-monitor
   fallback 未来记录过滤。
 - `swift test`：338 项，337 通过；失败仅 `SmartCleanupNativeTests`
   原生 GUI 用例（当前 shell 无 LaunchServices fixture 启动能力）。
+- Debug/Release 严格并发构建通过。
+
+## Slice 6a verification
+
+- 设置页诊断显示整体健康、检查时间、每项原因详情；新增“打开登录项设置”
+  和“查看隐私设置”入口；登录更新中提供取消。
+- `ProcessActionController.refreshAudit()` 先等待初始加载，再执行显式
+  重载，修复“刷新被初始任务代际丢弃”的竞态；审计面板新增刷新/重试。
+- 审计搜索覆盖操作名与状态；记录时间改为日期+时间；进程详情显示
+  “不支持退出”的具体原因和跨进程忙碌提示；菜单栏面板增加“统计”入口和
+  审计错误提示。
+- `swift test`：339 项，338 通过；失败仅 `SmartCleanupNativeTests`。
 - Debug/Release 严格并发构建通过。

@@ -1170,6 +1170,20 @@ final class ProcessActionController: ObservableObject {
         )
     }
 
+    /// Explicit recovery path for the settings/audit UI. A transient load
+    /// failure must not leave the audit panel stuck until the next process
+    /// action or application restart.
+    func refreshAudit() async {
+        // The initial load starts during init. Await it before starting an
+        // explicit refresh; otherwise the later initial task can increment the
+        // publication generation and discard the refresh result, leaving the
+        // caller with an empty/stale list even though the store is readable.
+        if let initialAuditLoadTask {
+            await initialAuditLoadTask.value
+        }
+        await loadAuditEvents()
+    }
+
     private func loadAuditEvents() async {
         auditPublicationGeneration &+= 1
         let generation = auditPublicationGeneration

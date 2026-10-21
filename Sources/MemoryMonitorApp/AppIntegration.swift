@@ -915,8 +915,13 @@ enum AuditEventFiltering {
             .filter(filter.matches)
             .filter { event in
                 guard !normalizedQuery.isEmpty else { return true }
-                let fields = [event.processLabel, event.applicationName, event.detail]
-                    .compactMap { $0?.lowercased() }
+                let fields = [
+                    event.processLabel,
+                    event.applicationName ?? "",
+                    event.detail,
+                    event.action.displayName,
+                    event.statusDisplayName
+                ].map { $0.lowercased() }
                 return fields.contains { $0.contains(normalizedQuery) }
             }
             .sorted {

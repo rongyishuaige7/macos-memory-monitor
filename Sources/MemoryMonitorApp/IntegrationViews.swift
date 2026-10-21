@@ -197,6 +197,7 @@ struct OperationsAuditPanel: View {
     @Environment(\.dismiss) private var dismiss
     @State private var filter: AuditEventFilter = .all
     @State private var query = ""
+    @State private var isRefreshing = false
 
     private var events: [ProcessActionAuditEvent] {
         AuditEventFiltering.apply(
@@ -220,6 +221,22 @@ struct OperationsAuditPanel: View {
                 Text("共 " + String(events.count) + " 条")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
+                if isRefreshing {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button {
+                        Task {
+                            isRefreshing = true
+                            await actions.refreshAudit()
+                            isRefreshing = false
+                        }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("重新读取操作记录")
+                    .accessibilityLabel("重新读取操作记录")
+                }
             }
 
             Picker("筛选", selection: $filter) {
@@ -230,7 +247,7 @@ struct OperationsAuditPanel: View {
             .pickerStyle(.segmented)
             .labelsHidden()
 
-            TextField("搜索进程或记录内容", text: $query)
+            TextField("搜索进程、操作或结果", text: $query)
                 .textFieldStyle(.roundedBorder)
                 .font(.caption)
 
@@ -309,7 +326,7 @@ private struct AuditEventRow: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
-                Text(event.timestamp, style: .date)
+                Text(event.timestamp.formatted(date: .abbreviated, time: .shortened))
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
@@ -346,7 +363,7 @@ private func auditEventColor(_ event: ProcessActionAuditEvent) -> Color {
     }
 }
 
-private func openPrivacySettings() {
+func openPrivacySettings() {
     // The preference pane identifier changed in macOS 13. Try the modern
     // Privacy & Security route first, then retain the legacy URL for older
     // systems. `open` reports whether Launch Services accepted the URL, so a

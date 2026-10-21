@@ -36,8 +36,20 @@ struct DesktopMenuPanel: View {
             Divider()
             route("打开主窗口", symbol: "macwindow", page: .overview)
             route("查看进程", symbol: "list.bullet.rectangle", page: .processes)
+            route("统计", symbol: "chart.xyaxis.line", page: .history)
             route("内存压力测试", symbol: "cpu", page: .stress)
             route("设置", symbol: "gearshape", page: .settings)
+            if model.processActions.auditError != nil {
+                Button { openDesktop(.settings) } label: {
+                    Label("操作记录暂时不可用", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("打开设置查看操作记录")
+            }
             Divider()
             Button { terminationAction() } label: {
                 Label("退出", systemImage: "power").frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())

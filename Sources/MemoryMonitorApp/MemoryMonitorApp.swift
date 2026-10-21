@@ -582,6 +582,7 @@ final class MonitorViewModel: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             await self.refreshOnce()
+            await self.processActions.refreshAudit()
             // Publish the check marker only after the requested sampling pass
             // (including any queued/latest-request coalescing) has finished.
             self.healthCheckedAt = self.dateProvider()
@@ -2226,6 +2227,11 @@ struct ProcessDetailView: View {
     private func actionsContent(_ process: ProcessSnapshot) -> some View {
         let validation = actions.eligibility(for: process)
         actionStatus
+        if actions.isBusy, actions.status(for: identity) == nil {
+            Label("另一个进程操作进行中，请稍后再试。", systemImage: "hourglass")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
         if validation.allowed {
             HStack(spacing: 10) {
                 Button("退出进程", systemImage: "rectangle.portrait.and.arrow.right") {
@@ -2249,10 +2255,15 @@ struct ProcessDetailView: View {
             }
             .buttonStyle(.bordered)
         } else {
-            Label("这个进程暂不支持退出", systemImage: "lock")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .help(validation.message)
+            VStack(alignment: .leading, spacing: 4) {
+                Label("这个进程暂不支持退出", systemImage: "lock")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Text(validation.message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 }

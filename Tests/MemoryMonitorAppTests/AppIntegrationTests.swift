@@ -2184,6 +2184,20 @@ final class AppIntegrationTests: XCTestCase {
         )
         XCTAssertTrue(attentionStages.isEmpty)
 
+        let byAction = AuditEventFiltering.apply(
+            events: [completed, failed],
+            filter: .all,
+            query: "强制结束"
+        )
+        XCTAssertEqual(byAction.map(\.id), ["failed"])
+
+        let byStatus = AuditEventFiltering.apply(
+            events: [completed, intent, sent],
+            filter: .all,
+            query: "已发送"
+        )
+        XCTAssertEqual(byStatus.map(\.id), ["sent"])
+
         let all = AuditEventFiltering.apply(
             events: [completed, failed],
             filter: .all,

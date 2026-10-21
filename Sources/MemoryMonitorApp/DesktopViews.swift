@@ -470,6 +470,20 @@ struct DesktopPreferences: View {
                 }
                     .toggleStyle(.switch).disabled(login.isUpdating)
                 Text(login.status.detail).font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 14) {
+                    Button("打开登录项设置", systemImage: "arrow.up.forward.app") {
+                        login.openSystemSettings()
+                    }
+                    .buttonStyle(.borderless)
+                    if login.isUpdating {
+                        Button("取消", systemImage: "xmark.circle") {
+                            login.cancelUpdate()
+                        }
+                        .buttonStyle(.borderless)
+                        .accessibilityIdentifier("desktop-settings-login-cancel")
+                    }
+                }.font(.caption)
                 if let error = login.lastError { Text(error).font(.caption).foregroundStyle(.orange) }
                 Divider()
                 Toggle(isOn: $showsPercentage) {
@@ -494,14 +508,19 @@ struct DesktopPreferences: View {
                     Spacer()
                     Button("查看记录", systemImage: "clock.arrow.circlepath") { navigation.showsAudit = true }
                 }
+                HStack {
+                    Text("隐私")
+                    Spacer()
+                    Button("查看隐私设置", systemImage: "lock.shield") {
+                        openPrivacySettings()
+                    }
+                    .buttonStyle(.borderless)
+                }
                 DisclosureGroup("运行诊断", isExpanded: $showsDiagnostics) {
                     VStack(alignment: .leading, spacing: 14) {
-                        ForEach(model.healthSnapshot.items) { item in
-                            HStack(alignment: .top) {
-                                Text(item.title).frame(width: 90, alignment: .leading)
-                                Text(item.status).foregroundStyle(.secondary)
-                                Spacer()
-                            }.font(.caption)
+                        healthHeader
+                        ForEach(health.items) { item in
+                            healthRow(item)
                         }
                         Button("重新检查", systemImage: "arrow.clockwise") { model.refreshHealth() }
                     }.padding(.top, 16)
@@ -522,6 +541,54 @@ struct DesktopPreferences: View {
         .onAppear { login.refreshStatus() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             login.refreshStatus()
+        }
+    }
+
+    private var health: MonitorHealthSnapshot { model.healthSnapshot }
+
+    private var healthHeader: some View {
+        let snapshot = health
+        return HStack(alignment: .top, spacing: 9) {
+            Image(systemName: snapshot.overall.iconName)
+                .foregroundStyle(healthLevelColor(snapshot.overall))
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text("运行健康").font(.caption.weight(.semibold))
+                    Text(snapshot.overall.title)
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(healthLevelColor(snapshot.overall))
+                    Spacer()
+                    Text(snapshot.checkedAt, style: .time)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                Text("诊断只读取当前状态，不会修改权限或结束进程。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func healthRow(_ item: MonitorHealthItem) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: item.level.iconName)
+                .foregroundStyle(healthLevelColor(item.level))
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(item.title).font(.caption.weight(.medium))
+                    Text(item.status)
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(healthLevelColor(item.level))
+                    Spacer()
+                }
+                Text(item.detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
