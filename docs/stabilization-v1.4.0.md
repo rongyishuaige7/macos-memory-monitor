@@ -135,7 +135,7 @@ swift test --disable-sandbox --package-path . --scratch-path /tmp/memory-monitor
 
 ## Staged delivery
 
-1. **Slice 1（本提交）**：恢复构建；显式 store 注入；fixture fail-closed；
+1. **Slice 1（已完成）**：恢复构建；显式 store 注入；fixture fail-closed；
    内存测试/登录运行时安全开关；scratch 移入 `Scratch/`；设计文档。
 2. **Slice 2（已完成）**：隐藏/遮挡/最小化/关闭/切 Space 采样降频；
    `DesktopPresentationPolicy` 纯策略与窗口生命周期观察。
