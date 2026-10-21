@@ -2084,6 +2084,153 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertEqual(groups.first { $0.id == "safari-webkit" }?.processCount, 1)
     }
 
+    func testWorkloadGrouperPrefersMaiBotOverGhosttyAncestor() {
+        let processes = [
+            makeProcess(pid: 220, name: "ghostty", footprint: 50),
+            makeProcess(
+                pid: 221,
+                name: "MaiBot",
+                parentPID: 220,
+                footprint: 100,
+                workingDirectoryLabel: "MaiBot"
+            ),
+            makeProcess(
+                pid: 222,
+                name: "python3",
+                parentPID: 221,
+                footprint: 200,
+                workingDirectoryLabel: "MaiBot"
+            )
+        ]
+
+        let groups = WorkloadGrouper().group(processes)
+
+        XCTAssertEqual(groups.first { $0.id == "maibot" }?.processCount, 2)
+        XCTAssertEqual(groups.first { $0.id == "maibot" }?.attributionReason, .maibotIdentity)
+        XCTAssertEqual(groups.first { $0.id == "ghostty-services" }?.processCount, 1)
+    }
+
+    func testWorkloadGrouperRecognizesMaiBotPythonByWorkingDirectory() {
+        let processes = [
+            makeProcess(
+                pid: 230,
+                name: "python3",
+                footprint: 100,
+                workingDirectoryLabel: "MaiBot"
+            )
+        ]
+
+        let groups = WorkloadGrouper().group(processes)
+
+        XCTAssertEqual(groups.first { $0.id == "maibot" }?.processCount, 1)
+        XCTAssertNil(groups.first { $0.id == "runtime-python-MaiBot" })
+    }
+
+    func testWorkloadGrouperPrefersVirtualMachineOverGhosttyAncestor() {
+        let processes = [
+            makeProcess(pid: 240, name: "ghostty", footprint: 50),
+            makeProcess(
+                pid: 241,
+                name: "qemu-system-aarch64",
+                parentPID: 240,
+                footprint: 300,
+                executablePath: "/opt/homebrew/bin/qemu-system-aarch64"
+            )
+        ]
+
+        let groups = WorkloadGrouper().group(processes)
+
+        XCTAssertEqual(groups.first { $0.id == "virtual-machines" }?.processCount, 1)
+        XCTAssertEqual(groups.first { $0.id == "ghostty-services" }?.processCount, 1)
+    }
+
+    func testWorkloadGrouperRecognizesCommonVirtualMachineApplications() {
+        let processes = [
+            makeProcess(
+                pid: 250,
+                name: "UTM",
+                footprint: 100,
+                executablePath: "/Applications/UTM.app/Contents/MacOS/UTM",
+                bundleIdentifier: "com.utmapp.UTM"
+            ),
+            makeProcess(
+                pid: 251,
+                name: "prl_vm_app",
+                footprint: 200,
+                executablePath: "/Applications/Parallels Desktop.app/Contents/MacOS/prl_vm_app",
+                bundleIdentifier: "com.parallels.desktop.console"
+            ),
+            makeProcess(
+                pid: 252,
+                name: "vmware-vmx",
+                footprint: 300,
+                executablePath: "/Applications/VMware Fusion.app/Contents/Library/vmware-vmx",
+                bundleIdentifier: "com.vmware.fusion"
+            ),
+            makeProcess(
+                pid: 253,
+                name: "VirtualBoxVM",
+                footprint: 400,
+                executablePath: "/Applications/VirtualBox.app/Contents/MacOS/VirtualBoxVM",
+                bundleIdentifier: "org.virtualbox.app.VirtualBox"
+            ),
+            makeProcess(
+                pid: 254,
+                name: "qemu-system-aarch64",
+                footprint: 500,
+                executablePath: "/opt/homebrew/bin/qemu-system-aarch64"
+            )
+        ]
+
+        let groups = WorkloadGrouper().group(processes)
+
+        XCTAssertEqual(groups.first { $0.id == "virtual-machines" }?.processCount, 5)
+        XCTAssertEqual(groups.first { $0.id == "virtual-machines" }?.attributionReason, .virtualizationIdentity)
+        XCTAssertNil(groups.first { $0.id == "process-utm" })
+        XCTAssertNil(groups.first { $0.id == "process-prl_vm_app" })
+    }
+
+    func testWorkloadGrouperDoesNotMatchIncidentalMaiBotOrUTMSubstrings() {
+        let processes = [
+            makeProcess(
+                pid: 260,
+                name: "worker",
+                footprint: 100,
+                executablePath: "/Users/me/maibot-backup/bin/worker"
+            ),
+            makeProcess(
+                pid: 261,
+                name: "worker",
+                footprint: 100,
+                executablePath: "/Users/me/utm-project/bin/worker"
+            )
+        ]
+
+        let groups = WorkloadGrouper().group(processes)
+
+        XCTAssertNil(groups.first { $0.id == "maibot" })
+        XCTAssertNil(groups.first { $0.id == "virtual-machines" })
+        XCTAssertEqual(groups.first { $0.id == "process-worker" }?.processCount, 2)
+    }
+
+    func testWorkloadGrouperKeepsGenericRuntimeUnderGhostty() {
+        let processes = [
+            makeProcess(pid: 270, name: "ghostty", footprint: 50),
+            makeProcess(
+                pid: 271,
+                name: "node",
+                parentPID: 270,
+                footprint: 100,
+                workingDirectoryLabel: "api"
+            )
+        ]
+
+        let groups = WorkloadGrouper().group(processes)
+
+        XCTAssertEqual(groups.first { $0.id == "ghostty-services" }?.processCount, 2)
+        XCTAssertNil(groups.first { $0.id == "runtime-node-api" })
+    }
+
     func testWorkloadTrendAnalyzerReportsExistingGrowingGroups() {
         let previous = [
             makeGroup(id: "chrome", title: "Chrome", footprint: 1_000),
@@ -5162,7 +5309,9 @@ final class MemoryMonitorCoreTests: XCTestCase {
         startTimeMicroseconds: UInt64? = nil,
         executablePath: String? = nil,
         omitExecutablePath: Bool = false,
-        physicalFootprintIsEstimated: Bool = false
+        physicalFootprintIsEstimated: Bool = false,
+        applicationName: String? = nil,
+        bundleIdentifier: String? = nil
     ) -> ProcessSnapshot {
         ProcessSnapshot(
             identity: ProcessIdentity(
@@ -5175,6 +5324,8 @@ final class MemoryMonitorCoreTests: XCTestCase {
             isSystem: isSystem,
             name: name,
             executablePath: omitExecutablePath ? nil : (executablePath ?? "/usr/bin/\(name)"),
+            applicationName: applicationName,
+            bundleIdentifier: bundleIdentifier,
             residentBytes: footprint,
             physicalFootprintBytes: footprint,
             physicalFootprintIsEstimated: physicalFootprintIsEstimated,

@@ -2051,8 +2051,27 @@ public struct WorkloadGrouper: Sendable {
         let ghosttyPrefixes = ["ghostty"]
         let maiBotNames: Set<String> = ["maibot"]
         let maiBotPrefixes = ["maibot worker", "maibot server"]
-        let virtualizationNames: Set<String> = ["vmm", "virtualization", "virtual machine"]
-        let virtualizationPrefixes = ["virtualization", "virtual machine"]
+        // Common host-side VM applications and helpers. Keep hyphenated
+        // variants as explicit exact names: the shared prefix matcher treats a
+        // hyphen as an ordinary word character so `chrome-project` and similar
+        // project paths are not misclassified.
+        let virtualizationNames: Set<String> = [
+            "vmm", "virtualization", "virtual machine", "virtualmachine",
+            "utm", "utm se", "utm-se",
+            "parallels", "parallels desktop",
+            "vmware", "vmware fusion", "vmware-vmx", "vmware-vmx-debug",
+            "virtualbox", "virtualboxvm", "vboxheadless",
+            "qemu", "qemu-system", "qemu-system-aarch64", "qemu-system-x86_64",
+            "qemu-system-arm", "qemu-system-i386", "qemu-system-ppc",
+            "qemu-system-riscv64",
+            "lima", "limactl", "colima", "multipass", "multipassd",
+            "prl_vm_app", "prl_client_app"
+        ]
+        let virtualizationPrefixes = [
+            "vmm", "virtualization", "virtual machine", "virtualmachine",
+            "utm", "parallels", "vmware", "virtualbox", "vbox",
+            "qemu", "lima", "colima", "multipass", "prl"
+        ]
 
         let ownIsCodex = processNameMatches(own, exact: codexNames, prefixes: codexPrefixes)
         let pathIsCodex = pathComponentMatches(
@@ -2103,8 +2122,22 @@ public struct WorkloadGrouper: Sendable {
                 prefixes: virtualizationPrefixes
             )
             || bundleContainsComponent(process.bundleIdentifier, anyOf: virtualizationNames)
-        let isNode = runtimeDescriptor(for: own.lowercased())?.id == "node"
-        let isPython = runtimeDescriptor(for: own.lowercased())?.id == "python"
+        let runtime = runtimeDescriptor(for: own.lowercased())
+        let isNode = runtime?.id == "node"
+        let isPython = runtime?.id == "python"
+        // Runtime working-directory resolution is also used to recognize a
+        // MaiBot Python worker that inherited its project label from an
+        // ancestor. Resolve it once instead of walking the parent chain twice.
+        let workingDirectory = runtime == nil
+            ? nil
+            : workingDirectoryResolution(for: process, byPID: byPID)
+        let maiBotWorkingDirectory = processNameMatches(
+            process.workingDirectoryLabel,
+            exact: maiBotNames,
+            prefixes: maiBotPrefixes
+        ) || (workingDirectory.map {
+            processNameMatches($0.label, exact: maiBotNames, prefixes: maiBotPrefixes)
+        } ?? false)
 
         let ancestorHasCodex = ancestors.contains {
             processNameMatches($0, exact: codexNames, prefixes: codexPrefixes)
@@ -2114,6 +2147,12 @@ public struct WorkloadGrouper: Sendable {
         }
         let ancestorHasGhostty = ancestors.contains {
             processNameMatches($0, exact: ghosttyNames, prefixes: ghosttyPrefixes)
+        }
+        let ancestorHasMaiBot = ancestors.contains {
+            processNameMatches($0, exact: maiBotNames, prefixes: maiBotPrefixes)
+        }
+        let ancestorHasVirtualization = ancestors.contains {
+            processNameMatches($0, exact: virtualizationNames, prefixes: virtualizationPrefixes)
         }
 
         if process.isSystem || process.userID == 0 || ["kernel_task", "windowserver", "controlcenter", "launchd"].contains(own.lowercased()) {
@@ -2137,17 +2176,20 @@ public struct WorkloadGrouper: Sendable {
         if isChrome {
             return Classification(id: "chrome", title: "Chrome", isSystem: false, reason: .chromeIdentity)
         }
+        // Specific application identities must win over the broad Ghostty
+        // subtree. A MaiBot Python worker or a VM launched from a terminal is
+        // still MaiBot/VM, not a generic development service.
+        if isMaiBot || ancestorHasMaiBot || maiBotWorkingDirectory {
+            return Classification(id: "maibot", title: "MaiBot", isSystem: false, reason: .maibotIdentity)
+        }
+        if isVirtualization || ancestorHasVirtualization {
+            return Classification(id: "virtual-machines", title: "虚拟机", isSystem: false, reason: .virtualizationIdentity)
+        }
         if isGhostty || ancestorHasGhostty {
             return Classification(id: "ghostty-services", title: "Ghostty/开发服务", isSystem: false, reason: .ghosttyAncestor)
         }
-        if isMaiBot {
-            return Classification(id: "maibot", title: "MaiBot", isSystem: false, reason: .maibotIdentity)
-        }
-        if isVirtualization {
-            return Classification(id: "virtual-machines", title: "虚拟机", isSystem: false, reason: .virtualizationIdentity)
-        }
-        if let runtime = runtimeDescriptor(for: own.lowercased()) {
-            if let resolution = workingDirectoryResolution(for: process, byPID: byPID) {
+        if let runtime {
+            if let resolution = workingDirectory {
                 let label = resolution.label
                 let component = WorkingDirectoryLabelSanitizer.identifierComponent(for: label)
                 return Classification(

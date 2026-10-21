@@ -141,7 +141,8 @@ swift test --disable-sandbox --package-path . --scratch-path /tmp/memory-monitor
    `DesktopPresentationPolicy` 纯策略与窗口生命周期观察。
 3. **Slice 3（已完成）**：未使用 `@Published` 状态收敛；删除不可达的
    `lastError`/采样描述属性；推荐与 CPU/GPU fraction 保留但不再发布。
-4. **Slice 4**：归因优先级/MaiBot/VM 识别与测试。
+4. **Slice 4（已完成）**：MaiBot/虚拟机优先于 Ghostty 子树；MaiBot
+   working-directory/祖先识别；常见 VM 应用/helper 名称与 bundle 识别。
 5. **Slice 5**：历史持久化/时钟回拨/文本清洗硬化。
 6. **Slice 6**：Dynamic Type、滚动可达性、诊断/审计/登录 UX。
 7. **Slice 7**：CI、macOS 14 迁移、发布门禁、部署版本与文档收口。
@@ -183,3 +184,15 @@ swift test --disable-sandbox --package-path . --scratch-path /tmp/memory-monitor
   （`CleanupMotionTests`、`DesktopMotionTests`、`SmartCleanupNativeTests`），
   均为当前 shell 无前台桌面/LaunchServices 能力导致。
 - Debug 与 Release 严格并发构建通过。
+
+## Slice 4 verification
+
+- MaiBot/虚拟机检查移到 `ancestorHasGhostty` 之前；MaiBot 增加
+  `workingDirectoryLabel` 与祖先链识别；虚拟机增加 UTM、Parallels、
+  VMware、VirtualBox、QEMU、Lima、Colima、Multipass 等常见名称/bundle。
+- 新增 6 个测试：MaiBot over Ghostty、MaiBot Python by working directory、
+  VM over Ghostty、常见 VM 应用集合、`maibot-backup`/`utm-project` 反例、
+  Ghostty 下普通 Node 运行时仍归 Ghostty。
+- `swift test`：334 项，332 通过；失败仅 `DesktopMotionTests` 与
+  `SmartCleanupNativeTests` 两个原生 GUI 用例，原因同上。
+- Debug/Release 严格并发构建通过。
