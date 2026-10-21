@@ -152,10 +152,14 @@ swift test --disable-sandbox --package-path . --scratch-path /tmp/memory-monitor
    **Slice 6b（已完成）**：Dynamic Type/相对字号、进程详情滚动与操作
    按钮回退、菜单面板滚动与固定退出 footer、进程/历史/释放/测试页字号
    与行高收敛、图表可访问性摘要。
-7. **Slice 7（已完成本地部分）**：CI 迁移到 macOS 15、CI 显式跳过原生
-   GUI 用例、macOS 14 URL 尾斜杠测试修复、README 的 Dock/版本描述与
-   兼容性矩阵说明收口。Actions 计费、旧 1.0.3 bundle 清理和正式 1.4.0
-   版本号提升仍需单独执行。
+7. **Slice 7（已完成）**：CI 迁移到 macOS 15、CI 显式跳过原生 GUI 用例、
+   macOS 14 URL 尾斜杠测试修复、README 的 Dock/版本描述与兼容性矩阵说明
+   收口；macOS 15 CI 已跑通（run `39596314922`、`39598034930`）。
+8. **Slice 8（已完成）**：删除旧 popover、健康面板、工作组详情、历史面板、
+   `DetailLayout`/`PopoverLayout` 及其测试；移除 App 侧无 UI 的推荐计算
+   与状态。Core `RecommendationEngine` 保留给 probe/未来入口，历史分析
+   Core API 保留为有测试的只读能力。旧 bundle 已备份清理，`Info.plist`
+   提升到 1.4.0（140），本地 bundle 已部署并保留登录项。
 
 ## Slice 1 verification
 
@@ -262,5 +266,39 @@ swift test --disable-sandbox --package-path . --scratch-path /tmp/memory-monitor
 - README 更新为“LSUIElement 启动、打开主窗口时切 regular/Dock”，并
   修正默认 bundle 版本为 1.3.1 / 131；兼容性矩阵增加 macOS 14 退役与
   macOS 15 CI 说明。
-- 未执行：GitHub Actions 计费修复、旧 1.0.3 bundle 清理、正式 1.4.0
-  版本号提升与 notarization。
+- GitHub Actions 计费已恢复；`macos-15` / Xcode 16.4 CI 两次通过：
+  run `39596314922`（ScreenCaptureKit 兼容修复）和 `39598034930`
+  （死代码清理后）。产物 `compatibility-macos-15-arm64` 显示
+  macOS 15.7.9 arm64、system estimated、CPU available、GPU unavailable
+  （hosted VM），进程 283/525（53.9%）。
+- 旧 bundle 清理与 1.4.0 本地部署已完成；Developer ID/notarization 仍未执行。
+
+## Slice 8 verification
+
+- App 侧删除约 4,600 行不可达代码：`MonitorPopover`、`MonitorHealthPanel`、
+  `WorkloadGroupDetailView`、`HistoryPanel`、`DetailLayout`、
+  `PopoverLayout` 及其测试。
+- 保留 `ProcessDetailView`、设置页健康诊断、审计面板和
+  `SimpleMonitorPresentation`；Core `RecommendationEngine` 继续供
+  `memory-monitor-probe` 使用。
+- 推荐相关 App 测试删除；Core 推荐/历史分析测试保留。
+- `swift test`：307 项，305 通过；失败仅 `DesktopMotionTests` 与
+  `SmartCleanupNativeTests`（无前台桌面/LaunchServices）。
+- Debug/Release 严格并发构建通过；CI run `39598034930` 通过。
+
+## Local 1.4.0 release verification
+
+- `Resources/Info.plist`：`1.4.0 / 140`；Release arm64 binary 使用
+  Apple Development 签名并通过 `codesign --verify --deep --strict`。
+- 已部署到登录项注册的路径
+  `~/Library/Application Support/MemoryMonitor/releases/1.3.1-final/MemoryMonitor.app`；
+  `~/Applications/MemoryMonitor.app` 指向该 bundle 的符号链接，避免同
+  bundle ID 多副本。
+- `sfltool dumpbtm` 复核：`MemoryMonitor` 登录项仍为
+  `enabled, allowed, notified`，URL 指向上述路径，Generation 12；未执行
+  登录/登出实测。
+- 旧 1.0.3、1.1.0、1.2.0、1.2.1、1.3.0 和旧 1.3.1 bundle 已移入
+  `~/Library/Application Support/MemoryMonitor/backup-1.4.0-migration/`，
+  可回滚；未删除用户数据。
+- 保留 `1.3.1-final` 目录名是为了不破坏已批准的登录项 URL；实际内容为
+  1.4.0。Developer ID/notarization、TCC 权限变化和登录实测仍未执行。
