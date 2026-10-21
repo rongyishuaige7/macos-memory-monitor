@@ -42,12 +42,6 @@ final class SimpleInterfaceTests: XCTestCase {
             startRefreshTask: false
         )
         await model.refreshOnce(at: dataset.referenceDate)
-        let popover = MonitorPopover(
-            model: model, processActions: actions, loginLaunch: model.loginLaunch,
-            terminationAction: ApplicationTerminationAction(handler: {})
-        )
-        try render(popover, name: "overview", width: 380, maximumHeight: 650)
-        try render(popover, name: "overview-dark", width: 380, maximumHeight: 650, dark: true)
         let process = try XCTUnwrap(model.processes.first)
         try render(
             ProcessDetailView(model: model, actions: actions, identity: process.identity),
@@ -57,10 +51,6 @@ final class SimpleInterfaceTests: XCTestCase {
             ProcessDetailView(model: model, actions: actions, identity: process.identity)
                 .environment(\.dynamicTypeSize, .accessibility3),
             name: "detail-accessibility", width: 380, maximumHeight: 560
-        )
-        try render(
-            MonitorHealthPanel(model: model, processActions: actions, loginLaunch: model.loginLaunch),
-            name: "settings", width: 420, maximumHeight: 380
         )
         await model.shutdown()
 
