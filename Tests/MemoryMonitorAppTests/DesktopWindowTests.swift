@@ -23,6 +23,51 @@ final class DesktopWindowTests: XCTestCase {
         await model.shutdown()
     }
 
+    func testDesktopPresentationPolicyRejectsNonReadableSurfaces() {
+        XCTAssertTrue(DesktopPresentationPolicy.isPresented(
+            windowExists: true,
+            windowVisible: true,
+            isMiniaturized: false,
+            isOccluded: false,
+            appHidden: false
+        ))
+        XCTAssertFalse(DesktopPresentationPolicy.isPresented(
+            windowExists: false,
+            windowVisible: true,
+            isMiniaturized: false,
+            isOccluded: false,
+            appHidden: false
+        ))
+        XCTAssertFalse(DesktopPresentationPolicy.isPresented(
+            windowExists: true,
+            windowVisible: false,
+            isMiniaturized: false,
+            isOccluded: false,
+            appHidden: false
+        ))
+        XCTAssertFalse(DesktopPresentationPolicy.isPresented(
+            windowExists: true,
+            windowVisible: true,
+            isMiniaturized: true,
+            isOccluded: false,
+            appHidden: false
+        ))
+        XCTAssertFalse(DesktopPresentationPolicy.isPresented(
+            windowExists: true,
+            windowVisible: true,
+            isMiniaturized: false,
+            isOccluded: true,
+            appHidden: false
+        ))
+        XCTAssertFalse(DesktopPresentationPolicy.isPresented(
+            windowExists: true,
+            windowVisible: true,
+            isMiniaturized: false,
+            isOccluded: false,
+            appHidden: true
+        ))
+    }
+
     func testSettingsWindowSurvivesPopoverDismissalAndReusesWindow() async throws {
         let model = MonitorViewModel(
             historyStore: makeTemporaryHistoryStore("desktop-window-settings-history"),
@@ -38,9 +83,9 @@ final class DesktopWindowTests: XCTestCase {
         model.setPanelPresented(false)
         NotificationCenter.default.post(name: NSApplication.didResignActiveNotification, object: NSApp)
         XCTAssertTrue(window.isVisible)
-        XCTAssertTrue(model.isPanelPresented)
         coordinator.show(.processes)
         XCTAssertTrue(window === coordinator.window)
+        XCTAssertTrue(model.isPanelPresented)
         XCTAssertEqual(coordinator.navigation.page, .processes)
         window.performClose(nil)
         XCTAssertFalse(window.isVisible)

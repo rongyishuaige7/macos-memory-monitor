@@ -137,7 +137,8 @@ swift test --disable-sandbox --package-path . --scratch-path /tmp/memory-monitor
 
 1. **Slice 1（本提交）**：恢复构建；显式 store 注入；fixture fail-closed；
    内存测试/登录运行时安全开关；scratch 移入 `Scratch/`；设计文档。
-2. **Slice 2**：隐藏/遮挡/失焦采样降频；`RefreshWakeup` 激活刷新。
+2. **Slice 2（已完成）**：隐藏/遮挡/最小化/关闭/切 Space 采样降频；
+   `DesktopPresentationPolicy` 纯策略与窗口生命周期观察。
 3. **Slice 3**：死功能取舍与 `@Published` 成本收敛。
 4. **Slice 4**：归因优先级/MaiBot/VM 识别与测试。
 5. **Slice 5**：历史持久化/时钟回拨/文本清洗硬化。
@@ -156,3 +157,15 @@ swift test --disable-sandbox --package-path . --scratch-path /tmp/memory-monitor
   2026-10-13，未被本次测试改写。
 - fixture 测试覆盖：lone flag 生成临时根、关闭清理、只读登录；
   `MemoryTestController` 默认禁用。
+
+## Slice 2 verification
+
+- `DesktopPresentationPolicy` 覆盖关闭、不可见、最小化、完全遮挡和 App
+  隐藏；只有可见、未最小化、未遮挡且未隐藏的窗口才请求面板级采样。
+- `DesktopWindowCoordinator` 观察 `didChangeOcclusionState`、
+  `didHide/didUnhide`、`didBecomeActive/didResignActive` 和
+  `activeSpaceDidChange`；窗口关闭/最小化时回落后台频率，重新可见时
+  恢复。
+- `swift test`：328 项，326 通过；失败仅 `DesktopMotionTests` 与
+  `SmartCleanupNativeTests` 两个原生 GUI 用例，原因同上。
+- Release 严格并发构建通过。

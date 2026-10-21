@@ -34,6 +34,26 @@ final class DesktopNavigation: ObservableObject {
     @Published var showsAudit = false
 }
 
+/// Pure policy for whether the desktop window should request panel-level
+/// sampling. A closed, hidden, minimized or fully occluded window is not a
+/// surface the user can be reading, so it must not keep the 3-second cadence
+/// and full process scan running.
+enum DesktopPresentationPolicy {
+    static func isPresented(
+        windowExists: Bool,
+        windowVisible: Bool,
+        isMiniaturized: Bool,
+        isOccluded: Bool,
+        appHidden: Bool
+    ) -> Bool {
+        windowExists
+            && windowVisible
+            && !isMiniaturized
+            && !isOccluded
+            && !appHidden
+    }
+}
+
 /// Owns the window independently of MenuBarExtra's transient focus lifetime.
 @MainActor
 final class DesktopWindowCoordinator: NSObject, NSWindowDelegate {
@@ -47,6 +67,48 @@ final class DesktopWindowCoordinator: NSObject, NSWindowDelegate {
         memoryTest = MemoryTestController(operationGate: model.processActions.operationGate,
             manualActionIsBusy: { [weak model] in model?.processActions.isBusy != false },
             executionEnabled: allowsMemoryTest)
+        super.init()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowOcclusionChanged(_:)),
+            name: NSWindow.didChangeOcclusionStateNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationVisibilityChanged(_:)),
+            name: NSApplication.didHideNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationVisibilityChanged(_:)),
+            name: NSApplication.didUnhideNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationVisibilityChanged(_:)),
+            name: NSApplication.didBecomeActiveNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationVisibilityChanged(_:)),
+            name: NSApplication.didResignActiveNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(activeSpaceChanged(_:)),
+            name: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil
+        )
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
     func show(_ page: DesktopPage = .overview, process: ProcessIdentity? = nil, audit: Bool = false) {
@@ -87,11 +149,40 @@ final class DesktopWindowCoordinator: NSObject, NSWindowDelegate {
     }
 
     func windowDidMiniaturize(_ notification: Notification) {
-        model.setDesktopPresented(false)
+        updateDesktopPresentation()
     }
 
     func windowDidDeminiaturize(_ notification: Notification) {
-        model.setDesktopPresented(true)
+        updateDesktopPresentation()
+    }
+
+    @objc private func windowOcclusionChanged(_ notification: Notification) {
+        guard let changedWindow = notification.object as? NSWindow,
+              changedWindow === window else { return }
+        updateDesktopPresentation()
+    }
+
+    @objc private func applicationVisibilityChanged(_ notification: Notification) {
+        updateDesktopPresentation()
+    }
+
+    @objc private func activeSpaceChanged(_ notification: Notification) {
+        updateDesktopPresentation()
+    }
+
+    private func updateDesktopPresentation() {
+        guard let window else {
+            model.setDesktopPresented(false)
+            return
+        }
+        let presented = DesktopPresentationPolicy.isPresented(
+            windowExists: true,
+            windowVisible: window.isVisible,
+            isMiniaturized: window.isMiniaturized,
+            isOccluded: !window.occlusionState.contains(.visible),
+            appHidden: NSApplication.shared.isHidden
+        )
+        model.setDesktopPresented(presented)
     }
 }
 
