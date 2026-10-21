@@ -143,7 +143,10 @@ swift test --disable-sandbox --package-path . --scratch-path /tmp/memory-monitor
    `lastError`/采样描述属性；推荐与 CPU/GPU fraction 保留但不再发布。
 4. **Slice 4（已完成）**：MaiBot/虚拟机优先于 Ghostty 子树；MaiBot
    working-directory/祖先识别；常见 VM 应用/helper 名称与 bundle 识别。
-5. **Slice 5**：历史持久化/时钟回拨/文本清洗硬化。
+5. **Slice 5（已完成）**：load/merge 强制 top-40 workload 且 compaction
+   idempotent；persisted title/id 清洗 bidi/控制符；analyzer 过滤无效
+   availableFraction；时钟回拨时丢弃无法被新时钟接受的 fallback 记录；
+   锁文件 `O_CLOEXEC`。
 6. **Slice 6**：Dynamic Type、滚动可达性、诊断/审计/登录 UX。
 7. **Slice 7**：CI、macOS 14 迁移、发布门禁、部署版本与文档收口。
 
@@ -195,4 +198,20 @@ swift test --disable-sandbox --package-path . --scratch-path /tmp/memory-monitor
   Ghostty 下普通 Node 运行时仍归 Ghostty。
 - `swift test`：334 项，332 通过；失败仅 `DesktopMotionTests` 与
   `SmartCleanupNativeTests` 两个原生 GUI 用例，原因同上。
+- Debug/Release 严格并发构建通过。
+
+## Slice 5 verification
+
+- `HistoryStore` load/merge 现在都经过 `compactingWorkloads`；旧文件或
+  recovery merge 中超过 top-40 的 workload 会被压缩为 top-40 + 两个聚合。
+  `compactedWorkloads` 对已有 `other-*` 聚合保持幂等。
+- `PersistedWorkloadRecord` decode 清洗 bidi/控制符、路径分隔符和空白；
+  `MemoryHistoryAnalyzer` 忽略非有限/越界的 `availableFraction`。
+- 大幅时钟回拨时，`fallbackRecordsForNewClock` 丢弃无法被新时钟接受的
+  记录，避免 `HistoryStore.merge` 整批失败；持久化锁文件增加
+  `O_CLOEXEC`。
+- 新增测试：compaction 幂等、merge/load legacy >40 workload、bidi 清洗、
+  fallback 未来记录过滤。
+- `swift test`：338 项，337 通过；失败仅 `SmartCleanupNativeTests`
+  原生 GUI 用例（当前 shell 无 LaunchServices fixture 启动能力）。
 - Debug/Release 严格并发构建通过。

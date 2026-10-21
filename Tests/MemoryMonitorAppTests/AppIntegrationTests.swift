@@ -1205,6 +1205,40 @@ final class AppIntegrationTests: XCTestCase {
         }
     }
 
+    func testFallbackRecordsForNewClockDropFutureRecords() {
+        let now = Date(timeIntervalSince1970: 1_700_200_000)
+        let valid = MemoryHistoryRecord(
+            timestamp: now,
+            availableFraction: 0.5,
+            compressedBytes: 1,
+            swapUsedBytes: 1
+        )
+        let future = MemoryHistoryRecord(
+            timestamp: now.addingTimeInterval(3_600),
+            availableFraction: 0.5,
+            compressedBytes: 1,
+            swapUsedBytes: 1
+        )
+        let futureMarker = MemoryHistoryRecord(
+            timestamp: now,
+            availableFraction: 0.5,
+            compressedBytes: 1,
+            swapUsedBytes: 1,
+            workloads: [],
+            workloadsSampledAt: now.addingTimeInterval(3_600),
+            workloadInventoryIsComplete: true,
+            sourceSampledAt: now
+        )
+
+        let filtered = MonitorViewModel.fallbackRecordsForNewClock(
+            [valid, future, futureMarker],
+            now: now
+        )
+
+        XCTAssertEqual(filtered.count, 1)
+        XCTAssertEqual(filtered.first?.timestamp, now)
+    }
+
     func testMonitorViewModelCoalescesConcurrentRefreshesToLatestRequest() async throws {
         let base = Date(timeIntervalSince1970: 1_700_100_000)
         let firstProcess = makeProcess(pid: 9020, name: "first")

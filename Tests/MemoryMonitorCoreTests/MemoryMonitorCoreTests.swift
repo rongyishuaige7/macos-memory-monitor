@@ -1292,6 +1292,19 @@ final class MemoryMonitorCoreTests: XCTestCase {
         """.utf8)
         XCTAssertThrowsError(try decoder.decode(PersistedWorkloadRecord.self, from: invalidWorkload))
 
+        let bidiWorkload = Data("""
+        {"id":"runtime-node-\u{202E}evil","title":"Node \u{202E}evil","processCount":1,"attributedFootprintBytes":1,"attributedResidentBytes":1,"isSystem":false}
+        """.utf8)
+        let decodedBidiWorkload = try decoder.decode(
+            PersistedWorkloadRecord.self,
+            from: bidiWorkload
+        )
+        XCTAssertEqual(decodedBidiWorkload.id, "runtime-node-evil")
+        XCTAssertEqual(decodedBidiWorkload.title, "Node evil")
+        XCTAssertFalse(
+            decodedBidiWorkload.title.unicodeScalars.contains { $0.value == 0x202E }
+        )
+
         let invalidAuditID = Data("""
         {"id":"","timestamp":"2023-11-14T22:13:20Z","action":"gracefulExit","outcome":"failed","processLabel":"worker","detail":"failed"}
         """.utf8)
@@ -5008,6 +5021,102 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertEqual(compacted.count, 41)
         XCTAssertEqual(aggregate?.processCount, 5)
         XCTAssertEqual(aggregate?.attributedFootprintBytes, 1 + 2 + 3 + 4 + 5)
+    }
+
+    func testHistoryStoreCompactionIsIdempotent() {
+        let workloads = (0..<45).map { index in
+            PersistedWorkloadRecord(
+                id: "workload-\(index)",
+                title: "Workload \(index)",
+                processCount: 1,
+                attributedFootprintBytes: UInt64(index + 1),
+                attributedResidentBytes: UInt64(index + 1),
+                isSystem: false
+            )
+        }
+
+        let once = HistoryStore.compactedWorkloads(workloads, limit: 40)
+        let twice = HistoryStore.compactedWorkloads(once, limit: 40)
+
+        XCTAssertEqual(twice, once)
+        XCTAssertEqual(twice.first { $0.id == "other-processes" }?.processCount, 5)
+    }
+
+    func testHistoryStoreMergeCompactsLegacyWorkloadCount() async throws {
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let workloads = (0..<45).map { index in
+            PersistedWorkloadRecord(
+                id: "workload-\(index)",
+                title: "Workload \(index)",
+                processCount: 1,
+                attributedFootprintBytes: UInt64(index + 1),
+                attributedResidentBytes: UInt64(index + 1),
+                isSystem: false
+            )
+        }
+        let record = MemoryHistoryRecord(
+            timestamp: timestamp,
+            availableFraction: 0.5,
+            compressedBytes: 1,
+            swapUsedBytes: 1,
+            workloads: workloads,
+            workloadsSampledAt: timestamp,
+            workloadInventoryIsComplete: true,
+            sourceSampledAt: timestamp
+        )
+        _ = try await HistoryStore(fileURL: url).merge(records: [record], now: timestamp)
+
+        let loaded = try await HistoryStore(fileURL: url).load(now: timestamp)
+        let persisted = try XCTUnwrap(loaded.first)
+        XCTAssertEqual(persisted.workloads.count, 41)
+        XCTAssertEqual(
+            persisted.workloads.first { $0.id == "other-processes" }?.processCount,
+            5
+        )
+    }
+
+    func testHistoryStoreLoadCompactsLegacyWorkloadCount() async throws {
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let workloads = (0..<45).map { index in
+            PersistedWorkloadRecord(
+                id: "workload-\(index)",
+                title: "Workload \(index)",
+                processCount: 1,
+                attributedFootprintBytes: UInt64(index + 1),
+                attributedResidentBytes: UInt64(index + 1),
+                isSystem: false
+            )
+        }
+        let record = MemoryHistoryRecord(
+            timestamp: timestamp,
+            availableFraction: 0.5,
+            compressedBytes: 1,
+            swapUsedBytes: 1,
+            workloads: workloads,
+            workloadsSampledAt: timestamp,
+            workloadInventoryIsComplete: true,
+            sourceSampledAt: timestamp
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try createFile(
+            at: url,
+            data: encoder.encode(MemoryHistoryFile(records: [record]))
+        )
+
+        let loaded = try await HistoryStore(fileURL: url).load(now: timestamp)
+        let persisted = try XCTUnwrap(loaded.first)
+        XCTAssertEqual(persisted.workloads.count, 41)
+        XCTAssertEqual(
+            persisted.workloads.first { $0.id == "other-processes" }?.processCount,
+            5
+        )
     }
 
     func testHistoryStorePersistsOnlySanitizedRuntimeIdentity() async throws {

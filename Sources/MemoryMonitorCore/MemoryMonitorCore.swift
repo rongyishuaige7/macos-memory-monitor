@@ -232,7 +232,7 @@ private func acquireExclusivePersistedFileLock(
     }
 
     let descriptor = url.path.withCString { path in
-        open(path, O_RDWR | O_CREAT, mode_t(S_IRUSR | S_IWUSR))
+        open(path, O_RDWR | O_CREAT | O_CLOEXEC, mode_t(S_IRUSR | S_IWUSR))
     }
     guard descriptor >= 0 else {
         throw PersistedFileLockError.openFailed
@@ -844,8 +844,19 @@ public enum WorkingDirectoryLabelSanitizer {
     /// Cleans a basename for display. This also handles synthetic/test input
     /// so callers cannot smuggle path separators or terminal control codes.
     public static func label(fromComponent component: String) -> String? {
+        sanitizedDisplayText(component, limit: maxLength)
+    }
+
+    /// Cleans arbitrary persisted display text (for example workload IDs and
+    /// titles read from an older or hand-edited history file). It removes
+    /// control and bidi/invisible scalars, replaces path separators, collapses
+    /// whitespace and applies an explicit length limit.
+    public static func sanitizedDisplayText(
+        _ value: String,
+        limit: Int = 256
+    ) -> String? {
         var filtered = ""
-        for scalar in component.unicodeScalars {
+        for scalar in value.unicodeScalars {
             if isControl(scalar) {
                 continue
             }
@@ -862,7 +873,8 @@ public enum WorkingDirectoryLabelSanitizer {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !collapsed.isEmpty, collapsed != ".", collapsed != ".." else { return nil }
 
-        let limited = String(collapsed.prefix(maxLength))
+        let safeLimit = max(limit, 1)
+        let limited = String(collapsed.prefix(safeLimit))
         return limited.isEmpty ? nil : limited
     }
 
@@ -3929,10 +3941,12 @@ public struct PersistedWorkloadRecord: Codable, Sendable, Equatable, Identifiabl
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        let id = try container.decode(String.self, forKey: .id)
-        let title = try container.decode(String.self, forKey: .title)
+        let rawID = try container.decode(String.self, forKey: .id)
+        let rawTitle = try container.decode(String.self, forKey: .title)
         let processCount = try container.decode(Int.self, forKey: .processCount)
-        guard Self.hasValidText(id),
+        guard let id = WorkingDirectoryLabelSanitizer.sanitizedDisplayText(rawID),
+              let title = WorkingDirectoryLabelSanitizer.sanitizedDisplayText(rawTitle),
+              Self.hasValidText(id),
               Self.hasValidText(title),
               processCount >= 0 else {
             throw DecodingError.dataCorruptedError(
@@ -4399,7 +4413,11 @@ public struct MemoryHistoryAnalyzer: Sendable {
     private func normalized(_ records: [MemoryHistoryRecord]) -> [MemoryHistoryRecord] {
         var byTimestamp = [Date: MemoryHistoryRecord]()
         for record in records {
-            guard record.timestamp.timeIntervalSince1970.isFinite else { continue }
+            guard record.timestamp.timeIntervalSince1970.isFinite,
+                  record.availableFraction.isFinite,
+                  (0...1).contains(record.availableFraction) else {
+                continue
+            }
             if let existing = byTimestamp[record.timestamp] {
                 byTimestamp[record.timestamp] = merged(existing: existing, candidate: record)
             } else {
@@ -5778,8 +5796,12 @@ public actor HistoryStore {
         }
 
         let coalescedRecords = coalesced(snapshotRecords + journalRecords)
-        records = Self.pruned(
+        let compactedRecords = Self.compactingWorkloads(
             coalescedRecords,
+            limit: maxPersistedWorkloads
+        )
+        records = Self.pruned(
+            compactedRecords,
             now: referenceNow,
             retentionInterval: retentionInterval
         )
@@ -5794,7 +5816,7 @@ public actor HistoryStore {
 
         let canonicalSnapshot: Data
         do {
-            canonicalSnapshot = try Self.encoder().encode(MemoryHistoryFile(records: coalescedRecords))
+            canonicalSnapshot = try Self.encoder().encode(MemoryHistoryFile(records: records))
             guard canonicalSnapshot.count <= Self.maximumSnapshotFileBytes else {
                 throw HistoryStoreError.fileTooLarge
             }
@@ -5937,7 +5959,10 @@ public actor HistoryStore {
         let diskRecords = records
         let referenceNow = retentionReferenceNow(now)
         let mergedRecords = Self.pruned(
-            coalesced(diskRecords + localRecords),
+            Self.compactingWorkloads(
+                coalesced(diskRecords + localRecords),
+                limit: maxPersistedWorkloads
+            ),
             now: referenceNow,
             retentionInterval: retentionInterval
         )
@@ -6209,7 +6234,10 @@ public actor HistoryStore {
         let referenceNow = retentionReferenceNow(now)
         let before = records
         let mergedRecords = Self.pruned(
-            coalesced(records + incoming),
+            Self.compactingWorkloads(
+                coalesced(records + incoming),
+                limit: maxPersistedWorkloads
+            ),
             now: referenceNow,
             retentionInterval: retentionInterval
         )
@@ -6560,6 +6588,31 @@ public actor HistoryStore {
         )
     }
 
+    /// Applies the top-workload policy to records loaded from an older or
+    /// hand-edited file, and to records merged by a recovery path. `append`
+    /// already normalizes new records; load/merge must not trust their input.
+    private nonisolated static func compactingWorkloads(
+        _ records: [MemoryHistoryRecord],
+        limit: Int
+    ) -> [MemoryHistoryRecord] {
+        let safeLimit = max(limit, 1)
+        return records.map { record in
+            guard record.workloads.count > safeLimit else { return record }
+            let workloads = compactedWorkloads(record.workloads, limit: safeLimit)
+            guard workloads != record.workloads else { return record }
+            return MemoryHistoryRecord(
+                timestamp: record.timestamp,
+                availableFraction: record.availableFraction,
+                compressedBytes: record.compressedBytes,
+                swapUsedBytes: record.swapUsedBytes,
+                workloads: workloads,
+                workloadsSampledAt: record.workloadsSampledAt,
+                workloadInventoryIsComplete: record.workloadInventoryIsComplete,
+                sourceSampledAt: record.sourceSampledAt
+            )
+        }
+    }
+
     private nonisolated static func preferredSystemRecord(
         existing: MemoryHistoryRecord,
         candidate: MemoryHistoryRecord
@@ -6725,22 +6778,15 @@ public actor HistoryStore {
         limit: Int
     ) -> [PersistedWorkloadRecord] {
         let safeLimit = max(limit, 1)
-        let ranked = source.sorted {
-            if $0.containsEstimatedFootprint != $1.containsEstimatedFootprint {
-                return !$0.containsEstimatedFootprint
-            }
-            if $0.attributedFootprintBytes != $1.attributedFootprintBytes {
-                return $0.attributedFootprintBytes > $1.attributedFootprintBytes
-            }
-            if $0.containsEstimatedFootprint != $1.containsEstimatedFootprint {
-                return !$0.containsEstimatedFootprint
-            }
-            if $0.isSystem != $1.isSystem {
-                return !$0.isSystem
-            }
-            return $0.id < $1.id
+        // Existing aggregate rows must survive re-compaction instead of being
+        // ranked as ordinary workloads and aggregated again. This keeps the
+        // helper idempotent when a canonical history file is loaded.
+        let aggregates = source.filter { isAggregateWorkloadID($0.id) }
+        let candidates = source.filter { !isAggregateWorkloadID($0.id) }
+        let ranked = candidates.sorted(by: workloadRanking)
+        guard ranked.count > safeLimit else {
+            return (ranked + aggregates).sorted(by: workloadRanking)
         }
-        guard ranked.count > safeLimit else { return ranked }
 
         var result = Array(ranked.prefix(safeLimit))
         var aggregateBySystem: [Bool: (
@@ -6749,7 +6795,8 @@ public actor HistoryStore {
             resident: UInt64,
             containsEstimatedFootprint: Bool
         )] = [:]
-        for workload in ranked.dropFirst(safeLimit) {
+
+        for workload in aggregates + Array(ranked.dropFirst(safeLimit)) {
             var aggregate = aggregateBySystem[workload.isSystem] ?? (
                 processCount: 0,
                 footprint: 0,
@@ -6777,21 +6824,27 @@ public actor HistoryStore {
                 )
             )
         }
-        return result.sorted {
-            if $0.containsEstimatedFootprint != $1.containsEstimatedFootprint {
-                return !$0.containsEstimatedFootprint
-            }
-            if $0.attributedFootprintBytes != $1.attributedFootprintBytes {
-                return $0.attributedFootprintBytes > $1.attributedFootprintBytes
-            }
-            if $0.containsEstimatedFootprint != $1.containsEstimatedFootprint {
-                return !$0.containsEstimatedFootprint
-            }
-            if $0.isSystem != $1.isSystem {
-                return !$0.isSystem
-            }
-            return $0.id < $1.id
+        return result.sorted(by: workloadRanking)
+    }
+
+    private nonisolated static func isAggregateWorkloadID(_ id: String) -> Bool {
+        id == "other-system" || id == "other-processes"
+    }
+
+    private nonisolated static func workloadRanking(
+        _ lhs: PersistedWorkloadRecord,
+        _ rhs: PersistedWorkloadRecord
+    ) -> Bool {
+        if lhs.containsEstimatedFootprint != rhs.containsEstimatedFootprint {
+            return !lhs.containsEstimatedFootprint
         }
+        if lhs.attributedFootprintBytes != rhs.attributedFootprintBytes {
+            return lhs.attributedFootprintBytes > rhs.attributedFootprintBytes
+        }
+        if lhs.isSystem != rhs.isSystem {
+            return !lhs.isSystem
+        }
+        return lhs.id < rhs.id
     }
 
     private nonisolated static func adding(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {

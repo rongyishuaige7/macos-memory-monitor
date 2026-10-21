@@ -1106,11 +1106,53 @@ final class MonitorViewModel: ObservableObject {
         }
 
         refreshEpoch &+= 1
-        resetCrossClockBaselines()
+        resetCrossClockBaselines(now: timestamp)
         return refreshEpoch
     }
 
-    private func resetCrossClockBaselines() {
+    /// Records captured under the previous wall-clock generation may be
+    /// "future" relative to the new clock. Keeping them in the fallback buffer
+    /// makes `HistoryStore.merge` reject the whole recovery batch, so drop
+    /// only the records that cannot be accepted by the new generation.
+    static func fallbackRecordsForNewClock(
+        _ records: [MemoryHistoryRecord],
+        now: Date,
+        allowance: TimeInterval = HistoryStore.maximumFutureSkew
+    ) -> [MemoryHistoryRecord] {
+        guard now.timeIntervalSince1970.isFinite,
+              allowance.isFinite,
+              allowance >= 0 else {
+            return []
+        }
+        return records.filter { record in
+            isDateWithinFutureSkew(record.timestamp, now: now, allowance: allowance)
+                && (record.sourceSampledAt.map {
+                    isDateWithinFutureSkew($0, now: now, allowance: allowance)
+                } ?? true)
+                && (record.workloadsSampledAt.map {
+                    isDateWithinFutureSkew($0, now: now, allowance: allowance)
+                } ?? true)
+        }
+    }
+
+    private static func isDateWithinFutureSkew(
+        _ date: Date,
+        now: Date,
+        allowance: TimeInterval
+    ) -> Bool {
+        let dateSeconds = date.timeIntervalSince1970
+        let nowSeconds = now.timeIntervalSince1970
+        guard dateSeconds.isFinite,
+              nowSeconds.isFinite,
+              allowance.isFinite,
+              allowance >= 0,
+              nowSeconds <= 253_402_300_799 - allowance else {
+            return false
+        }
+        return dateSeconds <= nowSeconds + allowance
+    }
+
+    private func resetCrossClockBaselines(now: Date) {
         lastAcceptedPass = nil
         previousCPUTime = nil
         cpuUsageFraction = nil
@@ -1134,6 +1176,11 @@ final class MonitorViewModel: ObservableObject {
         // A Date-based retry deadline belongs to the previous wall-clock
         // generation. Permit one immediate recovery attempt in the new one.
         historyRetryAfter = nil
+        historyRetryAttempt = 0
+        fallbackHistory = Self.fallbackRecordsForNewClock(
+            fallbackHistory,
+            now: now
+        )
     }
 
     /// Checks a request before doing provider/history work. The actual
