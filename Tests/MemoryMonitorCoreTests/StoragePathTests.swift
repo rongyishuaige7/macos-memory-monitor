@@ -58,8 +58,8 @@ final class StoragePathTests: XCTestCase {
             .standardizedFileURL
 
         XCTAssertEqual(
-            MemoryMonitorStoragePaths.isolatedRootURL(environment: environment),
-            expected
+            MemoryMonitorStoragePaths.isolatedRootURL(environment: environment)?.path,
+            expected.path
         )
 
         let invalidValues: [String?] = [
@@ -119,8 +119,8 @@ final class StoragePathTests: XCTestCase {
                     environment: [
                         MemoryMonitorStoragePaths.overrideEnvironmentKey: path
                     ]
-                ),
-                expected,
+                )?.path,
+                expected.path,
                 "physical temporary alias should resolve consistently: \(path)"
             )
         }

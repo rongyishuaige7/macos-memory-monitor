@@ -497,11 +497,11 @@ Process controls are guarded and limited to the current user's non-system proces
 open "$HOME/Library/Application Support/MemoryMonitor/dist/MemoryMonitor.app"
 ~~~
 
-应用是菜单栏代理（`LSUIElement=true`），启动后不会显示 Dock 图标；点击主屏菜单栏中的 `内存 xx%` 状态项即可打开详细面板。
+应用以菜单栏代理（`LSUIElement=true`）启动；打开主窗口时切换到常规激活策略并显示 Dock 图标，关闭窗口后菜单栏继续监视。点击菜单栏中的 `内存 xx%` 状态项打开快捷面板；设置和进程详情归主窗口管理，避免菜单栏失焦时连带消失。
 
 也可以通过 `OUTPUT_DIR` 指定其他本机目录；脚本会拒绝 iCloud Drive 或其他 File Provider 路径，因为这些位置可能在签名后重新写入 `com.apple.FinderInfo`。脚本只生成本地产物，不会自动安装、注册登录启动项或修改系统 LaunchAgents。Developer ID 签名、沙盒策略和登录启动开关留到单独阶段决定。
 
-构建脚本默认从 [`Resources/Info.plist`](Resources/Info.plist) 读取 `1.0.3 / 13`，也支持以下环境变量覆盖：`CONFIGURATION=debug|release`、`APP_VERSION`、`BUILD_NUMBER`、`CODE_SIGN_IDENTITY` 和 `SKIP_SIGNING=1`。默认签名身份为本地 ad-hoc（`-`）。发布基线和验收要求见 [`docs/release-readiness-v1.0.3.md`](docs/release-readiness-v1.0.3.md)。
+构建脚本默认从 [`Resources/Info.plist`](Resources/Info.plist) 读取 `1.3.1 / 131`，也支持以下环境变量覆盖：`CONFIGURATION=debug|release`、`APP_VERSION`、`BUILD_NUMBER`、`CODE_SIGN_IDENTITY` 和 `SKIP_SIGNING=1`。默认签名身份为本地 ad-hoc（`-`）。发布基线和验收要求见 [`docs/release-readiness-v1.0.3.md`](docs/release-readiness-v1.0.3.md)。
 
 ### Phase 2 completed
 

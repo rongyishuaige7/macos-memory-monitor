@@ -391,10 +391,11 @@ final class AppIntegrationTests: XCTestCase {
         XCTAssertTrue(fixtureConfiguration.usesUIFixture)
         XCTAssertTrue(fixtureConfiguration.fixtureRequested)
         XCTAssertEqual(
-            fixtureConfiguration.storageRoot,
+            fixtureConfiguration.storageRoot.path,
             URL(fileURLWithPath: "/tmp/paired", isDirectory: true)
                 .resolvingSymlinksInPath()
                 .standardizedFileURL
+                .path
         )
 
         let productionRoot = MemoryMonitorStoragePaths.defaultRootURL
@@ -407,7 +408,7 @@ final class AppIntegrationTests: XCTestCase {
             )
             XCTAssertFalse(configuration.usesUIFixture, "unexpected fixture mode: \(environment)")
             XCTAssertFalse(configuration.fixtureRequested)
-            XCTAssertEqual(configuration.storageRoot, productionRoot)
+            XCTAssertEqual(configuration.storageRoot.path, productionRoot.path)
         }
 
         // A fixture switch without a trustworthy root must fail closed:
@@ -452,7 +453,7 @@ final class AppIntegrationTests: XCTestCase {
             XCTFail("paired fixture test must resolve to an isolated UI fixture")
             return
         }
-        XCTAssertEqual(configuration.storageRoot, root.standardizedFileURL)
+        XCTAssertEqual(configuration.storageRoot.path, root.standardizedFileURL.path)
         let referenceDate = Date(timeIntervalSince1970: 1_750_000_000)
         let model = MemoryMonitorApplicationDelegate.makeModel(
             environment: environment,

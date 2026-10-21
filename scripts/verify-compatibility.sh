@@ -50,7 +50,18 @@ git -C "$project_root" diff --check
 git -C "$project_root" diff --cached --check
 
 print "Running Swift tests..."
-swift test --package-path "$project_root" --parallel
+test_skip_args=()
+if [[ -n "${SWIFT_TEST_SKIP:-}" ]]; then
+	# Hosted runners have no foreground desktop/LaunchServices session. Keep
+	# the pure logic gate deterministic and run native GUI tests on a real
+	# desktop runner instead of treating environment limitations as failures.
+	test_skip_args=(--skip "$SWIFT_TEST_SKIP")
+	print "Skipping native GUI tests: $SWIFT_TEST_SKIP"
+fi
+swift test \
+	--package-path "$project_root" \
+	--parallel \
+	"${test_skip_args[@]}"
 
 print "Building Debug with strict concurrency..."
 swift build \

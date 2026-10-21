@@ -152,7 +152,10 @@ swift test --disable-sandbox --package-path . --scratch-path /tmp/memory-monitor
    **Slice 6b（已完成）**：Dynamic Type/相对字号、进程详情滚动与操作
    按钮回退、菜单面板滚动与固定退出 footer、进程/历史/释放/测试页字号
    与行高收敛、图表可访问性摘要。
-7. **Slice 7**：CI、macOS 14 迁移、发布门禁、部署版本与文档收口。
+7. **Slice 7（已完成本地部分）**：CI 迁移到 macOS 15、CI 显式跳过原生
+   GUI 用例、macOS 14 URL 尾斜杠测试修复、README 的 Dock/版本描述与
+   兼容性矩阵说明收口。Actions 计费、旧 1.0.3 bundle 清理和正式 1.4.0
+   版本号提升仍需单独执行。
 
 ## Slice 1 verification
 
@@ -246,3 +249,18 @@ swift test --disable-sandbox --package-path . --scratch-path /tmp/memory-monitor
 - `swift test`：339 项，338 通过；失败仅 `SmartCleanupNativeTests`
   原生 GUI 用例。
 - Debug/Release 严格并发构建通过。
+
+## Slice 7 verification
+
+- GitHub Actions 兼容性矩阵移除已退役的 `macos-14`，保留 `macos-15`
+  / Xcode 16.4；CI 设置 `SWIFT_TEST_SKIP`，显式跳过需要前台桌面和
+  LaunchServices 的原生 GUI 用例，纯逻辑测试仍全量执行。
+- `verify-compatibility.sh` 支持 `SWIFT_TEST_SKIP`；`zsh -n` 语法检查
+  通过。
+- `StoragePathTests` 与 `AppIntegrationTests` 的 URL 比较改为 `.path`，
+  避免 macOS 14 的尾斜杠表示差异导致误报。
+- README 更新为“LSUIElement 启动、打开主窗口时切 regular/Dock”，并
+  修正默认 bundle 版本为 1.3.1 / 131；兼容性矩阵增加 macOS 14 退役与
+  macOS 15 CI 说明。
+- 未执行：GitHub Actions 计费修复、旧 1.0.3 bundle 清理、正式 1.4.0
+  版本号提升与 notarization。
