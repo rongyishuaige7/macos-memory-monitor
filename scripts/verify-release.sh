@@ -308,7 +308,11 @@ trap finalize EXIT
 run_step git_checks step_git_checks
 run_step bundle_replacement step_bundle_replacement
 run_step non_gui_tests step_non_gui_tests
-run_step native_tests step_native_tests
+if [[ "${VERIFY_RELEASE_SKIP_NATIVE_TESTS:-0}" == "1" ]]; then
+	record_step native_tests skipped "" "explicitly skipped by VERIFY_RELEASE_SKIP_NATIVE_TESTS"
+else
+	run_step native_tests step_native_tests
+fi
 run_step debug_build step_debug_build
 run_step release_build step_release_build
 run_step probe step_probe
