@@ -3,7 +3,8 @@
 计划基线：2026-10-22，源码 `dea920aa3145d1033b6d811c768ce07dc9f19ffe`，
 版本 1.4.2 (142)。状态：S1 已实施并推送（`e876029`），S2 已实施并推送
 （`0dd8acd`、`1c0ccfd`、`cc7b52a`、`18ec7f5`），S3 已实施并推送
-（`14a908a`），S4–S7 仍待实施。
+（`14a908a`），S2/S3 审查修复已推送（`4f421b3`、`c8d0a42`），
+S4–S7 仍待实施。
 
 建议下一阶段以“可核对来源、可解释中断、可恢复数据”为目标。先完善发布
 证据，再补存储检查和审计中断状态，之后实施备份恢复与扫描预算。登录项
@@ -345,3 +346,25 @@ release gate 的非 GUI/独立 GUI 入口继续使用；单进程 swift test 的
   通过（源码 `14a908a`）。
 - 未做：S4 审计中断聚合、S5 完整备份/恢复、S6 扫描预算、S7 升级/回滚；
   真实登录、公证和部署仍未变更。
+
+## S2/S3 审查修复记录（2026-10-22）
+
+- 门禁步骤改为每个命令显式 `|| return 1`，不再依赖被 `if` 条件抑制的
+  `set -e`。故障注入 `git diff --check` 后，`git_checks` 记录为 failed，
+  后续步骤不再执行，manifest 退出码为 1。
+- `memory-monitor-storage` 在判断报告位置前解析根和输出父目录的真实路径；
+  通过祖先符号链接把报告写进检查根会返回 2，且不创建文件。
+- 历史检查器在 v2 索引存在时验证 segments 目录必须是真实目录；目录缺失、
+  符号链接或非目录均不再报告 healthy。
+- 索引和全部分段共享 `maximumSnapshotFileBytes` 预算，超过后标记
+  `fileTooLarge`，不再只限制单段大小。
+- manifest 写入失败不再被 `|| true` 吞掉；成功门禁会转为非零退出。
+- `SWIFT_TEST_FLAGS` 禁止 `--filter`/`--skip`/`--only-testing`；新增
+  `non_gui_test_scope` 步骤，要求实际执行至少 300 项非 GUI 测试。
+- 构建输入发现符号链接时拒绝生成摘要；`Package.swift`、Sources、Resources
+  及验证输入均覆盖。
+- 验证：`swift test` **354 项全部通过**；Release 严格并发构建通过；
+  `HistoryInspectionTests` 13 项通过；S2 成功证据
+  `/private/tmp/mm-s2-final2`；失败注入证据
+  `/private/tmp/mm-s2-stepfail2`；CI job `39801787180` 的 macOS 15 任务
+  成功（run 级记录仍显示 in_progress）。
