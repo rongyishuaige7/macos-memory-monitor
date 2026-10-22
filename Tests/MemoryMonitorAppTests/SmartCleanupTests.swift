@@ -31,6 +31,41 @@ final class SmartCleanupTests: XCTestCase {
         XCTAssertTrue(SmartCleanupController(runtime: runtime, defaults: defaults).authorizations.isEmpty)
     }
 
+    func testAuthorizationIdentityIncludesBundleAndExecutableInodes() {
+        let app = cleanupApp(1)
+        let (controller, _, _) = setup()
+        controller.setAuthorized(app, true)
+        XCTAssertTrue(controller.isAuthorized(app))
+
+        let replaced = CleanupApplication(
+            process: app.process,
+            authorization: .init(
+                bundleIdentifier: app.authorization.bundleIdentifier,
+                bundlePath: app.authorization.bundlePath,
+                executablePath: app.authorization.executablePath,
+                bundleInode: app.authorization.bundleInode.map { $0 + 1 },
+                executableInode: app.authorization.executableInode
+            )
+        )
+        XCTAssertFalse(controller.isAuthorized(replaced))
+    }
+
+    func testLegacyAuthorizationWithoutInodesIsDiscarded() throws {
+        let suite = "cleanup-legacy-auth-" + UUID().uuidString
+        addTeardownBlock { UserDefaults.standard.removePersistentDomain(forName: suite) }
+        let defaults = UserDefaults(suiteName: suite)!
+        let legacy = CleanupAuthorization(
+            bundleIdentifier: "legacy.app",
+            bundlePath: "/Applications/Legacy.app",
+            executablePath: "/Applications/Legacy.app/Contents/MacOS/Legacy"
+        )
+        defaults.set(try JSONEncoder().encode([legacy]), forKey: "smartCleanup.authorizedApplications.v1")
+
+        let controller = SmartCleanupController(runtime: FakeCleanupRuntime(), defaults: defaults)
+        XCTAssertTrue(controller.authorizations.isEmpty)
+        XCTAssertTrue(controller.notice?.contains("身份校验") == true)
+    }
+
     func testProtectsForegroundRecentBusyAndUnknownApps() async {
         let apps = (1...5).map { cleanupApp($0) }
         let (controller, runtime, _) = setup([
@@ -196,6 +231,36 @@ final class SmartCleanupTests: XCTestCase {
         XCTAssertTrue(controller.result?.cancelled == true)
         XCTAssertNil(controller.result?.observedChangeBytes)
         XCTAssertFalse(controller.result?.hasMeasuredBenefit == true)
+    }
+
+    func testCleanupEligibilityPolicyUsesConfiguredThresholds() {
+        let app = cleanupApp(1)
+        let policy = CleanupEligibilityPolicy(
+            policyID: "test.policy",
+            recentActivitySeconds: 10,
+            busyCPUPercent: 20
+        )
+
+        XCTAssertEqual(
+            policy.decision(for: observation(app, recent: 15, cpu: 10)).reason,
+            .allowed
+        )
+        XCTAssertEqual(
+            policy.decision(for: observation(app, recent: 5, cpu: 10)).reason,
+            .recentActivity
+        )
+        XCTAssertEqual(
+            policy.decision(for: observation(app, recent: 15, cpu: 25)).reason,
+            .busyCPU
+        )
+        XCTAssertEqual(
+            policy.decision(for: observation(app, frontmost: true)).reason,
+            .frontmost
+        )
+        XCTAssertEqual(
+            policy.decision(for: observation(app, recent: 15, cpu: nil)).reason,
+            .missingCPUSample
+        )
     }
 
     func testAuditRecordsIntentSignalAndTerminalOutcome() async {
@@ -364,7 +429,13 @@ func cleanupApp(_ number: Int, start: UInt64 = 1000) -> CleanupApplication {
         executablePath: executable, applicationName: "测试应用 \(number)", bundleIdentifier: identifier,
         residentBytes: UInt64(number) * 100 * 1024 * 1024, physicalFootprintBytes: UInt64(number) * 100 * 1024 * 1024,
         virtualBytes: 0, userTimeNanos: 0, systemTimeNanos: 0, threadCount: 1),
-        authorization: .init(bundleIdentifier: identifier, bundlePath: path, executablePath: executable))
+        authorization: .init(
+            bundleIdentifier: identifier,
+            bundlePath: path,
+            executablePath: executable,
+            bundleInode: UInt64(10_000 + number),
+            executableInode: UInt64(20_000 + number)
+        ))
 }
 
 func observation(_ app: CleanupApplication, frontmost: Bool = false, recent: TimeInterval = 300,

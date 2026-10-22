@@ -153,8 +153,22 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
               bundle.isFileURL, executable.isFileURL else { return nil }
         let bundlePath = Self.canonical(bundle.path)
         let executablePath = Self.canonical(executable.path)
-        guard executablePath.hasPrefix(bundlePath + "/"), !bundlePath.hasPrefix("/System/") else { return nil }
-        return .init(bundleIdentifier: identifier, bundlePath: bundlePath, executablePath: executablePath)
+        guard executablePath.hasPrefix(bundlePath + "/"), !bundlePath.hasPrefix("/System/"),
+              let bundleInode = Self.inode(at: bundlePath),
+              let executableInode = Self.inode(at: executablePath) else { return nil }
+        return .init(
+            bundleIdentifier: identifier,
+            bundlePath: bundlePath,
+            executablePath: executablePath,
+            bundleInode: bundleInode,
+            executableInode: executableInode
+        )
+    }
+
+    private static func inode(at path: String) -> UInt64? {
+        var st = stat()
+        guard lstat(path, &st) == 0 else { return nil }
+        return UInt64(st.st_ino)
     }
 
     private static func canonical(_ path: String) -> String {

@@ -22,6 +22,25 @@ struct CleanupAuthorization: Codable, Hashable, Sendable {
     let bundleIdentifier: String
     let bundlePath: String
     let executablePath: String
+    /// Identity anchors for the bundle and executable observed at authorization
+    /// time. An in-place app update or replacement changes at least one of
+    /// these and invalidates the authorization until the user re-adds it.
+    let bundleInode: UInt64?
+    let executableInode: UInt64?
+
+    init(
+        bundleIdentifier: String,
+        bundlePath: String,
+        executablePath: String,
+        bundleInode: UInt64? = nil,
+        executableInode: UInt64? = nil
+    ) {
+        self.bundleIdentifier = bundleIdentifier
+        self.bundlePath = bundlePath
+        self.executablePath = executablePath
+        self.bundleInode = bundleInode
+        self.executableInode = executableInode
+    }
 }
 
 struct CleanupApplication: Identifiable, Equatable, Sendable {
@@ -29,6 +48,64 @@ struct CleanupApplication: Identifiable, Equatable, Sendable {
     let authorization: CleanupAuthorization
     var id: ProcessIdentity { process.identity }
     var name: String { process.applicationName ?? process.name }
+}
+
+enum CleanupDecisionReason: String, Codable, Sendable, Equatable {
+    case frontmost
+    case recentActivity
+    case missingCPUSample
+    case busyCPU
+    case allowed
+}
+
+struct CleanupEligibilityDecision: Sendable, Equatable {
+    let reason: CleanupDecisionReason
+    let message: String?
+
+    var isAllowed: Bool { reason == .allowed }
+}
+
+struct CleanupEligibilityPolicy: Sendable, Equatable {
+    let policyID: String
+    let recentActivitySeconds: TimeInterval
+    let busyCPUPercent: Double
+
+    static let standard = CleanupEligibilityPolicy()
+
+    init(
+        policyID: String = "smart-cleanup.v1",
+        recentActivitySeconds: TimeInterval = 120,
+        busyCPUPercent: Double = 5
+    ) {
+        self.policyID = policyID
+        self.recentActivitySeconds = recentActivitySeconds.isFinite
+            ? max(recentActivitySeconds, 0)
+            : 120
+        self.busyCPUPercent = busyCPUPercent.isFinite
+            ? max(busyCPUPercent, 0)
+            : 5
+    }
+
+    func decision(for observation: CleanupObservation) -> CleanupEligibilityDecision {
+        if observation.isFrontmost {
+            return .init(reason: .frontmost, message: "正在使用")
+        }
+        if !observation.secondsSinceActivity.isFinite
+            || observation.secondsSinceActivity < recentActivitySeconds {
+            return .init(reason: .recentActivity, message: "近期使用或仍在观察")
+        }
+        guard let cpu = observation.cpuPercent, cpu.isFinite, cpu >= 0 else {
+            return .init(reason: .missingCPUSample, message: "等待活动数据")
+        }
+        if cpu >= busyCPUPercent {
+            return .init(reason: .busyCPU, message: "当前忙碌")
+        }
+        return .init(reason: .allowed, message: nil)
+    }
+
+    func protectionMessage(for observation: CleanupObservation) -> String? {
+        decision(for: observation).message
+    }
 }
 
 struct CleanupObservation: Identifiable, Equatable, Sendable {
@@ -39,11 +116,7 @@ struct CleanupObservation: Identifiable, Equatable, Sendable {
     var id: ProcessIdentity { application.id }
 
     var protection: String? {
-        if isFrontmost { return "正在使用" }
-        if !secondsSinceActivity.isFinite || secondsSinceActivity < 120 { return "近期使用或仍在观察" }
-        guard let cpuPercent, cpuPercent.isFinite, cpuPercent >= 0 else { return "等待活动数据" }
-        if cpuPercent >= 5 { return "当前忙碌" }
-        return nil
+        CleanupEligibilityPolicy.standard.protectionMessage(for: self)
     }
 }
 
@@ -172,6 +245,7 @@ final class SmartCleanupController: ObservableObject {
     private let defaults: UserDefaults
     private let manualActionIsBusy: @MainActor () -> Bool
     private let audit: AuditHandler?
+    private let eligibilityPolicy: CleanupEligibilityPolicy
     private let executionEnabled: Bool
     private let approvalKey = "smartCleanup.authorizedApplications.v1"
     private var task: Task<Void, Never>?
@@ -184,16 +258,22 @@ final class SmartCleanupController: ObservableObject {
          operationGate: MonitorOperationGate = MonitorOperationGate(),
          executionEnabled: Bool = true,
          manualActionIsBusy: @escaping @MainActor () -> Bool = { false },
+         eligibilityPolicy: CleanupEligibilityPolicy = .standard,
          audit: AuditHandler? = nil) {
         self.runtime = runtime ?? LiveSmartCleanupRuntime()
         self.defaults = defaults
         self.operationGate = operationGate
         self.manualActionIsBusy = manualActionIsBusy
+        self.eligibilityPolicy = eligibilityPolicy
         self.audit = audit
         self.executionEnabled = executionEnabled
         if executionEnabled, let data = defaults.data(forKey: approvalKey),
            let saved = try? JSONDecoder().decode([CleanupAuthorization].self, from: data) {
-            authorizations = Set(saved)
+            let current = saved.filter { $0.bundleInode != nil && $0.executableInode != nil }
+            authorizations = Set(current)
+            if current.count != saved.count {
+                notice = "应用身份校验已升级，请重新授权清理名单。"
+            }
         } else {
             authorizations = []
         }
@@ -317,8 +397,9 @@ final class SmartCleanupController: ObservableObject {
             try Task.checkCancellation()
             let authorized = applications.filter { isAuthorized($0.application) }
             for observation in authorized {
-                if let reason = observation.protection {
-                    append(observation.application, .skipped, reason)
+                let decision = eligibilityPolicy.decision(for: observation)
+                if !decision.isAllowed {
+                    append(observation.application, .skipped, decision.message ?? "已跳过")
                 } else { planned.append(observation.application) }
             }
             planned.sort { ProcessSnapshot.memoryDescending($0.process, $1.process) }
@@ -379,7 +460,11 @@ final class SmartCleanupController: ObservableObject {
                   observation.application.authorization == app.authorization else {
                 append(app, .skipped, "应用已退出或身份发生变化"); return
             }
-            if let reason = observation.protection { append(app, .skipped, reason); return }
+            let decision = eligibilityPolicy.decision(for: observation)
+            if !decision.isAllowed {
+                append(app, .skipped, decision.message ?? "已跳过")
+                return
+            }
 
             // The intent is a durable prerequisite for sending the quit
             // request, mirroring the manual process-action audit gate.
@@ -388,7 +473,7 @@ final class SmartCleanupController: ObservableObject {
                 operationID: operationID,
                 phase: .intent,
                 outcome: .completed,
-                detail: "智能清理：用户已授权，准备请求正常退出"
+                detail: "智能清理[\(eligibilityPolicy.policyID)]：用户已授权，准备请求正常退出"
             ) else {
                 append(app, .skipped, "无法记录清理意图，未发送退出请求")
                 notice = "清理审计不可用，已阻止本次退出请求。"
