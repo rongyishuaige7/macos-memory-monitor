@@ -1289,11 +1289,36 @@ public struct ProcessActionPolicy: Sendable, Equatable {
     private static func isProtected(process: ProcessSnapshot) -> Bool {
         let name = process.name.lowercased()
         let executable = normalizedPath(process.executablePath ?? "").lowercased()
+        let bundleID = process.bundleIdentifier?.lowercased()
+        if let bundleID, protectedBundleIdentifiers.contains(bundleID) {
+            return true
+        }
         if protectedNames.contains(name) {
             return true
         }
         return protectedPathPrefixes.contains { executable.hasPrefix($0) }
     }
+
+    /// Bundle identifiers are the stable identity for shell and security
+    /// agents. Name-only checks are kept as a fallback for processes whose
+    /// bundle metadata is unavailable, but they are deliberately not the
+    /// primary protection mechanism.
+    private static let protectedBundleIdentifiers: Set<String> = [
+        "com.apple.finder",
+        "com.apple.dock",
+        "com.apple.systemuiserver",
+        "com.apple.controlcenter",
+        "com.apple.notificationcenterui",
+        "com.apple.windowserver",
+        "com.apple.loginwindow",
+        "com.apple.runningboardd",
+        "com.apple.tccd",
+        "com.apple.securityd",
+        "com.apple.cfprefsd",
+        "com.apple.securityagent",
+        "com.apple.systemsettings",
+        "com.apple.systempreferences"
+    ]
 
     private static let protectedNames: Set<String> = [
         "kernel_task",
@@ -1302,7 +1327,15 @@ public struct ProcessActionPolicy: Sendable, Equatable {
         "controlcenter",
         "runningboardd",
         "loginwindow",
-        "memory-monitor-app"
+        "memory-monitor-app",
+        "finder",
+        "dock",
+        "systemuiserver",
+        "notificationcenter",
+        "securityagent",
+        "tccd",
+        "securityd",
+        "cfprefsd"
     ]
 
     private static let protectedPathPrefixes = [

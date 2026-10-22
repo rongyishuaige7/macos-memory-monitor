@@ -776,6 +776,18 @@ final class MemoryMonitorCoreTests: XCTestCase {
             footprint: 100,
             executablePath: "/usr/libexec/helper"
         )
+        let protectedBundle = makeProcess(
+            pid: 705,
+            name: "worker",
+            footprint: 100,
+            bundleIdentifier: "com.apple.finder"
+        )
+        let protectedShellName = makeProcess(
+            pid: 706,
+            name: "Finder",
+            footprint: 100,
+            bundleIdentifier: nil
+        )
         let policy = ProcessActionPolicy(currentUserID: 501, monitorPID: 999)
 
         XCTAssertEqual(
@@ -792,6 +804,14 @@ final class MemoryMonitorCoreTests: XCTestCase {
         )
         XCTAssertEqual(
             policy.validate(expected: protectedPath, current: protectedPath).reason,
+            .protectedProcess
+        )
+        XCTAssertEqual(
+            policy.validate(expected: protectedBundle, current: protectedBundle).reason,
+            .protectedProcess
+        )
+        XCTAssertEqual(
+            policy.validate(expected: protectedShellName, current: protectedShellName).reason,
             .protectedProcess
         )
     }
