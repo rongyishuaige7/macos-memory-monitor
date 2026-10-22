@@ -4457,6 +4457,7 @@ final class MemoryMonitorCoreTests: XCTestCase {
         )
 
         try FileManager.default.removeItem(at: url)
+        try FileManager.default.removeItem(at: URL(fileURLWithPath: url.path + ".segments"))
         let resetNow = future.addingTimeInterval(-600)
         let resetStore = HistoryStore(fileURL: url, retentionInterval: 300)
         let records = try await resetStore.append(
@@ -4858,6 +4859,13 @@ final class MemoryMonitorCoreTests: XCTestCase {
             XCTAssertEqual(error, .invalidData)
         }
         XCTAssertEqual(try Data(contentsOf: url), Data("broken index".utf8))
+        try FileManager.default.removeItem(at: url)
+        do {
+            _ = try await HistoryStore(fileURL: url).load(now: next)
+            XCTFail("A missing index cannot discard immutable history")
+        } catch let error as HistoryStoreError {
+            XCTAssertEqual(error, .readFailed)
+        }
         try originalIndex.write(to: url, options: .atomic)
     }
 

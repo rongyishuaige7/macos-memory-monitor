@@ -5783,6 +5783,11 @@ public actor HistoryStore {
         let fileManager = FileManager.default
         let hasSnapshot = fileManager.fileExists(atPath: fileURL.path)
         let hasJournal = fileManager.fileExists(atPath: journalURL.path)
+        // An orphaned segmented store cannot be reconstructed from a journal
+        // containing only recent increments. Preserve it for explicit repair.
+        if !hasSnapshot, fileManager.fileExists(atPath: segmentsURL.path) {
+            throw HistoryStoreError.readFailed
+        }
         var snapshotRecords: [MemoryHistoryRecord] = []
         var snapshotData = Data()
         var snapshotError: HistoryStoreError?
