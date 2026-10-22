@@ -768,6 +768,47 @@ final class ProcessActionControllerTests: XCTestCase {
         await controller.shutdown()
     }
 
+    func testManualActionHoldsSharedGateAndBlocksSmartCleanup() async throws {
+        let process = makeProcess(pid: 4201, name: "worker")
+        let runtime = FakeProcessActionRuntime()
+        runtime.setSamples([process], for: process.identity.pid)
+        let paths = makeActionPaths()
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+
+        let actions = ProcessActionController(
+            currentUserID: process.userID,
+            monitorPID: 9999,
+            runtime: runtime,
+            auditStore: ProcessActionAuditStore(fileURL: paths.file),
+            gracefulTimeout: 5,
+            forceVerificationTimeout: 0.5
+        )
+
+        let suite = "cleanup-gate-" + UUID().uuidString
+        addTeardownBlock { UserDefaults.standard.removePersistentDomain(forName: suite) }
+        let defaults = UserDefaults(suiteName: suite)!
+        let cleanupRuntime = FakeCleanupRuntime()
+        let app = cleanupApp(1)
+        cleanupRuntime.observations = [observation(app)]
+        let cleanup = SmartCleanupController(
+            runtime: cleanupRuntime,
+            defaults: defaults,
+            operationGate: actions.operationGate
+        )
+        cleanup.setAuthorized(app, true)
+
+        actions.requestGracefulExit(for: process)
+        XCTAssertEqual(actions.operationGate.owner, .manualAction)
+
+        cleanup.start()
+        XCTAssertFalse(cleanup.isBusy, "Smart Cleanup must not start while a manual action holds the gate")
+        XCTAssertTrue(cleanupRuntime.requests.isEmpty)
+
+        actions.cancel(for: process.identity)
+        XCTAssertNil(actions.operationGate.owner)
+        await actions.shutdown()
+    }
+
     private func makeActionPaths() -> (file: URL, directory: URL) {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("MemoryMonitorActionController-" + UUID().uuidString, isDirectory: true)

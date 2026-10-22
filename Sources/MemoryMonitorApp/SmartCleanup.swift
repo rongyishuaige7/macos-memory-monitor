@@ -4,7 +4,7 @@ import MemoryMonitorCore
 
 @MainActor
 final class MonitorOperationGate: ObservableObject {
-    enum Owner { case cleanup, memoryTest }
+    enum Owner { case cleanup, memoryTest, manualAction }
     @Published private(set) var owner: Owner?
 
     func acquire(_ owner: Owner) -> Bool {

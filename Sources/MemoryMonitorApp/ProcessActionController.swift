@@ -436,7 +436,10 @@ final class ProcessActionController: ObservableObject {
 
     func requestGracefulExit(for process: ProcessSnapshot) {
         guard !isShuttingDown, !isBusy else { return }
-        guard operationGate.owner == nil else {
+        // Hold the shared gate for the whole manual operation. Checking
+        // `owner == nil` without acquiring left a window where Smart Cleanup
+        // could start after this check but before the action became busy.
+        guard operationGate.acquire(.manualAction) else {
             state = .denied(process.identity, "请等待智能清理或内存测试结束。")
             return
         }
@@ -446,6 +449,7 @@ final class ProcessActionController: ObservableObject {
         guard validation.allowed else {
             targetProcess = process
             state = .denied(process.identity, validation.message)
+            operationGate.release(.manualAction)
             launchAudit(
                 action: .gracefulExit,
                 outcome: .denied,
@@ -472,7 +476,9 @@ final class ProcessActionController: ObservableObject {
 
     func requestForceTerminate(for process: ProcessSnapshot) {
         guard !isShuttingDown else { return }
-        guard operationGate.owner == nil else { return }
+        // Force termination is a continuation of the same manual operation.
+        // The graceful request acquired the gate; it must still be ours.
+        guard operationGate.owner == .manualAction else { return }
         guard canForceTerminate(for: process.identity),
               let expected = targetProcess,
               expected.identity == process.identity else {
@@ -484,6 +490,7 @@ final class ProcessActionController: ObservableObject {
                 // Keep the actionable timeout visible for its original target.
             } else {
                 state = .denied(process.identity, message)
+                operationGate.release(.manualAction)
             }
             launchAudit(
                 action: .forceTerminate,
@@ -500,6 +507,7 @@ final class ProcessActionController: ObservableObject {
         let preflight = policy.validate(expected: expected, current: process)
         guard preflight.allowed else {
             state = .denied(process.identity, preflight.message)
+            operationGate.release(.manualAction)
             launchAudit(
                 action: .forceTerminate,
                 outcome: .denied,
@@ -534,6 +542,7 @@ final class ProcessActionController: ObservableObject {
         let cancellationMessage = cancellationMessage(for: state)
         cancelCurrentTask()
         state = .cancelled(identity, cancellationMessage)
+        operationGate.release(.manualAction)
         if let previousTarget {
             launchAudit(
                 action: action,
@@ -592,6 +601,7 @@ final class ProcessActionController: ObservableObject {
                 expected.identity,
                 "无法记录用户确认意图，未发送优雅退出请求。"
             )
+            operationGate.release(.manualAction)
             return
         }
 
@@ -749,6 +759,7 @@ final class ProcessActionController: ObservableObject {
                 expected.identity,
                 "无法记录用户确认意图，未发送强制结束请求。"
             )
+            operationGate.release(.manualAction)
             return
         }
 
@@ -973,6 +984,14 @@ final class ProcessActionController: ObservableObject {
         // Publish the terminal state before disk I/O so a slow or unavailable
         // audit store cannot leave the UI looking busy after the action ended.
         state = newState
+        // A timeout is actionable: the user may still confirm force
+        // termination for this same process. Keep the gate until that second
+        // decision, cancellation, shutdown, or background reconciliation.
+        if case .timedOut = newState {
+            // Keep the manual gate held.
+        } else {
+            operationGate.release(.manualAction)
+        }
         _ = await appendAudit(
             action: action,
             outcome: outcome,
@@ -998,6 +1017,7 @@ final class ProcessActionController: ObservableObject {
             state = .cancelled(identity, interruptedMessage)
         }
         cancelCurrentTask()
+        operationGate.release(.manualAction)
 
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
