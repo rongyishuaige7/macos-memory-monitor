@@ -6,11 +6,11 @@
 - 物理内存基线：16 GiB
 - 首版形态：菜单栏常驻 + 点击弹出详细面板
 - 首版范围（历史基线）：只监视、分析和给出建议，不执行进程退出或强制结束
-- 当前 App bundle：v1.4.1（build 141）；独立桌面窗口 + 菜单栏快捷面板
+- 当前 App bundle：v1.4.2（build 142）；独立桌面窗口 + 菜单栏快捷面板
 - 当前本地 App bundle 使用 Apple Development 签名；Developer ID、notarization 和沙盒策略尚未启用
 - 文档状态：设计基线，可作为后续实现的验收依据
 
-## 当前桌面版（v1.4.1）
+## 当前桌面版（v1.4.2）
 
 主窗口提供内存概览、进程管理、释放内存、24 小时历史、压力测试和设置。
 菜单栏保留快速查看及页面入口；设置和进程详情归主窗口管理，避免菜单栏
@@ -49,8 +49,8 @@ UI fixture 模式禁用智能清理执行，避免演示数据触发真实应用
 [1.2.0 界面优化](docs/visual-refinement-v1.2.0.md)、
 [1.2.1 应用标识](docs/brand-identity-v1.2.1.md)、
 [1.3.0 智能清理](docs/smart-cleanup-v1.3.0.md) 和
-[1.3.1 统计图优化](docs/history-chart-v1.3.1.md)。v1.4.0 稳定化与 1.4.1
-安全补丁的范围、
+[1.3.1 统计图优化](docs/history-chart-v1.3.1.md)。v1.4.0 稳定化、1.4.1
+安全补丁与 1.4.2 检修补丁的范围、
 风险、分阶段验收和剩余限制见
 [stabilization-v1.4.0.md](docs/stabilization-v1.4.0.md)。以下章节保留
 早期设计与历次实现背景，当前界面以上述文档为准。
@@ -511,7 +511,7 @@ open "$HOME/Library/Application Support/MemoryMonitor/dist/MemoryMonitor.app"
 
 原生桌面回归使用 `./scripts/verify-native-tests.sh [新的绝对日志目录]`，需要当前用户的登录桌面，会显示测试窗口并仅退出专用 fixture 应用。四个套件分别运行，覆盖窗口、动效生命周期及 AppKit 正常退出/拒绝退出；失败保留日志并返回非零，不修改登录项或 TCC。`verify-release.sh` 会先运行逻辑测试，再调用此入口；托管 CI 继续只运行非 GUI 测试。
 
-构建脚本默认从 [`Resources/Info.plist`](Resources/Info.plist) 读取 `1.4.1 / 141`，也支持以下环境变量覆盖：`CONFIGURATION=debug|release`、`APP_VERSION`、`BUILD_NUMBER`、`CODE_SIGN_IDENTITY` 和 `SKIP_SIGNING=1`。默认签名身份为本地 ad-hoc（`-`）。发布基线和验收要求见 [`docs/release-readiness-v1.0.3.md`](docs/release-readiness-v1.0.3.md)。
+构建脚本默认从 [`Resources/Info.plist`](Resources/Info.plist) 读取 `1.4.2 / 142`，也支持以下环境变量覆盖：`CONFIGURATION=debug|release`、`APP_VERSION`、`BUILD_NUMBER`、`CODE_SIGN_IDENTITY` 和 `SKIP_SIGNING=1`。默认签名身份为本地 ad-hoc（`-`）。发布基线和验收要求见 [`docs/release-readiness-v1.0.3.md`](docs/release-readiness-v1.0.3.md)。
 
 ### Phase 2 completed
 

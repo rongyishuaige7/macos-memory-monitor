@@ -336,3 +336,6 @@ patch release 部署到登录项注册路径；1.4.0 保留在
 `sfltool dumpbtm` 复核登录项仍为 enabled/allowed/notified，Generation 13。
 CI run `39717572166` 通过，产物为 1.4.1 (141)，macOS 15.7.9，进程
 273/501（54.49%），CPU available、GPU unavailable。
+1.4.2 检修补丁已部署：`Info.plist` 为 1.4.2 (142)，1.4.1 bundle 与
+历史/审计文件备份在 `backup-1.4.2-release/`；登录项路径和 Generation 13
+保持不变。真实历史仍为 v1，首次写入/修剪时才进入 v2 分段格式。

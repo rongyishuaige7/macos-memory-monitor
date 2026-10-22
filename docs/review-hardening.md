@@ -138,3 +138,17 @@
 - 托管 CI 未运行桌面原生测试；该部分由上述本机独立原生门禁验证。报告保留
   登录项注册、audit-token 信号验证未运行及系统权限未更改的限制。
 - 后续仅记录此证据的文档提交不改变被验证代码，也不触发当前路径过滤的 CI。
+
+## Deployment 1.4.2
+
+- 源码 HEAD `4b1faee`；`Resources/Info.plist` 提升到 **1.4.2 (142)**。
+- 部署前备份：
+  - 1.4.1 bundle：`~/Library/Application Support/MemoryMonitor/backup-1.4.2-release/MemoryMonitor-1.4.1.app`
+  - 历史/审计文件：同目录 `user-data/`，包含 `history.json`、`.clock`、`.journal`、`.lock`、`actions.jsonl` 及 clock/lock；备份时源数据尚无 v2 分段，仍按分段目录/ sidecar 形态保留恢复位置。
+- 已部署到登录项注册路径：
+  `~/Library/Application Support/MemoryMonitor/releases/1.3.1-final/MemoryMonitor.app`
+- `codesign --verify --deep --strict` 通过；fixture 启动烟测成功；`open -Ra` 返回 0。
+- `sfltool dumpbtm` 复核：登录项仍为 `enabled, allowed, notified`，URL 不变，Generation 13。
+- 验证：全量 335 项中 334 通过；唯一失败为 `CleanupMotionTests` 的跨套件 AppKit 状态问题，四个原生套件隔离运行 7/7 通过；Release 严格并发构建通过。
+- 真实用户历史尚未写入新 v2 格式；首次真实写入/修剪时才迁移。旧版本不能直接读取 v2 历史，回滚需同时恢复 `history.json`、`.segments` 和 sidecar。
+- 未做 Developer ID/notarization、真实注销/登录验证；Smart Cleanup 仍保留 AppKit 正常退出语义。
