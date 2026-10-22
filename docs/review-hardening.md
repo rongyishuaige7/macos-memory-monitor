@@ -151,4 +151,5 @@
 - `sfltool dumpbtm` 复核：登录项仍为 `enabled, allowed, notified`，URL 不变，Generation 13。
 - 验证：全量 335 项中 334 通过；唯一失败为 `CleanupMotionTests` 的跨套件 AppKit 状态问题，四个原生套件隔离运行 7/7 通过；Release 严格并发构建通过。
 - 真实用户历史尚未写入新 v2 格式；首次真实写入/修剪时才迁移。旧版本不能直接读取 v2 历史，回滚需同时恢复 `history.json`、`.segments` 和 sidecar。
+- 1.4.2 版本提交后 CI [run 39775765559](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/39775765559) 通过；产物为 1.4.2 (142)，macOS 15.7.9 arm64，253/472 进程（原始 53.60%，219 个明确权限拒绝，可读覆盖 100%），CPU 可用、GPU 不可用。
 - 未做 Developer ID/notarization、真实注销/登录验证；Smart Cleanup 仍保留 AppKit 正常退出语义。

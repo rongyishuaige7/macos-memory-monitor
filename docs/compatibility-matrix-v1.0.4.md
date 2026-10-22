@@ -25,6 +25,7 @@
 | 2026-10-21 | GitHub 托管 CI，[run 39598034930](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/39598034930) | 1.3.1 (131) | `837e462`, clean | 15.7.9 | arm64 | estimated 且可用 | 可用 | 不可用 | 283/525，53.90%，estimated 且可用 | 未执行 / 未执行 / 未执行 |
 | 2026-10-21 | GitHub 托管 CI，[run 39599217590](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/39599217590) | 1.4.0 (140) | `9262fea`, clean | 15.7.9 | arm64 | estimated 且可用 | 可用 | 不可用 | 262/490，53.47%，estimated 且可用 | 未执行 / 未执行 / 未执行 |
 | 2026-10-21 | GitHub 托管 CI，[run 39717572166](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/39717572166) | 1.4.1 (141) | `ba1a7dc`, clean | 15.7.9 | arm64 | estimated 且可用 | 可用 | 不可用 | 273/501，54.49%，estimated 且可用 | 未执行 / 未执行 / 未执行 |
+| 2026-10-22 | GitHub 托管 CI，[run 39775765559](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/39775765559) | 1.4.2 (142) | `bbcbaba`, clean | 15.7.9 | arm64 | estimated 且可用 | 可用 | 不可用 | 253/472，原始 53.60%，219 个明确权限拒绝，可读覆盖 100% | 未执行 / 未执行 / 未执行 |
 
 ## 当前主机证据
 
