@@ -790,6 +790,93 @@ final class ProcessActionControllerTests: XCTestCase {
         await controller.shutdown()
     }
 
+    func testAuditQueueLimitBlocksNewManualActions() async throws {
+        let first = makeProcess(pid: 4301, name: "first")
+        let second = makeProcess(pid: 4302, name: "second")
+        let paths = makeActionPaths()
+        try FileManager.default.createDirectory(at: paths.file, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let runtime = FakeProcessActionRuntime()
+        runtime.setSamples([first], for: first.identity.pid)
+        let controller = ProcessActionController(
+            currentUserID: first.userID,
+            monitorPID: 9999,
+            runtime: runtime,
+            auditStore: ProcessActionAuditStore(fileURL: paths.file),
+            gracefulTimeout: 1,
+            maximumPendingAuditEvents: 1
+        )
+
+        controller.requestGracefulExit(for: first)
+        await waitUntil { !controller.isBusy }
+        XCTAssertEqual(controller.pendingAuditCount, 1)
+        XCTAssertTrue(controller.auditQueueIsFull)
+
+        controller.requestGracefulExit(for: second)
+        guard case .denied(let identity, let message) = controller.state else {
+            return XCTFail("expected queue-full denial, got \(controller.state)")
+        }
+        XCTAssertEqual(identity, second.identity)
+        XCTAssertTrue(message.contains("审计待写队列已满"))
+        XCTAssertEqual(controller.pendingAuditCount, 1)
+        await controller.shutdown()
+    }
+
+    func testActiveAuditOperationIDsClearAfterTerminal() async throws {
+        let process = makeProcess(pid: 4303, name: "worker")
+        let runtime = FakeProcessActionRuntime()
+        runtime.setSamples([process], for: process.identity.pid)
+        let paths = makeActionPaths()
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let controller = ProcessActionController(
+            currentUserID: process.userID,
+            monitorPID: 9999,
+            runtime: runtime,
+            auditStore: ProcessActionAuditStore(fileURL: paths.file),
+            gracefulTimeout: 1
+        )
+
+        controller.requestGracefulExit(for: process)
+        XCTAssertEqual(controller.activeAuditOperationIDs.count, 1)
+        controller.cancel(for: process.identity)
+        XCTAssertTrue(controller.activeAuditOperationIDs.isEmpty)
+        await controller.shutdown()
+    }
+
+    func testExternalAuditTracksActiveOperationUntilTerminal() async throws {
+        let paths = makeActionPaths()
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let controller = ProcessActionController(
+            auditStore: ProcessActionAuditStore(fileURL: paths.file)
+        )
+        let intent = ProcessActionAuditEvent(
+            id: "external-intent",
+            operationID: "external-op",
+            action: .gracefulExit,
+            phase: .intent,
+            outcome: .completed,
+            processLabel: "worker",
+            detail: "intent"
+        )
+        let terminal = ProcessActionAuditEvent(
+            id: "external-terminal",
+            operationID: "external-op",
+            action: .gracefulExit,
+            phase: .terminal,
+            outcome: .completed,
+            processLabel: "worker",
+            detail: "terminal"
+        )
+
+        let intentRecorded = await controller.recordExternalAudit(intent)
+        XCTAssertTrue(intentRecorded)
+        XCTAssertTrue(controller.activeAuditOperationIDs.contains("external-op"))
+        let terminalRecorded = await controller.recordExternalAudit(terminal)
+        XCTAssertTrue(terminalRecorded)
+        XCTAssertFalse(controller.activeAuditOperationIDs.contains("external-op"))
+        await controller.shutdown()
+    }
+
     func testManualActionHoldsSharedGateAndBlocksSmartCleanup() async throws {
         let process = makeProcess(pid: 4201, name: "worker")
         let runtime = FakeProcessActionRuntime()

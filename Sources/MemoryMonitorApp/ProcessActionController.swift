@@ -278,6 +278,7 @@ final class ProcessActionController: ObservableObject {
     @Published private(set) var state: ProcessActionState = .idle
     @Published private(set) var recentEvents: [ProcessActionAuditEvent] = []
     @Published private(set) var auditError: String?
+    @Published private(set) var pendingAuditCount = 0
     let operationGate = MonitorOperationGate()
 
     private let policy: ProcessActionPolicy
@@ -285,8 +286,10 @@ final class ProcessActionController: ObservableObject {
     private let auditStore: ProcessActionAuditStore
     private let gracefulTimeout: TimeInterval
     private let forceVerificationTimeout: TimeInterval
+    private let maximumPendingAuditEvents: Int
     private let pollInterval: Duration = .milliseconds(250)
     private let timeoutReconciliationInterval: Duration = .seconds(1)
+    private let maximumAuditRetryDelay: TimeInterval = 60
 
     private var targetProcess: ProcessSnapshot?
     /// Stable identifier shared by the intent, signal-sent, and terminal
@@ -307,6 +310,9 @@ final class ProcessActionController: ObservableObject {
     /// Events are created once and retained with their original IDs when a
     /// write fails. Replaying the same event is idempotent in the audit store.
     private var pendingAuditEvents: [String: ProcessActionAuditEvent] = [:]
+    private var activeExternalAuditOperations: Set<String> = []
+    private var auditRetryTask: Task<Void, Never>?
+    private var auditRetryDelay: TimeInterval = 2
 
     init(
         currentUserID: UInt32 = UInt32(getuid()),
@@ -315,7 +321,8 @@ final class ProcessActionController: ObservableObject {
         runtime: (any ProcessActionRuntime)? = nil,
         auditStore: ProcessActionAuditStore = ProcessActionAuditStore(),
         gracefulTimeout: TimeInterval = 8,
-        forceVerificationTimeout: TimeInterval = 2
+        forceVerificationTimeout: TimeInterval = 2,
+        maximumPendingAuditEvents: Int = 64
     ) {
         let policy = ProcessActionPolicy(
             currentUserID: currentUserID,
@@ -338,6 +345,7 @@ final class ProcessActionController: ObservableObject {
             ),
             0.5
         )
+        self.maximumPendingAuditEvents = max(maximumPendingAuditEvents, 1)
 
         initialAuditLoadTask = Task { [weak self] in
             await self?.loadAuditEvents()
@@ -349,6 +357,7 @@ final class ProcessActionController: ObservableObject {
         timeoutReconciliationTask?.cancel()
         initialAuditLoadTask?.cancel()
         shutdownTask?.cancel()
+        auditRetryTask?.cancel()
         for task in backgroundAuditTasks.values {
             task.cancel()
         }
@@ -365,6 +374,18 @@ final class ProcessActionController: ObservableObject {
     }
 
     var gracefulTimeoutForDisplay: TimeInterval { gracefulTimeout }
+
+    var activeAuditOperationIDs: Set<String> {
+        var identifiers = activeExternalAuditOperations
+        if let activeOperationID {
+            identifiers.insert(activeOperationID)
+        }
+        return identifiers
+    }
+
+    var auditQueueIsFull: Bool {
+        pendingAuditCount >= maximumPendingAuditEvents
+    }
 
     private var gracefulTimeoutDisplaySeconds: Int {
         // `maximumGracefulTimeout` keeps this conversion bounded, but retain a
@@ -384,8 +405,15 @@ final class ProcessActionController: ObservableObject {
     func recordExternalAudit(_ event: ProcessActionAuditEvent) async -> Bool {
         // A failed intent must stop execution. Once a request has been sent,
         // preserve its facts for idempotent retry just like manual actions.
+        if event.phase == .terminal {
+            activeExternalAuditOperations.remove(event.operationID)
+        }
         let result = await appendAuditEvent(event, queueOnFailure: event.phase != .intent)
-        return result.appended
+        guard result.appended else { return false }
+        if event.phase != .terminal {
+            activeExternalAuditOperations.insert(event.operationID)
+        }
+        return true
     }
 
     func isBusy(for identity: ProcessIdentity) -> Bool {
@@ -447,6 +475,10 @@ final class ProcessActionController: ObservableObject {
 
     func requestGracefulExit(for process: ProcessSnapshot) {
         guard !isShuttingDown, !isBusy else { return }
+        guard !auditQueueIsFull else {
+            state = .denied(process.identity, "审计待写队列已满，请先恢复记录后再操作。")
+            return
+        }
         // Hold the shared gate for the whole manual operation. Checking
         // `owner == nil` without acquiring left a window where Smart Cleanup
         // could start after this check but before the action became busy.
@@ -501,6 +533,7 @@ final class ProcessActionController: ObservableObject {
                 // Keep the actionable timeout visible for its original target.
             } else {
                 state = .denied(process.identity, message)
+                activeOperationID = nil
                 operationGate.release(.manualAction)
             }
             launchAudit(
@@ -518,6 +551,7 @@ final class ProcessActionController: ObservableObject {
         let preflight = policy.validate(expected: expected, current: process)
         guard preflight.allowed else {
             state = .denied(process.identity, preflight.message)
+            activeOperationID = nil
             operationGate.release(.manualAction)
             launchAudit(
                 action: .forceTerminate,
@@ -553,6 +587,7 @@ final class ProcessActionController: ObservableObject {
         let cancellationMessage = cancellationMessage(for: state)
         cancelCurrentTask()
         state = .cancelled(identity, cancellationMessage)
+        activeOperationID = nil
         operationGate.release(.manualAction)
         if let previousTarget {
             launchAudit(
@@ -999,9 +1034,10 @@ final class ProcessActionController: ObservableObject {
         // termination for this same process. Keep the gate until that second
         // decision, cancellation, shutdown, or background reconciliation.
         if case .timedOut = newState {
-            // Keep the manual gate held.
+            // Keep the manual gate held while force termination is actionable.
         } else {
             operationGate.release(.manualAction)
+            activeOperationID = nil
         }
         _ = await appendAudit(
             action: action,
@@ -1028,6 +1064,7 @@ final class ProcessActionController: ObservableObject {
             state = .cancelled(identity, interruptedMessage)
         }
         cancelCurrentTask()
+        activeOperationID = nil
         operationGate.release(.manualAction)
 
         let task = Task { @MainActor [weak self] in
@@ -1053,7 +1090,9 @@ final class ProcessActionController: ObservableObject {
                 try await self.auditStore.flush(now: now)
                 self.recentEvents = try await self.auditStore.load(now: now)
                 if self.pendingAuditEvents.isEmpty {
+                    self.pendingAuditCount = 0
                     self.auditError = nil
+                    self.cancelAuditRetry()
                 }
             } catch {
                 self.auditError = error.localizedDescription
@@ -1130,7 +1169,13 @@ final class ProcessActionController: ObservableObject {
             _ = try await auditStore.append(event)
         } catch {
             if queueOnFailure {
-                pendingAuditEvents[event.id] = event
+                if event.phase == .intent && pendingAuditEvents.count >= maximumPendingAuditEvents {
+                    auditError = "审计待写队列已满，已暂停新的进程操作。"
+                } else {
+                    pendingAuditEvents[event.id] = event
+                    pendingAuditCount = pendingAuditEvents.count
+                    scheduleAuditRetry()
+                }
             }
             guard generation == auditPublicationGeneration else {
                 return (false, false)
@@ -1150,7 +1195,9 @@ final class ProcessActionController: ObservableObject {
             }
             recentEvents = latestEvents
             if pendingAuditEvents.isEmpty {
+                pendingAuditCount = 0
                 auditError = nil
+                cancelAuditRetry()
             }
         } catch {
             guard generation == auditPublicationGeneration else {
@@ -1176,11 +1223,49 @@ final class ProcessActionController: ObservableObject {
             let result = await appendAuditEvent(event, queueOnFailure: false)
             if result.appended {
                 pendingAuditEvents.removeValue(forKey: event.id)
-                if pendingAuditEvents.isEmpty, result.published {
-                    auditError = nil
+                pendingAuditCount = pendingAuditEvents.count
+                if pendingAuditEvents.isEmpty {
+                    cancelAuditRetry()
+                    if result.published {
+                        auditError = nil
+                    }
                 }
             }
         }
+        if !pendingAuditEvents.isEmpty {
+            scheduleAuditRetry()
+        } else {
+            cancelAuditRetry()
+        }
+    }
+
+    private func scheduleAuditRetry() {
+        guard auditRetryTask == nil, !pendingAuditEvents.isEmpty, !isShuttingDown else {
+            return
+        }
+        let delay = max(auditRetryDelay, 1)
+        auditRetryTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(delay))
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled, !self.isShuttingDown else { return }
+            self.auditRetryTask = nil
+            await self.retryPendingAudits()
+            if !self.pendingAuditEvents.isEmpty {
+                self.auditRetryDelay = min(max(self.auditRetryDelay * 2, 2), self.maximumAuditRetryDelay)
+                self.scheduleAuditRetry()
+            } else {
+                self.auditRetryDelay = 2
+            }
+        }
+    }
+
+    private func cancelAuditRetry() {
+        auditRetryTask?.cancel()
+        auditRetryTask = nil
+        auditRetryDelay = 2
     }
 
     /// The intent is a durable prerequisite for any sampling or signal
