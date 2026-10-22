@@ -134,14 +134,39 @@ public enum StorageBackup {
             throw StorageBackupError.writeFailed
         }
         defer { MaintenanceLock.release(maintenance) }
+        guard !MaintenanceTransaction.exists(root: sourceRoot) else {
+            throw StorageBackupError.unsupportedData
+        }
+        let historyLock: Int32
+        do {
+            historyLock = try StoreFileLock.acquireShared(
+                at: sourceRoot.appendingPathComponent("history.json.lock")
+            )
+        } catch MaintenanceLockError.timedOut {
+            throw StorageBackupError.lockTimedOut
+        } catch {
+            throw StorageBackupError.writeFailed
+        }
+        defer { StoreFileLock.release(historyLock) }
+        let auditLock: Int32
+        do {
+            auditLock = try StoreFileLock.acquireShared(
+                at: sourceRoot.appendingPathComponent("actions.jsonl.lock")
+            )
+        } catch MaintenanceLockError.timedOut {
+            throw StorageBackupError.lockTimedOut
+        } catch {
+            throw StorageBackupError.writeFailed
+        }
+        defer { StoreFileLock.release(auditLock) }
 
         let inspection = HistoryInspector.inspect(root: sourceRoot)
-        let restorable: Bool
+        let historyRestorable: Bool
         switch inspection.status {
         case .healthy, .legacy, .empty:
-            restorable = true
+            historyRestorable = true
         default:
-            restorable = false
+            historyRestorable = false
         }
 
         let fileManager = FileManager.default
@@ -208,10 +233,19 @@ public enum StorageBackup {
             throw StorageBackupError.invalidPath("历史分段目录必须是真实目录")
         }
         if segmentsInfo != nil {
+            files.append(StorageBackupFile(
+                relativePath: "history.json.segments",
+                role: "historySegmentsDirectory",
+                present: true
+            ))
             let segmentFiles = try listRegularFiles(in: segmentsSource)
             for segment in segmentFiles {
                 let relative = "history.json.segments/" + segment.lastPathComponent
                 let destination = dataDirectory.appendingPathComponent(relative)
+                try FileManager.default.createDirectory(
+                    at: destination.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
                 let result = try copyRegularFile(from: segment, to: destination)
                 files.append(StorageBackupFile(
                     relativePath: relative,
@@ -230,9 +264,10 @@ public enum StorageBackup {
             ))
         }
 
+        let hasAudit = files.contains { $0.role == "audit" && $0.present }
         let manifest = StorageBackupManifest(
             createdAt: now,
-            restorable: restorable,
+            restorable: historyRestorable && hasAudit,
             historyStatus: inspection.status,
             format: inspection.format,
             files: files.sorted { $0.relativePath < $1.relativePath },

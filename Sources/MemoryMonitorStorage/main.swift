@@ -36,14 +36,21 @@ private struct BackupOptions {
     let appBundle: URL?
 }
 
+private struct RestoreOptions {
+    let root: URL
+    let backup: URL
+}
+
 private let usage = """
 Usage:
   memory-monitor-storage inspect --root <absolute-storage-directory> --output <absolute-report.json>
   memory-monitor-storage backup  --root <absolute-storage-directory> --output <new-absolute-directory> [--app-bundle <app>]
+  memory-monitor-storage restore --backup <backup-directory> --root <absolute-storage-directory>
+  memory-monitor-storage recover --root <absolute-storage-directory>
 
-The inspect command is read-only. The backup command requires the application
-to be stopped, takes the exclusive maintenance lock, and never overwrites an
-existing output directory.
+The inspect command is read-only. Backup/restore/recover require the
+application to be stopped. Backup never overwrites an existing output
+directory; restore validates every hash before replacing data.
 """
 
 private func parseOptions(_ arguments: [String]) throws -> StorageOptions {
@@ -228,6 +235,99 @@ private func parseBackupOptions(_ arguments: [String]) throws -> BackupOptions {
     return BackupOptions(root: root, output: output, appBundle: appBundle)
 }
 
+private func parseRestoreOptions(_ arguments: [String]) throws -> RestoreOptions {
+    guard arguments.first == "restore" else {
+        throw StorageCommandError.usage(usage)
+    }
+    var rootPath: String?
+    var backupPath: String?
+    var index = 1
+    while index < arguments.count {
+        let argument = arguments[index]
+        switch argument {
+        case "--root", "--backup":
+            guard index + 1 < arguments.count else {
+                throw StorageCommandError.usage("Missing value for \(argument)")
+            }
+            let value = arguments[index + 1]
+            if argument == "--root" {
+                guard rootPath == nil else {
+                    throw StorageCommandError.usage("--root may be specified only once")
+                }
+                rootPath = value
+            } else {
+                guard backupPath == nil else {
+                    throw StorageCommandError.usage("--backup may be specified only once")
+                }
+                backupPath = value
+            }
+            index += 2
+        case "--help", "-h":
+            throw StorageCommandError.usage(usage)
+        default:
+            throw StorageCommandError.usage("Unknown argument: \(argument)\n\n\(usage)")
+        }
+    }
+    guard let rootPath, let backupPath,
+          rootPath.hasPrefix("/"), backupPath.hasPrefix("/") else {
+        throw StorageCommandError.invalidPath("--root and --backup must be absolute")
+    }
+    let root = URL(fileURLWithPath: canonicalPath(rootPath) ?? rootPath, isDirectory: true)
+    let backup = URL(fileURLWithPath: canonicalPath(backupPath) ?? backupPath, isDirectory: true)
+    var rootInfo = stat()
+    guard lstat(root.path, &rootInfo) == 0,
+          (rootInfo.st_mode & S_IFMT) == S_IFDIR,
+          (rootInfo.st_mode & S_IFMT) != S_IFLNK else {
+        throw StorageCommandError.invalidPath("Storage root is not a real directory: \(root.path)")
+    }
+    var backupInfo = stat()
+    guard lstat(backup.path, &backupInfo) == 0,
+          (backupInfo.st_mode & S_IFMT) == S_IFDIR,
+          (backupInfo.st_mode & S_IFMT) != S_IFLNK else {
+        throw StorageCommandError.invalidPath("Backup directory is not a real directory: \(backup.path)")
+    }
+    return RestoreOptions(root: root, backup: backup)
+}
+
+private func parseRecoverOptions(_ arguments: [String]) throws -> URL {
+    guard arguments.first == "recover", arguments.count == 3, arguments[1] == "--root" else {
+        throw StorageCommandError.usage(usage)
+    }
+    let rootPath = arguments[2]
+    guard rootPath.hasPrefix("/") else {
+        throw StorageCommandError.invalidPath("--root must be absolute")
+    }
+    let root = URL(fileURLWithPath: canonicalPath(rootPath) ?? rootPath, isDirectory: true)
+    var info = stat()
+    guard lstat(root.path, &info) == 0,
+          (info.st_mode & S_IFMT) == S_IFDIR,
+          (info.st_mode & S_IFMT) != S_IFLNK else {
+        throw StorageCommandError.invalidPath("Storage root is not a real directory: \(root.path)")
+    }
+    return root
+}
+
+private func applicationIsRunning() -> Bool {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+    process.arguments = ["-x", "memory-monitor-app"]
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = FileHandle.nullDevice
+    do {
+        try process.run()
+        process.waitUntilExit()
+        return process.terminationStatus == 0
+    } catch {
+        return true
+    }
+}
+
+private func requireApplicationStopped() throws {
+    if applicationIsRunning() {
+        throw StorageCommandError.invalidPath("MemoryMonitor is still running; stop it before backup/restore")
+    }
+}
+
 private func canonicalPath(_ path: String) -> String? {
     guard let resolved = realpath(path, nil) else { return nil }
     defer { free(resolved) }
@@ -278,6 +378,7 @@ do {
         exit(acceptable.contains(report.status) ? 0 : 1)
     case "backup":
         let options = try parseBackupOptions(arguments)
+        try requireApplicationStopped()
         let manifest = try StorageBackup.create(
             root: options.root,
             output: options.output,
@@ -288,6 +389,21 @@ do {
         print("History status: \(manifest.historyStatus.rawValue)")
         print("Files: \(manifest.files.filter(\.present).count) present, \(manifest.files.filter { !$0.present }.count) missing")
         exit(0)
+    case "restore":
+        let options = try parseRestoreOptions(arguments)
+        try requireApplicationStopped()
+        let result = try StorageRestore.restore(
+            backupDirectory: options.backup,
+            root: options.root
+        )
+        print("Restore completed: \(result.restoredFiles) files")
+        exit(0)
+    case "recover":
+        let root = try parseRecoverOptions(arguments)
+        try requireApplicationStopped()
+        let result = try StorageRestore.recover(root: root)
+        print("Recovery completed; previous data retained: \(result.previousDataRetained ? "yes" : "no")")
+        exit(0)
     default:
         throw StorageCommandError.usage(usage)
     }
@@ -295,6 +411,9 @@ do {
     fputs("memory-monitor-storage: \(error)\n", stderr)
     exit(error.description == usage ? 0 : 2)
 } catch let error as StorageBackupError {
+    fputs("memory-monitor-storage: \(error)\n", stderr)
+    exit(2)
+} catch let error as StorageRestoreError {
     fputs("memory-monitor-storage: \(error)\n", stderr)
     exit(2)
 } catch {

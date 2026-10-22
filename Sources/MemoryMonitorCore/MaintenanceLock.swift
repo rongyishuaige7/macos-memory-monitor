@@ -112,3 +112,77 @@ public enum MaintenanceTransaction {
         return lstat(url(root: root).path, &info) == 0
     }
 }
+
+/// A file lock used by offline restore after taking the maintenance lock. The
+/// ordering is always maintenance → history lock → audit lock.
+public enum StoreFileLock {
+    public static func acquire(at url: URL, timeoutSeconds: TimeInterval = 2) throws -> Int32 {
+        try acquire(url: url, operation: LOCK_EX, timeoutSeconds: timeoutSeconds)
+    }
+
+    public static func acquireShared(at url: URL, timeoutSeconds: TimeInterval = 2) throws -> Int32 {
+        try acquire(url: url, operation: LOCK_SH, timeoutSeconds: timeoutSeconds)
+    }
+
+    private static func acquire(
+        url: URL,
+        operation: Int32,
+        timeoutSeconds: TimeInterval
+    ) throws -> Int32 {
+        do {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+        } catch {
+            throw MaintenanceLockError.openFailed
+        }
+        let descriptor = url.path.withCString {
+            open($0, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, mode_t(S_IRUSR | S_IWUSR))
+        }
+        guard descriptor >= 0 else {
+            throw MaintenanceLockError.openFailed
+        }
+        var releaseOnFailure = true
+        defer {
+            if releaseOnFailure {
+                _ = flock(descriptor, LOCK_UN)
+                close(descriptor)
+            }
+        }
+        let clock = ContinuousClock()
+        let timeout = timeoutSeconds.isFinite && timeoutSeconds >= 0 ? timeoutSeconds : 0
+        let deadline = clock.now.advanced(by: .seconds(timeout))
+        while true {
+            if withUnsafeCurrentTask(body: { $0?.isCancelled == true }) {
+                throw CancellationError()
+            }
+            if flock(descriptor, operation | LOCK_NB) == 0 {
+                break
+            }
+            if errno == EINTR { continue }
+            guard errno == EWOULDBLOCK || errno == EAGAIN else {
+                throw MaintenanceLockError.lockFailed
+            }
+            guard clock.now < deadline else {
+                throw MaintenanceLockError.timedOut
+            }
+            usleep(10_000)
+        }
+        do {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: url.path
+            )
+        } catch {
+            throw MaintenanceLockError.lockFailed
+        }
+        releaseOnFailure = false
+        return descriptor
+    }
+
+    public static func release(_ descriptor: Int32) {
+        _ = flock(descriptor, LOCK_UN)
+        close(descriptor)
+    }
+}

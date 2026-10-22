@@ -102,6 +102,16 @@ final class StorageBackupTests: XCTestCase {
         }
     }
 
+    func testBackupRefusesUnfinishedRestoreTransaction() throws {
+        try writeV1()
+        try Data("{}".utf8).write(to: MaintenanceTransaction.url(root: root))
+        XCTAssertThrowsError(try StorageBackup.create(root: root, output: output)) { error in
+            guard case StorageBackupError.unsupportedData = error else {
+                return XCTFail("expected unsupportedData, got \(error)")
+            }
+        }
+    }
+
     func testSourceDataIsNotChangedByBackup() throws {
         try writeV1()
         let historyBefore = try Data(contentsOf: root.appendingPathComponent("history.json"))
