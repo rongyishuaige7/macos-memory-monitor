@@ -3,8 +3,8 @@
 计划基线：2026-10-22，源码 `dea920aa3145d1033b6d811c768ce07dc9f19ffe`，
 版本 1.4.2 (142)。状态：S1 已实施并推送（`e876029`），S2 已实施并推送
 （`0dd8acd`、`1c0ccfd`、`cc7b52a`、`18ec7f5`），S3 已实施并推送
-（`14a908a`），S2/S3 审查修复已推送（`4f421b3`、`c8d0a42`），
-S4–S7 仍待实施。
+（`14a908a`），S2/S3 审查修复已推送（`4f421b3`、`c8d0a42`），S4 已实施
+并推送（`f0b2a22`），S5–S7 仍待实施。
 
 建议下一阶段以“可核对来源、可解释中断、可恢复数据”为目标。先完善发布
 证据，再补存储检查和审计中断状态，之后实施备份恢复与扫描预算。登录项
@@ -368,3 +368,24 @@ release gate 的非 GUI/独立 GUI 入口继续使用；单进程 swift test 的
   `/private/tmp/mm-s2-final2`；失败注入证据
   `/private/tmp/mm-s2-stepfail2`；CI job `39801787180` 的 macOS 15 任务
   成功（run 级记录仍显示 in_progress）。
+
+## S4 实施记录（2026-10-22）
+
+状态：已完成并推送；源码 `f0b2a22`。未修改已安装 1.4.2 bundle。
+
+- 新增 `AuditOperationProjection`：按 `operationID` 聚合 intent/signalSent/
+  terminal；进行中的操作显示“进行中”，上次运行留下且无 terminal 的显示
+  “仅确认/已发送，结果未确认”，缺少前序事件显示“记录不完整”。
+  terminal-only 旧记录识别为合法终态，不误标不完整；不补造成功。
+- `ProcessActionController` 暴露 `activeAuditOperationIDs`，手动和 Smart
+  Cleanup 的活跃操作显式参与投影；terminal 后清理，超时保留到强制结束/
+  取消。
+- 待写审计队列上限 64；队列满时只阻止新的手动动作，已发出的 signalSent/
+  terminal 事实不丢弃。失败事件保留原 event ID，按 2→60 秒指数退避重试；
+  Smart Cleanup intent 审计失败继续 fail closed。
+- 审计面板增加“操作/事件”视图、待写入数量和队列满提示；事件视图保留
+  原有筛选/搜索。
+- 验证：`swift test` **365 项全部通过**；Release 严格并发构建通过；
+  CI job `39807793660` 的 macOS 15 任务成功。
+- 未做：S5 完整备份/恢复、S6 扫描预算、S7 升级/回滚；真实登录、公证和
+  部署仍未变更。
