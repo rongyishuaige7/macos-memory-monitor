@@ -335,9 +335,20 @@ struct MemoryMonitorFixtureTool {
         guard auditLineCount == expectedAuditCount else {
             throw FixtureToolError.missingOutput(auditURL.path)
         }
+        let segmentsURL = URL(fileURLWithPath: historyURL.path + ".segments", isDirectory: true)
+        guard !isSymbolicLink(atPath: segmentsURL.path), permissions(atPath: segmentsURL.path) == 0o700 else {
+            throw FixtureToolError.verificationFailed("history segments 目录权限无效")
+        }
+        let segmentFiles = try fileManager.contentsOfDirectory(at: segmentsURL, includingPropertiesForKeys: nil)
+        guard !segmentFiles.isEmpty else { throw FixtureToolError.missingOutput(segmentsURL.path) }
+        for file in segmentFiles {
+            guard !isSymbolicLink(atPath: file.path), permissions(atPath: file.path) == 0o600 else {
+                throw FixtureToolError.missingOutput(file.path)
+            }
+        }
         let expectedNames = Set(expectedPaths.map {
             URL(fileURLWithPath: $0).lastPathComponent
-        })
+        }).union([segmentsURL.lastPathComponent])
         let actualNames = Set(try fileManager.contentsOfDirectory(atPath: root.path))
         guard actualNames == expectedNames else {
             throw FixtureToolError.verificationFailed(

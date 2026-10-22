@@ -1,4 +1,5 @@
 import Darwin
+import CryptoKit
 import Foundation
 import IOKit
 
@@ -43,11 +44,10 @@ private struct PersistedClockAnchor: Codable {
 
 private func persistedJSONEncoder(sortedKeys: Bool = false) -> JSONEncoder {
     let encoder = JSONEncoder()
+    let format = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
     encoder.dateEncodingStrategy = .custom { date, encoder in
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         var container = encoder.singleValueContainer()
-        try container.encode(formatter.string(from: date))
+        try container.encode(format.format(date))
     }
     if sortedKeys {
         encoder.outputFormatting = [.sortedKeys]
@@ -57,17 +57,15 @@ private func persistedJSONEncoder(sortedKeys: Bool = false) -> JSONEncoder {
 
 private func persistedJSONDecoder() -> JSONDecoder {
     let decoder = JSONDecoder()
+    let fractional = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+    let legacy = Date.ISO8601FormatStyle(includingFractionalSeconds: false)
     decoder.dateDecodingStrategy = .custom { decoder in
         let container = try decoder.singleValueContainer()
         let value = try container.decode(String.self)
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: value) {
+        if let date = try? fractional.parse(value) {
             return date
         }
-        let legacy = ISO8601DateFormatter()
-        legacy.formatOptions = [.withInternetDateTime]
-        guard let date = legacy.date(from: value) else {
+        guard let date = try? legacy.parse(value) else {
             throw DecodingError.dataCorruptedError(
                 in: container,
                 debugDescription: "Invalid RFC 3339 timestamp"
@@ -4732,6 +4730,8 @@ public struct HistoryStoreDiagnostics: Sendable, Equatable {
     public let lastCompactionAt: Date?
     public let fullReloadCount: Int
     public let generationFastPathCount: Int
+    public let snapshotWriteBytes: Int
+    public let segmentWriteCount: Int
 
     public init(
         snapshotBytes: Int,
@@ -4741,7 +4741,9 @@ public struct HistoryStoreDiagnostics: Sendable, Equatable {
         compactionCount: Int,
         lastCompactionAt: Date?,
         fullReloadCount: Int = 0,
-        generationFastPathCount: Int = 0
+        generationFastPathCount: Int = 0,
+        snapshotWriteBytes: Int = 0,
+        segmentWriteCount: Int = 0
     ) {
         self.snapshotBytes = max(snapshotBytes, 0)
         self.journalBytes = max(journalBytes, 0)
@@ -4751,6 +4753,8 @@ public struct HistoryStoreDiagnostics: Sendable, Equatable {
         self.lastCompactionAt = lastCompactionAt
         self.fullReloadCount = max(fullReloadCount, 0)
         self.generationFastPathCount = max(generationFastPathCount, 0)
+        self.snapshotWriteBytes = max(snapshotWriteBytes, 0)
+        self.segmentWriteCount = max(segmentWriteCount, 0)
     }
 
     public var totalBytes: Int {
@@ -5156,6 +5160,32 @@ private struct HistoryDurableGeneration: Equatable {
     let snapshot: PersistedFileGeneration?
     let journal: PersistedFileGeneration?
     let clock: PersistedFileGeneration?
+    let segments: [PersistedFileGeneration?]
+}
+
+/// Immutable, content-addressed chunks keep retention pruning bounded to the
+/// two edges of the window. `records` makes older binaries reach their explicit
+/// unsupported-version guard instead of treating the index as corrupt JSON.
+private struct HistorySegmentIndex: Codable {
+    let version: Int
+    let records: [MemoryHistoryRecord]
+    let segments: [HistorySegmentReference]
+}
+
+private struct HistorySegmentReference: Codable, Equatable {
+    let bucket: Int64
+    let digest: String
+    var fileName: String { "segment-\(bucket)-\(digest).json" }
+    var isValid: Bool {
+        digest.count == 64 && digest.utf8.allSatisfy {
+            (48...57).contains($0) || (97...102).contains($0)
+        }
+    }
+}
+
+private struct HistoryCachedSegment {
+    let reference: HistorySegmentReference
+    let records: [MemoryHistoryRecord]
 }
 
 /// Resolves the small set of files written by the monitor.
@@ -5464,6 +5494,13 @@ public actor HistoryStore {
     public nonisolated let journalURL: URL
     private let clockURL: URL
     private let lockURL: URL
+    private let segmentsURL: URL
+    private var segmentCache: [Int64: HistoryCachedSegment] = [:]
+    private var usesSegmentIndex = false
+    private var snapshotWriteBytes = 0
+    private var segmentWriteCount = 0
+    private static let segmentSeconds: TimeInterval = 15 * 60
+    private static let maximumSegmentCount = 16_384
     public let retentionInterval: TimeInterval
     public let maxPersistedWorkloads: Int
     public let compactionRecordThreshold: Int
@@ -5505,6 +5542,7 @@ public actor HistoryStore {
         self.journalURL = URL(fileURLWithPath: fileURL.path + ".journal")
         self.clockURL = URL(fileURLWithPath: fileURL.path + ".clock")
         self.lockURL = URL(fileURLWithPath: fileURL.path + ".lock")
+        self.segmentsURL = URL(fileURLWithPath: fileURL.path + ".segments", isDirectory: true)
         // An unbounded or NaN retention value would silently disable pruning
         // and allow the local file to grow forever. Fall back to the bounded
         // product default for non-finite input.
@@ -5677,20 +5715,27 @@ public actor HistoryStore {
         HistoryDurableGeneration(
             snapshot: try persistedFileGeneration(at: fileURL),
             journal: try persistedFileGeneration(at: journalURL),
-            clock: try persistedFileGeneration(at: clockURL)
+            clock: try persistedFileGeneration(at: clockURL),
+            segments: try segmentCache.values.sorted { $0.reference.bucket < $1.reference.bucket }.map {
+                try persistedFileGeneration(at: segmentsURL.appendingPathComponent($0.reference.fileName))
+            }
         )
     }
 
     public func diagnostics() -> HistoryStoreDiagnostics {
         HistoryStoreDiagnostics(
-            snapshotBytes: byteCount(at: fileURL),
+            snapshotBytes: byteCount(at: fileURL) + segmentCache.values.reduce(0) {
+                $0 + byteCount(at: segmentsURL.appendingPathComponent($1.reference.fileName))
+            },
             journalBytes: byteCount(at: journalURL),
             pendingRecordCount: pendingRecords.count,
             journalRecordCount: journalRecordCount,
             compactionCount: compactionCount,
             lastCompactionAt: lastCompactionAt,
             fullReloadCount: fullReloadCount,
-            generationFastPathCount: generationFastPathCount
+            generationFastPathCount: generationFastPathCount,
+            snapshotWriteBytes: snapshotWriteBytes,
+            segmentWriteCount: segmentWriteCount
         )
     }
 
@@ -5760,10 +5805,19 @@ public actor HistoryStore {
                         throw HistoryStoreError.invalidData
                     }
                     let file = try Self.decoder().decode(MemoryHistoryFile.self, from: snapshotData)
-                    guard file.version == MemoryHistoryFile.currentVersion else {
-                        throw HistoryStoreError.unsupportedVersion(file.version)
+                    if file.version == 2 {
+                        usesSegmentIndex = true
+                        // Do not recover a broken v2 index/segment from a journal
+                        // that may contain only a fraction of the retained view.
+                        snapshotRecords = try loadSegments(from: snapshotData)
+                    } else {
+                        guard file.version == MemoryHistoryFile.currentVersion else {
+                            throw HistoryStoreError.unsupportedVersion(file.version)
+                        }
+                        snapshotRecords = file.records
                     }
-                    snapshotRecords = file.records
+                } catch BoundedFileReadError.tooLarge {
+                    snapshotError = .fileTooLarge
                 } catch let error as HistoryStoreError {
                     snapshotError = error
                 } catch {
@@ -5822,7 +5876,9 @@ public actor HistoryStore {
             // A damaged/unreadable snapshot can be reconstructed from a
             // valid journal. Unsupported versions remain hard failures so a
             // newer file is never overwritten by this binary.
-            guard (snapshotError == .invalidData || snapshotError == .readFailed),
+            guard !usesSegmentIndex,
+                  !fileManager.fileExists(atPath: segmentsURL.path),
+                  (snapshotError == .invalidData || snapshotError == .readFailed),
                   !journalRecords.isEmpty else {
                 throw snapshotError
             }
@@ -5849,7 +5905,8 @@ public actor HistoryStore {
 
         let canonicalSnapshot: Data
         do {
-            canonicalSnapshot = try Self.encoder().encode(MemoryHistoryFile(records: records))
+            canonicalSnapshot = usesSegmentIndex ? Data()
+                : try Self.encoder().encode(MemoryHistoryFile(records: records))
             guard canonicalSnapshot.count <= Self.maximumSnapshotFileBytes else {
                 throw HistoryStoreError.fileTooLarge
             }
@@ -5866,7 +5923,7 @@ public actor HistoryStore {
         let needsCompaction = (!hasSnapshot && !journalRecords.isEmpty)
             || (snapshotError != nil && !journalRecords.isEmpty)
             || (records != coalescedRecords)
-            || (hasSnapshot && !hasJournal && snapshotData != canonicalSnapshot)
+            || (hasSnapshot && !hasJournal && !usesSegmentIndex && snapshotData != canonicalSnapshot)
         if needsCompaction {
             do {
                 try compactSnapshot(at: now)
@@ -5889,6 +5946,9 @@ public actor HistoryStore {
                 throw error
             }
         }
+        if usesSegmentIndex {
+            try removeUnreferencedSegments()
+        }
         return records
     }
 
@@ -5905,6 +5965,8 @@ public actor HistoryStore {
         lastPersistedMinute = nil
         dirty = false
         hasLoaded = false
+        segmentCache = [:]
+        usesSegmentIndex = false
     }
 
     private func reloadFromDiskLocked(now: Date) throws {
@@ -5949,6 +6011,8 @@ public actor HistoryStore {
         let savedHasLoaded = hasLoaded
         let savedLastObservedNow = lastObservedNow
         let savedIgnorePersistedAnchor = ignorePersistedClockAnchorUntilWrite
+        let savedSegmentCache = segmentCache
+        let savedUsesSegmentIndex = usesSegmentIndex
         do {
             try reloadFromDiskLocked(now: now)
         } catch let error as HistoryStoreError {
@@ -5963,6 +6027,8 @@ public actor HistoryStore {
             hasLoaded = savedHasLoaded
             lastObservedNow = savedLastObservedNow
             ignorePersistedClockAnchorUntilWrite = savedIgnorePersistedAnchor
+            segmentCache = savedSegmentCache
+            usesSegmentIndex = savedUsesSegmentIndex
             if error == .readFailed {
                 // A write operation can encounter a target that is
                 // temporarily unreadable (for example, a path replaced by a
@@ -5985,6 +6051,8 @@ public actor HistoryStore {
             hasLoaded = savedHasLoaded
             lastObservedNow = savedLastObservedNow
             ignorePersistedClockAnchorUntilWrite = savedIgnorePersistedAnchor
+            segmentCache = savedSegmentCache
+            usesSegmentIndex = savedUsesSegmentIndex
             throw error
         }
         guard preserveLocal else { return true }
@@ -6497,21 +6565,126 @@ public actor HistoryStore {
         }
     }
 
+    private static func segmentBucket(_ timestamp: Date) -> Int64 {
+        Int64(floor(timestamp.timeIntervalSince1970 / segmentSeconds))
+    }
+
+    private static func segmentDigest(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func loadSegments(from data: Data) throws -> [MemoryHistoryRecord] {
+        var directoryInfo = stat()
+        guard segmentsURL.path.withCString({ lstat($0, &directoryInfo) }) == 0,
+              directoryInfo.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
+            throw HistoryStoreError.invalidData
+        }
+        let decoder = Self.decoder()
+        let index = try decoder.decode(HistorySegmentIndex.self, from: data)
+        guard index.version == 2, index.records.isEmpty,
+              index.segments.count <= Self.maximumSegmentCount,
+              Set(index.segments.map(\.bucket)).count == index.segments.count else {
+            throw HistoryStoreError.invalidData
+        }
+        var loaded: [MemoryHistoryRecord] = []
+        var cache: [Int64: HistoryCachedSegment] = [:]
+        var totalBytes = data.count
+        for reference in index.segments {
+            guard reference.isValid else { throw HistoryStoreError.invalidData }
+            let payload = try readBoundedFile(
+                at: segmentsURL.appendingPathComponent(reference.fileName),
+                maximumBytes: Self.maximumSnapshotFileBytes - totalBytes
+            )
+            totalBytes += payload.count
+            guard isCompleteBoundedJSON(payload), Self.segmentDigest(payload) == reference.digest else {
+                throw HistoryStoreError.invalidData
+            }
+            let file = try decoder.decode(MemoryHistoryFile.self, from: payload)
+            guard file.version == 1, !file.records.isEmpty,
+                  file.records.allSatisfy({ Self.segmentBucket($0.timestamp) == reference.bucket }) else {
+                throw HistoryStoreError.invalidData
+            }
+            loaded += file.records
+            cache[reference.bucket] = HistoryCachedSegment(reference: reference, records: file.records)
+        }
+        segmentCache = cache
+        return loaded
+    }
+
+    private func prepareSegmentsDirectory() throws {
+        var information = stat()
+        let result = segmentsURL.path.withCString { lstat($0, &information) }
+        if result == 0 {
+            guard information.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
+                throw HistoryStoreError.writeFailed
+            }
+        } else if errno != ENOENT {
+            throw HistoryStoreError.writeFailed
+        }
+        try FileManager.default.createDirectory(at: segmentsURL, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: segmentsURL.path)
+    }
+
+    private func writeSegmentedSnapshot() throws {
+        try prepareSegmentsDirectory()
+        let grouped = Dictionary(grouping: records) { Self.segmentBucket($0.timestamp) }
+        guard grouped.count <= Self.maximumSegmentCount else { throw HistoryStoreError.fileTooLarge }
+        let encoder = Self.encoder()
+        var cache: [Int64: HistoryCachedSegment] = [:]
+        var totalBytes = 0
+        for bucket in grouped.keys.sorted() {
+            let rows = grouped[bucket]!
+            if let existing = segmentCache[bucket], existing.records == rows {
+                cache[bucket] = existing
+                totalBytes += byteCount(at: segmentsURL.appendingPathComponent(existing.reference.fileName))
+            } else {
+                let data = try encoder.encode(MemoryHistoryFile(records: rows))
+                guard data.count <= Self.maximumSnapshotFileBytes - totalBytes else {
+                    throw HistoryStoreError.fileTooLarge
+                }
+                let reference = HistorySegmentReference(bucket: bucket, digest: Self.segmentDigest(data))
+                let target = segmentsURL.appendingPathComponent(reference.fileName)
+                // Atomic writes also repair an unreferenced partial file left
+                // by an interrupted attempt, without touching the old index.
+                try data.write(to: target, options: [.atomic])
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
+                snapshotWriteBytes += data.count
+                segmentWriteCount += 1
+                totalBytes += data.count
+                cache[bucket] = HistoryCachedSegment(reference: reference, records: rows)
+            }
+            guard totalBytes <= Self.maximumSnapshotFileBytes else { throw HistoryStoreError.fileTooLarge }
+        }
+        let index = HistorySegmentIndex(version: 2, records: [], segments: cache.values.map(\.reference).sorted {
+            $0.bucket < $1.bucket
+        })
+        let data = try encoder.encode(index)
+        guard data.count <= Self.maximumSnapshotFileBytes - totalBytes else {
+            throw HistoryStoreError.fileTooLarge
+        }
+        try data.write(to: fileURL, options: [.atomic])
+        // The index is now authoritative even if a later permission, journal,
+        // clock or orphan-removal operation fails and needs a retry.
+        segmentCache = cache
+        usesSegmentIndex = true
+        snapshotWriteBytes += data.count
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+    }
+
+    private func removeUnreferencedSegments() throws {
+        let referenced = Set(segmentCache.values.map { $0.reference.fileName })
+        for name in try FileManager.default.contentsOfDirectory(atPath: segmentsURL.path) {
+            guard !referenced.contains(name),
+                  name.range(of: "^segment--?[0-9]+-[0-9a-f]{64}\\.json$", options: .regularExpression) != nil else { continue }
+            try FileManager.default.removeItem(at: segmentsURL.appendingPathComponent(name))
+        }
+    }
+
     private func compactSnapshot(at timestamp: Date) throws {
         let fileManager = FileManager.default
         do {
             try prepareDirectory()
-            let data = try Self.encoder().encode(MemoryHistoryFile(records: records))
-            guard data.count <= Self.maximumSnapshotFileBytes else {
-                throw HistoryStoreError.fileTooLarge
-            }
-            // Keep the canonical snapshot atomic. If the process stops during
-            // this write, the previous snapshot and journal remain readable.
-            try data.write(to: fileURL, options: [.atomic])
-            try fileManager.setAttributes(
-                [.posixPermissions: 0o600],
-                ofItemAtPath: fileURL.path
-            )
+            try writeSegmentedSnapshot()
 
             // Truncating the sidecar only after the snapshot is in place makes
             // a crash recoverable: an old journal merely contributes duplicate
@@ -6524,6 +6697,7 @@ public actor HistoryStore {
                 )
             }
             try persistClockAnchor(at: timestamp)
+            try removeUnreferencedSegments()
         } catch let error as HistoryStoreError {
             throw error
         } catch {

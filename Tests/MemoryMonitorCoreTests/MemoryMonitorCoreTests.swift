@@ -1740,7 +1740,7 @@ final class MemoryMonitorCoreTests: XCTestCase {
             now: fractionalHistoryDate
         )
         try await historyStore.flush(now: fractionalHistoryDate)
-        let historyText = String(decoding: try Data(contentsOf: historyPaths.file), as: UTF8.self)
+        let historyText = try historyPayloadText(at: historyPaths.file)
         XCTAssertTrue(historyText.contains(".123Z"))
         let historyReloaded = try await HistoryStore(fileURL: historyPaths.file)
             .load(now: fractionalHistoryDate)
@@ -4760,6 +4760,151 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertEqual(persisted.map(\.compressedBytes), [2, 3])
     }
 
+    func testHistorySegmentsBoundFullWindowWritesWithoutExtendingRetention() async throws {
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let base = Date(timeIntervalSince1970: 1_699_999_980)
+        let workloads = (0..<40).map {
+            makePersistedWorkload(id: "worker-\($0)", title: "Worker \($0)", footprint: UInt64(100 + $0))
+        }
+        let initial = (0...1440).map { minute in
+            makeHistoryRecord(timestamp: base.addingTimeInterval(Double(minute) * 60),
+                              availableFraction: 0.4, swapUsedBytes: UInt64(minute), workloads: workloads)
+        }
+        let store = HistoryStore(fileURL: url)
+        _ = try await store.merge(records: initial, now: initial.last!.timestamp)
+        let before = await store.diagnostics()
+        for minute in 1441...1443 {
+            let date = base.addingTimeInterval(Double(minute) * 60)
+            _ = try await store.append(makeHistoryRecord(timestamp: date, availableFraction: 0.4,
+                                                         swapUsedBytes: UInt64(minute), workloads: workloads), now: date)
+        }
+        let after = await store.diagnostics()
+        let written = after.snapshotWriteBytes - before.snapshotWriteBytes
+        XCTAssertLessThanOrEqual(after.segmentWriteCount - before.segmentWriteCount, 6)
+        XCTAssertLessThan(written, before.snapshotBytes / 5)
+        print("Synthetic 24h history: snapshot=\(before.snapshotBytes), three-minute snapshot writes=\(written)")
+        let now = base.addingTimeInterval(1443 * 60)
+        let reloaded = try await HistoryStore(fileURL: url).load(now: now)
+        XCTAssertEqual(reloaded.count, 1441)
+        XCTAssertEqual(reloaded.first?.timestamp, base.addingTimeInterval(3 * 60))
+        XCTAssertEqual(reloaded.last?.swapUsedBytes, 1443)
+        // Inspect all physical chunks, including possible unreferenced files:
+        // retention must remove the old payload rather than just hiding it.
+        let segments = URL(fileURLWithPath: url.path + ".segments")
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let value = try decoder.singleValueContainer().decode(String.self)
+            return try Date.ISO8601FormatStyle(includingFractionalSeconds: true).parse(value)
+        }
+        for file in try FileManager.default.contentsOfDirectory(at: segments, includingPropertiesForKeys: nil) {
+            let rows = try decoder.decode(MemoryHistoryFile.self, from: Data(contentsOf: file)).records
+            XCTAssertTrue(rows.allSatisfy { $0.timestamp >= now.addingTimeInterval(-86400) })
+        }
+    }
+
+    func testHistorySegmentsMigrateLegacyAndCleanInterruptedStaging() async throws {
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let base = Date(timeIntervalSince1970: 1_699_999_980)
+        let rows = [makeHistoryRecord(timestamp: base, availableFraction: 0.4, swapUsedBytes: 1)]
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try createFile(at: url, data: encoder.encode(MemoryHistoryFile(records: rows)))
+        let store = HistoryStore(fileURL: url)
+        _ = try await store.load(now: base)
+        try await store.flush(now: base)
+        let oldReader = try JSONDecoder().decode(MemoryHistoryFile.self, from: Data(contentsOf: url))
+        XCTAssertEqual(oldReader.version, 2)
+        XCTAssertTrue(oldReader.records.isEmpty)
+        let segments = URL(fileURLWithPath: url.path + ".segments")
+        let orphan = segments.appendingPathComponent("segment-0-" + String(repeating: "a", count: 64) + ".json")
+        try Data("interrupted staging".utf8).write(to: orphan)
+        let loaded = try await HistoryStore(fileURL: url).load(now: base)
+        XCTAssertEqual(loaded.map(\.swapUsedBytes), [1])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: orphan.path))
+    }
+
+    func testHistorySegmentsDetectMutationAndNeverRebuildPartialViewFromJournal() async throws {
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let base = Date(timeIntervalSince1970: 1_699_999_980)
+        let store = HistoryStore(fileURL: url)
+        _ = try await store.append(makeHistoryRecord(timestamp: base, availableFraction: 0.4, swapUsedBytes: 1), now: base)
+        let next = base.addingTimeInterval(60)
+        _ = try await store.append(makeHistoryRecord(timestamp: next, availableFraction: 0.3, swapUsedBytes: 2), now: next)
+        let segments = URL(fileURLWithPath: url.path + ".segments")
+        let segment = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: segments, includingPropertiesForKeys: nil).first)
+        let original = try Data(contentsOf: segment)
+        try Data("corrupt".utf8).write(to: segment, options: .atomic)
+        for candidate in [store, HistoryStore(fileURL: url)] {
+            do {
+                _ = try await candidate.currentRecords(now: next)
+                XCTFail("A partial journal cannot replace a corrupt segment")
+            } catch let error as HistoryStoreError {
+                XCTAssertEqual(error, .invalidData)
+            }
+        }
+        try original.write(to: segment, options: .atomic)
+        let repaired = try await store.currentRecords(now: next)
+        XCTAssertEqual(repaired.map(\.swapUsedBytes), [1, 2])
+        // A damaged index also must not trigger legacy journal-only recovery.
+        let originalIndex = try Data(contentsOf: url)
+        try Data("broken index".utf8).write(to: url, options: .atomic)
+        do {
+            _ = try await HistoryStore(fileURL: url).load(now: next)
+            XCTFail("Corrupt segmented history must remain repairable")
+        } catch let error as HistoryStoreError {
+            XCTAssertEqual(error, .invalidData)
+        }
+        XCTAssertEqual(try Data(contentsOf: url), Data("broken index".utf8))
+        try originalIndex.write(to: url, options: .atomic)
+    }
+
+    func testHistorySegmentMigrationFailurePreservesLegacyAndCanRetry() async throws {
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let base = Date(timeIntervalSince1970: 1_699_999_980)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let original = try encoder.encode(MemoryHistoryFile(records: [
+            makeHistoryRecord(timestamp: base, availableFraction: 0.4, swapUsedBytes: 1)
+        ]))
+        try createFile(at: url, data: original)
+        let segments = URL(fileURLWithPath: url.path + ".segments")
+        try Data("blocks directory creation".utf8).write(to: segments)
+        let store = HistoryStore(fileURL: url)
+        do {
+            _ = try await store.load(now: base)
+            XCTFail("Expected migration write failure")
+        } catch let error as HistoryStoreError {
+            XCTAssertEqual(error, .writeFailed)
+        }
+        XCTAssertEqual(try Data(contentsOf: url), original)
+        try FileManager.default.removeItem(at: segments)
+        try await store.flush(now: base)
+        let rows = try await HistoryStore(fileURL: url).load(now: base)
+        XCTAssertEqual(rows.map(\.swapUsedBytes), [1])
+    }
+
+    func testHistorySegmentIndexRejectsUnsafeReference() async throws {
+        let (url, directory) = makeTemporaryHistoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let base = Date(timeIntervalSince1970: 1_699_999_980)
+        let store = HistoryStore(fileURL: url)
+        _ = try await store.append(makeHistoryRecord(timestamp: base, availableFraction: 0.4, swapUsedBytes: 1), now: base)
+        let index: [String: Any] = ["version": 2, "records": [], "segments": [["bucket": 0, "digest": "../../outside"]]]
+        let data = try JSONSerialization.data(withJSONObject: index)
+        try data.write(to: url, options: .atomic)
+        do {
+            _ = try await HistoryStore(fileURL: url).load(now: base)
+            XCTFail("Unsafe segment reference must be rejected")
+        } catch let error as HistoryStoreError {
+            XCTAssertEqual(error, .invalidData)
+        }
+        XCTAssertEqual(try Data(contentsOf: url), data)
+    }
+
     func testHistoryStoreRetriesCompactionAfterWriteFailure() async throws {
         let (url, directory) = makeTemporaryHistoryURL()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -5159,7 +5304,7 @@ final class MemoryMonitorCoreTests: XCTestCase {
             now: Date(timeIntervalSince1970: 1_700_000_000)
         )
 
-        let persisted = try String(contentsOf: url, encoding: .utf8)
+        let persisted = try historyPayloadText(at: url)
         XCTAssertTrue(persisted.contains("runtime-node-api"))
         XCTAssertFalse(persisted.contains("/Users/"))
         XCTAssertFalse(persisted.contains("commandLine"))
@@ -5276,6 +5421,19 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertEqual(forwardGroup.attributionReason, .runtimeWorkingDirectory)
         XCTAssertEqual(reverseGroup.attributionReason, .runtimeWorkingDirectory)
         XCTAssertEqual(forwardGroup, reverseGroup)
+    }
+
+    private func historyPayloadText(at url: URL) throws -> String {
+        let index = try Data(contentsOf: url)
+        let object = try JSONSerialization.jsonObject(with: index) as? [String: Any]
+        let references = object?["segments"] as? [[String: Any]] ?? []
+        return try references.reduce(String(decoding: index, as: UTF8.self)) { text, ref in
+            let bucket = try XCTUnwrap(ref["bucket"] as? NSNumber)
+            let digest = try XCTUnwrap(ref["digest"] as? String)
+            let file = URL(fileURLWithPath: url.path + ".segments")
+                .appendingPathComponent("segment-\(bucket)-\(digest).json")
+            return text + String(decoding: try Data(contentsOf: file), as: UTF8.self)
+        }
     }
 
     private func makeGroup(

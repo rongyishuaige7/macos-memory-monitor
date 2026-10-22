@@ -282,6 +282,12 @@ history_lock="$storage_root/history.json.lock"
 audit_file="$storage_root/actions.jsonl"
 audit_clock="$storage_root/actions.jsonl.clock"
 audit_lock="$storage_root/actions.jsonl.lock"
+history_segments="$storage_root/history.json.segments"
+if [[ ! -d "$history_segments" || -L "$history_segments" ||
+      "$(stat -f '%Lp' "$history_segments")" != "700" ]]; then
+	print -u2 "Fixture history segments directory is missing or unsafe"
+	exit 1
+fi
 fixture_paths=(
 	"$history_file"
 	"$history_journal"
@@ -290,6 +296,7 @@ fixture_paths=(
 	"$audit_file"
 	"$audit_clock"
 	"$audit_lock"
+	"$history_segments"/*.json(N)
 )
 for fixture_path in "${fixture_paths[@]}"; do
 	if [[ ! -f "$fixture_path" || -L "$fixture_path" ]]; then
@@ -308,7 +315,7 @@ if [[ "$storage_permissions" != "700" ]]; then
 	exit 1
 fi
 storage_entry_count="$(find "$storage_root" -mindepth 1 -maxdepth 1 -print | awk 'END { print NR }')"
-if [[ "$storage_entry_count" != "7" ]]; then
+if [[ "$storage_entry_count" != "8" ]]; then
 	print -u2 "Fixture storage root contains an unexpected number of files: $storage_entry_count"
 	exit 1
 fi
