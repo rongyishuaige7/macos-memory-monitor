@@ -117,7 +117,9 @@ fi
 
 source_revision="$(build_source_revision "$project_root")"
 checkout_state="$(build_checkout_state "$project_root")"
-build_digest_before="$(build_inputs_digest "$project_root")"
+if ! build_digest_before="$(build_inputs_digest "$project_root")"; then
+	exit 1
+fi
 toolchain_version="$(swift --version 2>/dev/null | head -n 1 | tr -d '\n')"
 [[ -n "$toolchain_version" ]] || toolchain_version="unknown"
 
@@ -149,7 +151,9 @@ if [[ "$binary_description" != *arm64* ]]; then
 	exit 1
 fi
 
-build_digest_after="$(build_inputs_digest "$project_root")"
+if ! build_digest_after="$(build_inputs_digest "$project_root")"; then
+	exit 1
+fi
 if [[ "$build_digest_before" != "$build_digest_after" ]]; then
 	print -u2 "Build inputs changed during the build; refusing to label the artifact"
 	exit 1

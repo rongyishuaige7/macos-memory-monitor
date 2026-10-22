@@ -79,20 +79,28 @@ private func parseOptions(_ arguments: [String]) throws -> StorageOptions {
         throw StorageCommandError.invalidPath("Both paths must be absolute")
     }
 
-    let root = URL(fileURLWithPath: rootPath, isDirectory: true).standardizedFileURL
-    let output = URL(fileURLWithPath: outputPath).standardizedFileURL
+    let inputRoot = URL(fileURLWithPath: rootPath, isDirectory: true).standardizedFileURL
     var rootInfo = stat()
-    guard lstat(root.path, &rootInfo) == 0,
-          (rootInfo.st_mode & S_IFMT) == S_IFDIR else {
-        throw StorageCommandError.invalidPath("Storage root is not a directory: \(root.path)")
+    guard lstat(inputRoot.path, &rootInfo) == 0,
+          (rootInfo.st_mode & S_IFMT) == S_IFDIR,
+          (rootInfo.st_mode & S_IFMT) != S_IFLNK else {
+        throw StorageCommandError.invalidPath("Storage root is not a real directory: \(inputRoot.path)")
     }
+    let root = inputRoot.resolvingSymlinksInPath().standardizedFileURL
+
+    let inputOutput = URL(fileURLWithPath: outputPath).standardizedFileURL
+    let inputParent = inputOutput.deletingLastPathComponent()
     var parentInfo = stat()
-    let parent = output.deletingLastPathComponent()
-    guard lstat(parent.path, &parentInfo) == 0,
+    guard lstat(inputParent.path, &parentInfo) == 0,
           (parentInfo.st_mode & S_IFMT) == S_IFDIR,
           (parentInfo.st_mode & S_IFMT) != S_IFLNK else {
-        throw StorageCommandError.invalidPath("Report parent is missing or is a symlink: \(parent.path)")
+        throw StorageCommandError.invalidPath("Report parent is missing or is a symlink: \(inputParent.path)")
     }
+    // Resolve every ancestor symlink before checking containment. A textual
+    // prefix check would allow a path alias to place the report inside the
+    // inspected root.
+    let parent = inputParent.resolvingSymlinksInPath().standardizedFileURL
+    let output = parent.appendingPathComponent(inputOutput.lastPathComponent).standardizedFileURL
     var outputInfo = stat()
     if lstat(output.path, &outputInfo) == 0 {
         throw StorageCommandError.outputExists(output.path)

@@ -23,6 +23,15 @@ for command_name in git plutil swift awk grep mktemp file codesign env python3 s
 	fi
 done
 
+for test_flag in ${(z)SWIFT_TEST_FLAGS:-}; do
+	case "$test_flag" in
+		--filter|--skip|--only-testing|--filter=*|--skip=*|--only-testing=*)
+			print -u2 "SWIFT_TEST_FLAGS may not select tests: $test_flag"
+			exit 2
+			;;
+	esac
+done
+
 plutil -lint "$info_plist" >/dev/null
 source_version="$(plutil -extract CFBundleShortVersionString raw -o - "$info_plist")"
 source_build="$(plutil -extract CFBundleVersion raw -o - "$info_plist")"
@@ -85,7 +94,7 @@ run_step() {
 	shift
 	local log="$logs_dir/$id.log"
 	print "== $id =="
-	if "$@" >"$log" 2>&1; then
+	if ( set -e; "$@" ) >"$log" 2>&1; then
 		record_step "$id" passed "${log#$evidence_root/}" ""
 	else
 		local code=$?
@@ -108,6 +117,14 @@ step_bundle_replacement() {
 step_non_gui_tests() {
 	swift test "${test_flags[@]}" --package-path "$project_root" \
 		--skip 'CleanupMotionTests|DesktopMotionTests|SmartCleanupNativeTests|DesktopWindowTests'
+}
+
+step_non_gui_scope() {
+	local log="$logs_dir/non_gui_tests.log"
+	local count
+	count="$(grep -Eo 'Executed [0-9]+ tests' "$log" | tail -1 | awk '{print $2}')"
+	[[ "$count" =~ ^[0-9]+$ ]]
+	(( count >= ${MIN_NON_GUI_TESTS:-300} ))
 }
 
 step_native_tests() {
@@ -298,7 +315,12 @@ finalize() {
 		if [[ -z "${verification_digest_after:-}" ]]; then
 			verification_digest_after="$(verification_inputs_digest "$project_root" 2>/dev/null || true)"
 		fi
-		write_manifest "$gate_status" "$exit_code" || true
+		if ! write_manifest "$gate_status" "$exit_code"; then
+			print -u2 "Failed to write evidence manifest; evidence directory was retained"
+			if (( exit_code == 0 )); then
+				exit_code=1
+			fi
+		fi
 		print -u2 "Evidence retained: $evidence_root"
 	fi
 	exit "$exit_code"
@@ -308,6 +330,7 @@ trap finalize EXIT
 run_step git_checks step_git_checks
 run_step bundle_replacement step_bundle_replacement
 run_step non_gui_tests step_non_gui_tests
+run_step non_gui_test_scope step_non_gui_scope
 if [[ "${VERIFY_RELEASE_SKIP_NATIVE_TESTS:-0}" == "1" ]]; then
 	record_step native_tests skipped "" "explicitly skipped by VERIFY_RELEASE_SKIP_NATIVE_TESTS"
 else

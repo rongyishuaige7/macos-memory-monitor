@@ -126,6 +126,23 @@ final class HistoryInspectionTests: XCTestCase {
         XCTAssertEqual(report.status, .missingIndex)
     }
 
+    func testEmptyV2WithoutSegmentsDirectoryIsNotHealthy() throws {
+        try writeV2Index(records: [], references: [])
+        let report = HistoryInspector.inspect(root: root)
+        XCTAssertEqual(report.status, .missingSegment)
+    }
+
+    func testSymlinkedSegmentsDirectoryIsUnsafe() throws {
+        let external = root.deletingLastPathComponent()
+            .appendingPathComponent("HistoryInspectionExternal-" + UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: external, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: external) }
+        try FileManager.default.createSymbolicLink(at: segmentsURL, withDestinationURL: external)
+        try writeV2Index(records: [], references: [])
+        let report = HistoryInspector.inspect(root: root)
+        XCTAssertEqual(report.status, .unsafePath)
+    }
+
     func testMissingSegmentIsClassified() throws {
         let record = record()
         let bucket = Int64(floor(record.timestamp.timeIntervalSince1970 / 900))

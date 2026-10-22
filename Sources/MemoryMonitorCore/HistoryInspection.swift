@@ -177,7 +177,11 @@ public enum HistoryInspector {
         }
 
         let hasIndex = state.fileInfo(historyURL.path) != nil
-        let hasSegmentsDirectory = state.fileInfo(segmentsURL.path) != nil
+        let segmentsInfo = state.fileInfo(segmentsURL.path)
+        let hasSegmentsDirectory = segmentsInfo != nil
+        if let segmentsInfo, segmentsInfo.isSymlink || !segmentsInfo.isDirectory {
+            state.mark(.unsafePath, code: "segmentsDirectory")
+        }
         let journalInfo = state.fileInfo(journalURL.path)
         let journalRecords: [MemoryHistoryRecord]
         if let journalInfo {
@@ -281,14 +285,22 @@ public enum HistoryInspector {
                 state.mark(.invalidData, code: "indexStructure")
                 return ([], [])
             }
+            guard validateSegmentsDirectory(segmentsURL, state: &state) else {
+                return ([], [])
+            }
             state.format = .segmentedV2
             var records: [MemoryHistoryRecord] = []
             var totalSegmentBytes = 0
             var segmentCount = 0
+            var remainingBytes = max(maximumIndexBytes - state.indexBytes, 0)
             for reference in index.segments {
                 guard reference.isValid else {
                     state.mark(.invalidData, code: "segmentReference")
                     continue
+                }
+                guard remainingBytes > 0 else {
+                    state.mark(.fileTooLarge, code: "segmentBudget")
+                    break
                 }
                 let fileURL = segmentsURL.appendingPathComponent(reference.fileName)
                 state.fingerprint(path: fileURL.path)
@@ -304,9 +316,14 @@ public enum HistoryInspector {
                     state.mark(.unsafePath, code: "segmentNotRegular")
                     continue
                 }
-                guard let payload = state.readData(fileURL.path, maximum: maximumSegmentBytes, code: "segmentRead") else {
+                guard let payload = state.readData(
+                    fileURL.path,
+                    maximum: min(maximumSegmentBytes, remainingBytes),
+                    code: "segmentRead"
+                ) else {
                     continue
                 }
+                remainingBytes -= payload.count
                 totalSegmentBytes += payload.count
                 guard sha256(payload) == reference.digest else {
                     state.mark(.checksumMismatch, code: "segmentChecksum")
@@ -340,6 +357,25 @@ public enum HistoryInspector {
 
         state.mark(.invalidData, code: "indexDecode")
         return ([], [])
+    }
+
+    private static func validateSegmentsDirectory(
+        _ segmentsURL: URL,
+        state: inout InspectionState
+    ) -> Bool {
+        guard let info = state.fileInfo(segmentsURL.path) else {
+            state.mark(.missingSegment, code: "segmentsDirectoryMissing")
+            return false
+        }
+        if info.isSymlink {
+            state.mark(.unsafePath, code: "segmentsDirectorySymlink")
+            return false
+        }
+        guard info.isDirectory else {
+            state.mark(.unsafePath, code: "segmentsDirectoryNotDirectory")
+            return false
+        }
+        return true
     }
 
     private static func decodeJournal(_ data: Data) -> (

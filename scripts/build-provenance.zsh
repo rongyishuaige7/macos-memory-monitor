@@ -21,6 +21,8 @@ build_checkout_state() {
 
 build_inputs_digest() {
 	local root="$1"
+	reject_symlink_inputs "$root" Package.swift Sources Resources \
+		scripts/build-app.sh scripts/bundle-replacement.zsh scripts/build-provenance.zsh || return 1
 	local manifest
 	manifest="$(mktemp "${TMPDIR:-/tmp}/memory-monitor-build-inputs.XXXXXX")"
 	trap 'rm -f -- "${manifest:-}"' EXIT
@@ -104,6 +106,7 @@ PY
 # tests, scripts and workflow definitions that determine what was executed.
 verification_inputs_digest() {
 	local root="$1"
+	reject_symlink_inputs "$root" Package.swift Tests scripts .github/workflows Sources Resources || return 1
 	local manifest
 	manifest="$(mktemp "${TMPDIR:-/tmp}/memory-monitor-verification-inputs.XXXXXX")"
 	trap 'rm -f -- "${manifest:-}"' EXIT
@@ -129,4 +132,26 @@ verification_inputs_digest() {
 	shasum -a 256 "$manifest" | awk '{print $1}'
 	rm -f -- "$manifest"
 	trap - EXIT
+}
+
+# SwiftPM follows symlinked source files, while a digest built from `find -type
+# f` would omit them. Refuse these inputs rather than publishing a digest that
+# does not cover what the compiler actually reads.
+reject_symlink_inputs() {
+	local root="$1"
+	shift
+	local candidate symlink_path
+	for candidate in "$@"; do
+		[[ -e "$root/$candidate" || -L "$root/$candidate" ]] || continue
+		if [[ -L "$root/$candidate" ]]; then
+			print -u2 "Refusing symlinked build input: $candidate"
+			return 1
+		fi
+		symlink_path="$(find "$root/$candidate" -type l -print -quit 2>/dev/null)"
+		if [[ -n "$symlink_path" ]]; then
+			print -u2 "Refusing symlinked build input: ${symlink_path#$root/}"
+			return 1
+		fi
+	done
+	return 0
 }
