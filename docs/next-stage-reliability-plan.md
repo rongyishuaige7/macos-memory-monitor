@@ -4,7 +4,8 @@
 版本 1.4.2 (142)。状态：S1 已实施并推送（`e876029`），S2 已实施并推送
 （`0dd8acd`、`1c0ccfd`、`cc7b52a`、`18ec7f5`），S3 已实施并推送
 （`14a908a`），S2/S3 审查修复已推送（`4f421b3`、`c8d0a42`），S4 已实施
-并推送（`f0b2a22`），S5–S7 仍待实施。
+并推送（`f0b2a22`），S5 已实施并推送（`efe799b`、`39c939f`），S6–S7
+仍待实施。
 
 建议下一阶段以“可核对来源、可解释中断、可恢复数据”为目标。先完善发布
 证据，再补存储检查和审计中断状态，之后实施备份恢复与扫描预算。登录项
@@ -389,3 +390,29 @@ release gate 的非 GUI/独立 GUI 入口继续使用；单进程 swift test 的
   CI job `39807793660` 的 macOS 15 任务成功。
 - 未做：S5 完整备份/恢复、S6 扫描预算、S7 升级/回滚；真实登录、公证和
   部署仍未变更。
+
+## S5 实施记录（2026-10-22）
+
+状态：已完成并推送；源码 `efe799b`（maintenance 锁 + 完整备份）与
+`39c939f`（事务恢复 + recover）。未修改已安装 1.4.2 bundle。
+
+- 新增 `.maintenance.lock`：生产 `HistoryStore`/`ProcessActionAuditStore`
+  的每次操作先取共享锁；备份取独占锁并再取 history/audit 共享 store 锁；
+  恢复取独占锁后按 history → audit 顺序取独占 store 锁。锁文件独立于数据
+  文件，不随数据替换。
+- 新增 `memory-monitor-storage backup`：要求应用退出，输出拒绝已存在目录、
+  根内路径和符号链接逃逸；保存 history 索引/全部分段/journal/clock 与
+  audit/clock；清单记录缺失状态、hash、大小、角色、格式、历史状态和可选
+  `BuildProvenance`。损坏集合可原样备份但 `restorable=false`。
+- 新增 `restore`：校验 `backup.json`、每个文件 hash、路径和审计文件；
+  先把当前集合完整复制到事务目录，再把备份复制到 staging；写事务标记后
+  才替换目标数据，v1/v2 集合整体替换，不混合 segments。
+- 新增 `recover`：按事务标记回滚到恢复前集合；`committed` 阶段只清理；
+  未完成标记会阻止 HistoryStore/AuditStore 正常操作并提示先运行 recover。
+- 验证：非 GUI `swift test` **373 项通过**；`StorageBackupTests` 6 项、
+  `StorageRestoreTests` 5 项、`MaintenanceLockTests` 4 项通过；Release
+  严格并发构建通过；CI job `39812051896` 的 macOS 15 任务成功。
+- 真实数据：`/private/tmp/mm-s5-backup-final` 备份成功（legacy，5 个文件）；
+  在临时根恢复并逐文件 hash 一致，未对真实数据执行 restore。
+- 未完成/边界：未做每个 rename 阶段的强退注入矩阵；未做应用内备份/恢复
+  按钮；未对真实数据执行恢复；S6 扫描预算、S7 升级/回滚仍待实施。
