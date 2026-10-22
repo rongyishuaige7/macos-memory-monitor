@@ -455,6 +455,57 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertFalse(snapshot.processDataIsUsable)
     }
 
+    func testPermissionDenialsAllowRefreshButUnknownFailuresStillBlockIt() throws {
+        let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let process = makeProcess(pid: 809, name: "worker", footprint: 100)
+        func result(_ denied: Int) -> ProcessSamplingResult {
+            ProcessSamplingResult(processes: [process], listedProcessCount: 10, sampledProcessCount: 1,
+                                  skippedProcessCount: 9, status: .estimated(at: timestamp),
+                                  readFailures: (1...9).map {
+                ProcessReadDiagnostic(pid: Int32($0), reason: $0 <= denied ? .permissionDenied : .unavailable)
+            })
+        }
+        XCTAssertTrue(result(9).isUsable)
+        XCTAssertTrue(result(8).isUsable)
+        XCTAssertFalse(result(7).isUsable)
+        XCTAssertFalse(result(0).isUsable)
+        let sampled = result(9)
+        let sampler = MonitorSampler(systemSampler: { throw TestSamplingError.unavailable },
+                                     cpuSampler: { throw TestSamplingError.unavailable },
+                                     gpuSampler: { GPUUsageSample(fraction: nil, status: .unavailable()) },
+                                     processSampler: { sampled })
+        let snapshot = sampler.sample(at: timestamp)
+        XCTAssertTrue(snapshot.processDataIsUsable)
+        XCTAssertEqual(snapshot.permissionDeniedProcessCount, 9)
+        XCTAssertNotEqual(snapshot.sampledProcessCount, snapshot.listedProcessCount)
+        let report = CompatibilityProcessReport(snapshot: snapshot)
+        XCTAssertEqual(report.coverageFraction, 0.1)
+        XCTAssertEqual(report.readableCoverageFraction, 1)
+        XCTAssertEqual(report.permissionDeniedCount, 9)
+        var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(report)) as? [String: Any])
+        legacy.removeValue(forKey: "permissionDeniedCount")
+        legacy.removeValue(forKey: "readableCoverageFraction")
+        let legacyReport = try JSONDecoder().decode(CompatibilityProcessReport.self,
+                                                    from: JSONSerialization.data(withJSONObject: legacy))
+        XCTAssertNil(legacyReport.permissionDeniedCount)
+        XCTAssertEqual(ProcessSampler.readFailure(errno: EPERM), .permissionDenied)
+        XCTAssertEqual(ProcessSampler.readFailure(errno: EACCES), .permissionDenied)
+        XCTAssertEqual(ProcessSampler.readFailure(errno: ESRCH), .disappeared)
+        XCTAssertEqual(ProcessSampler.readFailure(errno: 0), .unavailable)
+        XCTAssertEqual(ProcessSampler.readFailure(errno: EIO), .unavailable)
+    }
+
+    func testPermissionDenialDiagnosticsCannotCountSampledOrDuplicatePIDs() {
+        let process = makeProcess(pid: 809, name: "worker", footprint: 100)
+        let result = ProcessSamplingResult(processes: [process], listedProcessCount: 10, sampledProcessCount: 1,
+                                           skippedProcessCount: 9, status: .estimated(at: Date()), readFailures: [
+            .init(pid: 809, reason: .permissionDenied), .init(pid: 1, reason: .permissionDenied),
+            .init(pid: 1, reason: .permissionDenied), .init(pid: -1, reason: .permissionDenied)
+        ])
+        XCTAssertEqual(result.permissionDeniedProcessCount, 1)
+        XCTAssertFalse(result.isUsable)
+    }
+
     func testMonitorSnapshotAcceptsHighCoverageEstimatedProcessResult() {
         let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
         let process = makeProcess(pid: 809, name: "worker", footprint: 100)

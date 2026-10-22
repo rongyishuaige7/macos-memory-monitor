@@ -29,6 +29,11 @@
   每个 encoder/decoder 复用 Sendable 的 ISO8601FormatStyle 值，避免逐日期
   构造非 Sendable formatter。
 - bundle 先在目标卷完成复制和签名验证，再可恢复地替换；失败保留旧产物。
+- 进程扫描保留每个失败的原因和可读取的 BSD 身份元数据；仅明确的权限拒绝
+  可从刷新覆盖率分母排除，消失、身份变化及未知失败仍计入。原始覆盖率及
+  不完整标记继续用于诊断与历史，不因此扩大清理/进程操作权限。
+- 清理 CPU 检查聚合主进程、后代及同 bundle 内 helper；成员变化、CPU 回退
+  或无法确认完整性时不给出空闲判断。最终同步门闩仍检查样本新鲜度。
 
 ## Risks
 
@@ -83,3 +88,10 @@
   后续构建拒绝覆盖，需按 README 核对恢复。
 - 临时输出目录连续两次真实 Release 构建/替换成功，当前与 previous.app
   均通过 `codesign --verify --deep --strict`（ad-hoc）；未替换部署 bundle。
+
+### 4a. 权限与扫描失败分离
+
+- 321 项非 GUI 测试通过，覆盖 errno 分类、重复/已采样 PID 不得计入权限
+  拒绝、可读覆盖率门槛及 MonitorSampler 到兼容性报告的字段传递。
+- 保留原始 coverageFraction，新增可选 permissionDeniedCount 和
+  readableCoverageFraction。旧报告可缺少这些字段；未放宽历史完整性条件。

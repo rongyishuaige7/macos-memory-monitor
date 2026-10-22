@@ -1501,6 +1501,27 @@ public struct ProcessActionAuditEvent: Codable, Sendable, Equatable, Identifiabl
     }
 }
 
+public enum ProcessReadFailure: String, Sendable, Equatable {
+    case permissionDenied, disappeared, unstableIdentity, unavailable
+}
+
+public struct ProcessReadDiagnostic: Sendable, Equatable {
+    public let pid: Int32
+    public let parentPID: Int32?
+    public let userID: UInt32?
+    public let executablePath: String?
+    public let reason: ProcessReadFailure
+
+    public init(pid: Int32, parentPID: Int32? = nil, userID: UInt32? = nil,
+                executablePath: String? = nil, reason: ProcessReadFailure) {
+        self.pid = pid
+        self.parentPID = parentPID
+        self.userID = userID
+        self.executablePath = executablePath
+        self.reason = reason
+    }
+}
+
 public struct ProcessSamplingResult: Sendable, Equatable {
     public static let minimumUsableCoverage = 0.5
 
@@ -1509,13 +1530,19 @@ public struct ProcessSamplingResult: Sendable, Equatable {
     public let sampledProcessCount: Int
     public let skippedProcessCount: Int
     public let status: SampleStatus
+    public let readFailures: [ProcessReadDiagnostic]
+    public var permissionDeniedProcessCount: Int {
+        min(readFailures.filter { $0.reason == .permissionDenied }.count,
+            listedProcessCount - sampledProcessCount)
+    }
 
     public init(
         processes: [ProcessSnapshot],
         listedProcessCount: Int,
         sampledProcessCount: Int,
         skippedProcessCount: Int,
-        status: SampleStatus
+        status: SampleStatus,
+        readFailures: [ProcessReadDiagnostic] = []
     ) {
         self.processes = processes
         let normalizedSampledCount = processes.count
@@ -1527,11 +1554,17 @@ public struct ProcessSamplingResult: Sendable, Equatable {
             normalizedListedCount - normalizedSampledCount
         )
         self.status = status
+        let sampledPIDs = Set(processes.map(\.identity.pid))
+        var seenPIDs = Set<Int32>()
+        self.readFailures = readFailures.filter {
+            $0.pid > 0 && !sampledPIDs.contains($0.pid) && seenPIDs.insert($0.pid).inserted
+        }
     }
 
     /// A scan may return a technically valid but nearly empty list when most
-    /// processes disappear or are denied during enumeration. Such a result is
-    /// diagnostic evidence, not a safe replacement for the last good snapshot.
+    /// processes disappear during enumeration. Only proven OS permission
+    /// denials are excluded from the refresh denominator; missing/unstable
+    /// reads still prevent an unreliable scan replacing the last good rows.
     public var isUsable: Bool {
         guard status.quality.isUsable,
               status.hasFiniteSampleTimestamp,
@@ -1539,7 +1572,7 @@ public struct ProcessSamplingResult: Sendable, Equatable {
               listedProcessCount > 0 else {
             return false
         }
-        let coverage = Double(sampledProcessCount) / Double(listedProcessCount)
+        let coverage = Double(sampledProcessCount) / Double(listedProcessCount - permissionDeniedProcessCount)
         return coverage.isFinite && coverage >= Self.minimumUsableCoverage
     }
 }
@@ -1585,7 +1618,8 @@ public struct ProcessSampler: Sendable {
         at timestamp: Date,
         listedProcessCount: Int,
         sampledProcessCount: Int,
-        hasEstimatedFootprint: Bool
+        hasEstimatedFootprint: Bool,
+        permissionDeniedProcessCount: Int = 0
     ) -> SampleStatus {
         guard timestamp.timeIntervalSince1970.isFinite else {
             return .error("进程采样时间无效")
@@ -1605,7 +1639,9 @@ public struct ProcessSampler: Sendable {
         var reasons = [String]()
         let skipped = listed - sampled
         if skipped > 0 {
-            reasons.append("\(skipped) 个进程在扫描期间退出、身份变化或受权限限制")
+            let denied = min(max(permissionDeniedProcessCount, 0), skipped)
+            if denied > 0 { reasons.append("\(denied) 个进程被系统拒绝读取") }
+            if skipped > denied { reasons.append("\(skipped - denied) 个进程在扫描期间退出、身份变化或读取失败") }
         }
         if hasEstimatedFootprint {
             reasons.append("部分 footprint 使用 RSS 估算")
@@ -1623,7 +1659,8 @@ public struct ProcessSampler: Sendable {
     /// unavailable.
     public func sample(pid: Int32) -> ProcessSnapshot? {
         guard pid > 0 else { return nil }
-        return snapshot(pid: pid_t(pid))
+        var failure = ProcessReadFailure.unavailable
+        return snapshot(pid: pid_t(pid), failure: &failure)
     }
 
     /// Enumerates all visible processes and reports processes that disappear
@@ -1690,8 +1727,15 @@ public struct ProcessSampler: Sendable {
         let candidatePIDs = pids.prefix(returnedCount).filter { pid in
             pid > 0 && seenPIDs.insert(pid).inserted
         }
-        let processes: [ProcessSnapshot] = candidatePIDs.compactMap { pid in
-            snapshot(pid: pid)
+        var processes: [ProcessSnapshot] = []
+        var failures: [ProcessReadDiagnostic] = []
+        for pid in candidatePIDs {
+            var failure = ProcessReadFailure.unavailable
+            if let process = snapshot(pid: pid, failure: &failure) {
+                processes.append(process)
+            } else {
+                failures.append(readDiagnostic(pid: pid, reason: failure))
+            }
         }
         let skippedCount = candidatePIDs.count - processes.count
         let hasEstimatedFootprint = processes.contains { $0.physicalFootprintIsEstimated }
@@ -1699,24 +1743,45 @@ public struct ProcessSampler: Sendable {
             at: timestamp,
             listedProcessCount: candidatePIDs.count,
             sampledProcessCount: processes.count,
-            hasEstimatedFootprint: hasEstimatedFootprint
+            hasEstimatedFootprint: hasEstimatedFootprint,
+            permissionDeniedProcessCount: failures.filter { $0.reason == .permissionDenied }.count
         )
         return ProcessSamplingResult(
             processes: processes,
             listedProcessCount: candidatePIDs.count,
             sampledProcessCount: processes.count,
             skippedProcessCount: skippedCount,
-            status: status
+            status: status,
+            readFailures: failures
         )
     }
 
-    private func snapshot(pid: pid_t) -> ProcessSnapshot? {
+    static func readFailure(errno code: Int32) -> ProcessReadFailure {
+        switch code {
+        case EPERM, EACCES: return .permissionDenied
+        case ESRCH, ENOENT: return .disappeared
+        default: return .unavailable
+        }
+    }
+
+    private func readDiagnostic(pid: pid_t, reason: ProcessReadFailure) -> ProcessReadDiagnostic {
+        var bsd = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.stride)
+        let count = withUnsafeMutablePointer(to: &bsd) { proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, $0, size) }
+        return ProcessReadDiagnostic(pid: pid, parentPID: count >= size ? Int32(bsd.pbi_ppid) : nil,
+                                     userID: count >= size ? bsd.pbi_uid : nil,
+                                     executablePath: executablePath(for: pid), reason: reason)
+    }
+
+    private func snapshot(pid: pid_t, failure: inout ProcessReadFailure) -> ProcessSnapshot? {
         var info = proc_taskallinfo()
         let infoSize = Int32(MemoryLayout<proc_taskallinfo>.stride)
+        errno = 0
         let infoBytes = withUnsafeMutablePointer(to: &info) { pointer in
             proc_pidinfo(pid, PROC_PIDTASKALLINFO, 0, pointer, infoSize)
         }
-        guard infoBytes >= infoSize else { return nil }
+        let infoError = errno
+        guard infoBytes >= infoSize else { failure = Self.readFailure(errno: infoError); return nil }
 
         let bsd = info.pbsd
         let task = info.ptinfo
@@ -1744,17 +1809,19 @@ public struct ProcessSampler: Sendable {
             startTimeSeconds: bsd.pbi_start_tvsec,
             startTimeMicroseconds: bsd.pbi_start_tvusec
         )
-        guard identity.isStructurallyValid else { return nil }
+        guard identity.isStructurallyValid else { failure = .unstableIdentity; return nil }
 
         let path = executablePath(for: pid)
         let application = ApplicationIdentityResolver.resolve(executablePath: path)
 
         var finalBSD = proc_bsdinfo()
         let finalBSDSize = Int32(MemoryLayout<proc_bsdinfo>.stride)
+        errno = 0
         let finalBSDBytes = withUnsafeMutablePointer(to: &finalBSD) { pointer in
             proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, pointer, finalBSDSize)
         }
-        guard finalBSDBytes >= finalBSDSize else { return nil }
+        let finalError = errno
+        guard finalBSDBytes >= finalBSDSize else { failure = Self.readFailure(errno: finalError); return nil }
         let finalIdentity = ProcessIdentity(
             pid: Int32(finalBSD.pbi_pid),
             startTimeSeconds: finalBSD.pbi_start_tvsec,
@@ -1765,6 +1832,7 @@ public struct ProcessSampler: Sendable {
             initial: identity,
             final: finalIdentity
         ) else {
+            failure = .unstableIdentity
             return nil
         }
         return ProcessSnapshot(
@@ -2397,6 +2465,7 @@ public struct MonitorSnapshot: Sendable, Equatable {
     public let processStatus: SampleStatus
     public let listedProcessCount: Int
     public let sampledProcessCount: Int
+    public let permissionDeniedProcessCount: Int
     public let groups: [WorkloadGroupSnapshot]
 
     public var processCount: Int { sampledProcessCount }
@@ -2415,7 +2484,8 @@ public struct MonitorSnapshot: Sendable, Equatable {
         sampledProcessCount: Int,
         groups: [WorkloadGroupSnapshot],
         samplingMode: SamplingMode = .full,
-        diagnostics: SamplingDiagnostics? = nil
+        diagnostics: SamplingDiagnostics? = nil,
+        permissionDeniedProcessCount: Int = 0
     ) {
         self.timestamp = timestamp
         self.samplingMode = samplingMode
@@ -2434,6 +2504,8 @@ public struct MonitorSnapshot: Sendable, Equatable {
         let normalizedSampledCount = processes.count
         self.listedProcessCount = max(normalizedListedCount, normalizedSampledCount)
         self.sampledProcessCount = normalizedSampledCount
+        self.permissionDeniedProcessCount = min(max(permissionDeniedProcessCount, 0),
+                                                 self.listedProcessCount - normalizedSampledCount)
         self.groups = groups
         self.diagnostics = diagnostics ?? SamplingDiagnostics(
             mode: samplingMode,
@@ -2502,7 +2574,7 @@ public struct MonitorSnapshot: Sendable, Equatable {
               listedProcessCount > 0 else {
             return false
         }
-        let coverage = Double(sampledProcessCount) / Double(listedProcessCount)
+        let coverage = Double(sampledProcessCount) / Double(listedProcessCount - permissionDeniedProcessCount)
         return coverage.isFinite && coverage >= ProcessSamplingResult.minimumUsableCoverage
     }
 
@@ -2646,6 +2718,7 @@ public struct MonitorSampler: Sendable {
         var processStatus: SampleStatus
         var listedProcessCount = 0
         var sampledProcessCount = 0
+        var permissionDeniedProcessCount = 0
         if processSamplingPerformed {
             do {
                 let result = try processProvider()
@@ -2653,6 +2726,7 @@ public struct MonitorSampler: Sendable {
                 processStatus = result.status
                 listedProcessCount = result.listedProcessCount
                 sampledProcessCount = processes.count
+                permissionDeniedProcessCount = result.permissionDeniedProcessCount
             } catch {
                 processStatus = Self.errorStatus(for: error)
             }
@@ -2686,7 +2760,8 @@ public struct MonitorSampler: Sendable {
             sampledProcessCount: sampledProcessCount,
             groups: grouper.group(processes),
             samplingMode: mode,
-            diagnostics: diagnostics
+            diagnostics: diagnostics,
+            permissionDeniedProcessCount: permissionDeniedProcessCount
         )
     }
 

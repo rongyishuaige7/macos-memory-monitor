@@ -71,6 +71,8 @@ public struct CompatibilityProcessReport: Codable, Sendable, Equatable {
     public let sampledCount: Int
     public let listedCount: Int
     public let coverageFraction: Double?
+    public let permissionDeniedCount: Int?
+    public let readableCoverageFraction: Double?
 
     public init(snapshot: MonitorSnapshot) {
         let sampledCount = max(snapshot.sampledProcessCount, 0)
@@ -85,6 +87,9 @@ public struct CompatibilityProcessReport: Codable, Sendable, Equatable {
         self.samplingPerformed = snapshot.didSampleProcesses
         self.sampledCount = sampledCount
         self.listedCount = listedCount
+        self.permissionDeniedCount = snapshot.permissionDeniedProcessCount
+        let readableCount = listedCount - snapshot.permissionDeniedProcessCount
+        self.readableCoverageFraction = readableCount > 0 ? Double(sampledCount) / Double(readableCount) : nil
         if listedCount > 0 {
             self.coverageFraction = min(
                 max(Double(sampledCount) / Double(listedCount), 0),
