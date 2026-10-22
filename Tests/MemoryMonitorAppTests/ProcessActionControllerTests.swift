@@ -768,6 +768,28 @@ final class ProcessActionControllerTests: XCTestCase {
         await controller.shutdown()
     }
 
+    func testExternalAuditIsPersistedAndPublished() async throws {
+        let paths = makeActionPaths()
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let controller = ProcessActionController(
+            auditStore: ProcessActionAuditStore(fileURL: paths.file)
+        )
+        let event = ProcessActionAuditEvent(
+            id: "external-audit",
+            operationID: "cleanup-operation",
+            action: .gracefulExit,
+            phase: .intent,
+            outcome: .completed,
+            processLabel: "worker",
+            detail: "智能清理：准备请求正常退出"
+        )
+
+        let recorded = await controller.recordExternalAudit(event)
+        XCTAssertTrue(recorded)
+        XCTAssertTrue(controller.recentEvents.contains { $0.id == "external-audit" })
+        await controller.shutdown()
+    }
+
     func testManualActionHoldsSharedGateAndBlocksSmartCleanup() async throws {
         let process = makeProcess(pid: 4201, name: "worker")
         let runtime = FakeProcessActionRuntime()

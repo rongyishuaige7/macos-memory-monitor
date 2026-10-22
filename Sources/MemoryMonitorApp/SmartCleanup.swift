@@ -576,6 +576,7 @@ final class SmartCleanupController: ObservableObject {
         }
     }
 
+    @discardableResult
     private func recordAudit(
         _ app: CleanupApplication,
         operationID: String,

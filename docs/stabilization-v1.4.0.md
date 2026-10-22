@@ -304,3 +304,31 @@ swift test --disable-sandbox --package-path . --scratch-path /tmp/memory-monitor
   可回滚；未删除用户数据。
 - 保留 `1.3.1-final` 目录名是为了不破坏已批准的登录项 URL；实际内容为
   1.4.0。Developer ID/notarization、TCC 权限变化和登录实测仍未执行。
+
+## Post-1.4.0 safety hardening
+
+在 1.4.0 本地部署之后，又完成了一组不改变产品默认值的智能清理安全加固：
+
+- `MonitorOperationGate` 增加 `.manualAction`：手动进程操作现在真正持有门闩，
+  智能清理不能在其执行期间启动；超时、取消、审计失败、完成和 shutdown
+  都验证了门闩释放。
+- Smart Cleanup 的退出请求纳入 `ProcessActionAuditStore`：先写 intent，再
+  发送 `NSRunningApplication.terminate()`；退出、拒绝、超时、取消和重新
+  启动都有终态审计。审计不可用时 fail closed，不发送请求。
+- `ProcessActionPolicy` 的保护名单升级为 bundle ID + name + path 三层；
+  Finder、Dock、SystemUIServer、TCC、securityd、cfprefsd 等 shell/安全
+  agent 不会被手动操作或智能清理授权退出。
+- Smart Cleanup 增加 `CleanupInventory` 覆盖诊断：缺少 bundle、缺少
+  executable、系统路径、受保护、未完成启动、采样失败都有原因计数；
+  清理名单页展示“另有 N 个应用无法评估”。
+- 批次执行前增加确认对话框：列出最多 8 个将请求退出的应用，明确只发送
+  正常退出请求、不强制结束。
+- 清理阈值抽成 `CleanupEligibilityPolicy`（policy ID + reason code）；
+  授权增加 bundle/executable inode，应用更新或替换后旧授权自动失效；
+  旧版无 inode 的授权会被丢弃并提示重新授权。
+- 新增测试覆盖 external audit、inode 授权、legacy 授权清理、可配置
+  eligibility、inventory 诊断和手动/智能清理互斥。
+
+验证：全量 Swift 测试通过；Release `-strict-concurrency=complete` 构建
+通过。上述改动尚未重新打包/部署，当前已安装的 1.4.0 bundle 不包含这组
+post-release 加固；下一次 patch release 需要重新构建、签名和部署。
