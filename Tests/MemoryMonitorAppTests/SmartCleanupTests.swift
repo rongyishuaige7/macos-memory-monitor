@@ -246,6 +246,31 @@ final class SmartCleanupTests: XCTestCase {
         XCTAssertTrue(controller.notice?.contains("审计") == true)
     }
 
+    func testInventoryDiagnosticsExposeSkippedApplications() async {
+        let suite = "cleanup-inventory-" + UUID().uuidString
+        addTeardownBlock { UserDefaults.standard.removePersistentDomain(forName: suite) }
+        let defaults = UserDefaults(suiteName: suite)!
+        let runtime = FakeCleanupRuntime()
+        let app = cleanupApp(1)
+        runtime.inventoryReportValue = CleanupInventory(
+            observations: [observation(app)],
+            skipped: [
+                CleanupSkip(name: "No Bundle", reason: .missingBundle),
+                CleanupSkip(name: "Protected", reason: .protectedProcess),
+                CleanupSkip(name: "No Path", reason: .missingExecutable)
+            ]
+        )
+        let controller = SmartCleanupController(runtime: runtime, defaults: defaults)
+        controller.refreshApplications()
+        await controller.waitUntilRefreshed()
+
+        XCTAssertEqual(controller.applications.count, 1)
+        XCTAssertEqual(controller.inventory.evaluatedCount, 4)
+        XCTAssertEqual(controller.inventory.skippedCount, 3)
+        XCTAssertTrue(controller.inventory.skippedSummary?.contains("1 个缺少 bundle 标识") == true)
+        XCTAssertTrue(controller.inventory.skippedSummary?.contains("1 个受系统保护") == true)
+    }
+
     func testOperationGateBlocksManualAndMemoryTest() async {
         let (controller, _, _) = setup()
         XCTAssertTrue(controller.operationGate.acquire(.memoryTest))
@@ -287,6 +312,7 @@ final class SmartCleanupTests: XCTestCase {
 final class FakeCleanupRuntime: SmartCleanupRuntime {
     var now: TimeInterval = 1000
     var observations: [CleanupObservation] = []
+    var inventoryReportValue: CleanupInventory?
     var requests: [CleanupApplication] = []
     var quitResult: CleanupQuitRequest = .sent
     var exitResult: CleanupExitState = .exited
@@ -301,6 +327,9 @@ final class FakeCleanupRuntime: SmartCleanupRuntime {
     var failMemoryRead = 0
     var reliefCalls = 0
     func inventory() async -> [CleanupObservation] { observations }
+    func inventoryReport() async -> CleanupInventory {
+        inventoryReportValue ?? CleanupInventory(observations: observations)
+    }
     func inspect(_ app: CleanupApplication) async -> CleanupObservation? {
         if let onInspect { return onInspect(app) }
         return observations.first { $0.id == app.id }

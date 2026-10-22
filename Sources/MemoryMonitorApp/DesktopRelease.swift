@@ -8,6 +8,7 @@ struct DesktopRelease: View {
     @ObservedObject var navigation: DesktopNavigation
     @State private var showsApplications = false
     @State private var showsResults = false
+    @State private var showsCleanupConfirmation = false
     @AppStorage("desktopMotionEnabled") private var motionEnabled = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -38,7 +39,7 @@ struct DesktopRelease: View {
                     } else {
                         Button {
                             if cleanup.authorizations.isEmpty { showsApplications = true }
-                            else { cleanup.start() }
+                            else { showsCleanupConfirmation = true }
                         } label: { Label("智能释放", systemImage: "sparkles") }
                             .buttonStyle(MonitorPrimaryButtonStyle()).disabled(!cleanup.canStart)
                             .accessibilityIdentifier("cleanup-start")
@@ -82,7 +83,32 @@ struct DesktopRelease: View {
                 .frame(maxWidth: 760).frame(maxWidth: .infinity)
         }
         .sheet(isPresented: $showsApplications) { CleanupApplicationsSheet(cleanup: cleanup) }
+        .confirmationDialog(
+            "请求退出这些应用？",
+            isPresented: $showsCleanupConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("请求正常退出", role: .destructive) { cleanup.start() }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text(cleanupConfirmationMessage)
+        }
         .onChange(of: cleanup.phase) { if cleanup.phase == .scanning { showsResults = false } }
+    }
+
+    private var cleanupConfirmationApplications: [CleanupObservation] {
+        Array(cleanup.applications.filter {
+            cleanup.isAuthorized($0.application) && $0.protection == nil
+        }.prefix(8))
+    }
+
+    private var cleanupConfirmationMessage: String {
+        let apps = cleanupConfirmationApplications
+        guard !apps.isEmpty else {
+            return "当前没有同时满足“已授权、不在使用中、CPU 不忙碌”的应用。不会发送退出请求。"
+        }
+        let names = apps.map(\.application.name).joined(separator: "、")
+        return "将请求退出 \(apps.count) 个应用：\(names)。只发送正常退出请求，不会强制结束；应用可能拒绝或询问是否保存。"
     }
 
     private var instrument: some View {
@@ -190,6 +216,12 @@ struct CleanupApplicationsSheet: View {
                     }
                 }
             }.frame(minHeight: 180, maxHeight: .infinity)
+            if let summary = cleanup.inventory.skippedSummary {
+                Text("另有 \(cleanup.inventory.skippedCount) 个应用无法评估：\(summary)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             HStack {
                 Button("全部取消授权") { cleanup.revokeAll() }.buttonStyle(.borderless)
                     .disabled(cleanup.authorizations.isEmpty)

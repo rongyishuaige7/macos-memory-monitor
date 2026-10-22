@@ -47,6 +47,62 @@ struct CleanupObservation: Identifiable, Equatable, Sendable {
     }
 }
 
+enum CleanupSkipReason: String, Sendable, Equatable {
+    case missingBundle
+    case missingExecutable
+    case systemPath
+    case protectedProcess
+    case notReady
+    case samplingFailed
+
+    var displayName: String {
+        switch self {
+        case .missingBundle: return "缺少 bundle 标识"
+        case .missingExecutable: return "缺少可执行路径"
+        case .systemPath: return "系统路径"
+        case .protectedProcess: return "受系统保护"
+        case .notReady: return "尚未完成启动"
+        case .samplingFailed: return "无法读取进程"
+        }
+    }
+}
+
+struct CleanupSkip: Identifiable, Sendable, Equatable {
+    let id: String
+    let name: String
+    let reason: CleanupSkipReason
+
+    init(name: String, reason: CleanupSkipReason) {
+        self.id = reason.rawValue + ":" + name
+        self.name = name
+        self.reason = reason
+    }
+}
+
+struct CleanupInventory: Sendable, Equatable {
+    let observations: [CleanupObservation]
+    let skipped: [CleanupSkip]
+
+    init(observations: [CleanupObservation], skipped: [CleanupSkip] = []) {
+        self.observations = observations
+        self.skipped = skipped
+    }
+
+    var evaluatedCount: Int { observations.count + skipped.count }
+    var eligibleCount: Int { observations.filter { $0.protection == nil }.count }
+    var skippedCount: Int { skipped.count }
+
+    var skippedSummary: String? {
+        guard !skipped.isEmpty else { return nil }
+        var counts: [CleanupSkipReason: Int] = [:]
+        for item in skipped { counts[item.reason, default: 0] += 1 }
+        return counts
+            .sorted { $0.key.rawValue < $1.key.rawValue }
+            .map { "\($0.value) 个\($0.key.displayName)" }
+            .joined(separator: "，")
+    }
+}
+
 enum CleanupQuitRequest { case sent, refused, changed }
 enum CleanupExitState { case running, exited, relaunched }
 enum CleanupPhase: Equatable { case idle, scanning, quitting, waiting, measuring, finished }
@@ -79,6 +135,7 @@ struct CleanupResult: Equatable {
 protocol SmartCleanupRuntime: AnyObject {
     var now: TimeInterval { get }
     func inventory() async -> [CleanupObservation]
+    func inventoryReport() async -> CleanupInventory
     func inspect(_ application: CleanupApplication) async -> CleanupObservation?
     func requestQuit(_ application: CleanupApplication) -> CleanupQuitRequest
     func exitState(_ application: CleanupApplication) -> CleanupExitState
@@ -88,11 +145,19 @@ protocol SmartCleanupRuntime: AnyObject {
 }
 
 @MainActor
+extension SmartCleanupRuntime {
+    func inventoryReport() async -> CleanupInventory {
+        CleanupInventory(observations: await inventory())
+    }
+}
+
+@MainActor
 final class SmartCleanupController: ObservableObject {
     typealias AuditHandler = @MainActor (ProcessActionAuditEvent) async -> Bool
 
     @Published private(set) var phase: CleanupPhase = .idle
     @Published private(set) var applications: [CleanupObservation] = []
+    @Published private(set) var inventory = CleanupInventory(observations: [])
     @Published private(set) var authorizations: Set<CleanupAuthorization>
     @Published private(set) var entries: [CleanupEntry] = []
     @Published private(set) var result: CleanupResult?
@@ -167,10 +232,13 @@ final class SmartCleanupController: ObservableObject {
         isRefreshing = true
         refreshTask = Task { [weak self] in
             guard let self else { return }
-            _ = await runtime.inventory()
+            _ = await runtime.inventoryReport()
             do { try await runtime.sleep(seconds: 0.6) } catch { finishRefresh(); return }
-            let observations = await runtime.inventory()
-            if !Task.isCancelled && !isBusy { applications = observations }
+            let report = await runtime.inventoryReport()
+            if !Task.isCancelled && !isBusy {
+                inventory = report
+                applications = report.observations
+            }
             finishRefresh()
         }
     }
@@ -205,6 +273,7 @@ final class SmartCleanupController: ObservableObject {
     func cancel() { task?.cancel() }
     func skipCurrent() { if phase == .waiting { wantsSkip = true } }
     func waitUntilFinished() async { await task?.value }
+    func waitUntilRefreshed() async { await refreshTask?.value }
 
     func shutdown() async {
         shuttingDown = true
@@ -240,9 +309,11 @@ final class SmartCleanupController: ObservableObject {
         do {
             before = try await memoryWindow()
             guard before != nil else { notice = "内存数据暂不可用，本次未执行清理。"; finishResult(before: nil, after: nil); return }
-            _ = await runtime.inventory()
+            _ = await runtime.inventoryReport()
             try await runtime.sleep(seconds: 0.6)
-            applications = await runtime.inventory()
+            let report = await runtime.inventoryReport()
+            inventory = report
+            applications = report.observations
             try Task.checkCancellation()
             let authorized = applications.filter { isAuthorized($0.application) }
             for observation in authorized {

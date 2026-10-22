@@ -35,17 +35,63 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
     }
 
     func inventory() async -> [CleanupObservation] {
+        await inventoryReport().observations
+    }
+
+    func inventoryReport() async -> CleanupInventory {
         let running = NSWorkspace.shared.runningApplications
         let pids = Set(running.map(\.processIdentifier))
         activity = activity.filter { pids.contains($0.key) }
         handles = handles.filter { !$0.value.isTerminated }
         cpuSamples = cpuSamples.filter { pids.contains($0.key.pid) }
         var observations: [CleanupObservation] = []
-        for app in running where app.activationPolicy == .regular && app.processIdentifier != getpid() {
+        var skipped: [CleanupSkip] = []
+        for app in running {
             guard !Task.isCancelled else { break }
-            if let observation = await observe(app) { observations.append(observation) }
+            if app.processIdentifier == getpid() {
+                skipped.append(CleanupSkip(name: "Memory Monitor", reason: .protectedProcess))
+                continue
+            }
+            guard app.activationPolicy == .regular else { continue }
+            if let reason = inventorySkipReason(app) {
+                skipped.append(CleanupSkip(name: displayName(for: app), reason: reason))
+                continue
+            }
+            if let observation = await observe(app) {
+                observations.append(observation)
+            } else {
+                skipped.append(CleanupSkip(name: displayName(for: app), reason: .samplingFailed))
+            }
         }
-        return observations.sorted { ProcessSnapshot.memoryDescending($0.application.process, $1.application.process) }
+        observations.sort { ProcessSnapshot.memoryDescending($0.application.process, $1.application.process) }
+        skipped.sort {
+            if $0.reason.rawValue != $1.reason.rawValue {
+                return $0.reason.rawValue < $1.reason.rawValue
+            }
+            return $0.name < $1.name
+        }
+        return CleanupInventory(observations: observations, skipped: skipped)
+    }
+
+    private func inventorySkipReason(_ app: NSRunningApplication) -> CleanupSkipReason? {
+        guard let identifier = app.bundleIdentifier, !identifier.isEmpty else {
+            return .missingBundle
+        }
+        guard let bundle = app.bundleURL, bundle.isFileURL,
+              let executable = app.executableURL, executable.isFileURL else {
+            return .missingExecutable
+        }
+        let bundlePath = Self.canonical(bundle.path)
+        let executablePath = Self.canonical(executable.path)
+        if bundlePath.hasPrefix("/System/") { return .systemPath }
+        guard executablePath.hasPrefix(bundlePath + "/") else { return .missingExecutable }
+        guard app.isFinishedLaunching, !app.isTerminated else { return .notReady }
+        return nil
+    }
+
+    private func displayName(for app: NSRunningApplication) -> String {
+        let raw = app.localizedName ?? app.bundleIdentifier ?? "未知应用"
+        return String(raw.prefix(80))
     }
 
     func inspect(_ application: CleanupApplication) async -> CleanupObservation? {
