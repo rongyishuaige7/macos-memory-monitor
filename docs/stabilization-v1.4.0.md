@@ -334,3 +334,5 @@ swift test --disable-sandbox --package-path . --scratch-path /tmp/memory-monitor
 patch release 部署到登录项注册路径；1.4.0 保留在
 `~/Library/Application Support/MemoryMonitor/backup-1.4.1-release/`。
 `sfltool dumpbtm` 复核登录项仍为 enabled/allowed/notified，Generation 13。
+CI run `39717572166` 通过，产物为 1.4.1 (141)，macOS 15.7.9，进程
+273/501（54.49%），CPU available、GPU unavailable。
