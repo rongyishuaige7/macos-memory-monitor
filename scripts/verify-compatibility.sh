@@ -49,6 +49,7 @@ done
 git -C "$project_root" diff --check
 git -C "$project_root" diff --cached --check
 
+zsh "$script_dir/test-bundle-replacement.sh"
 print "Running Swift tests..."
 test_skip_args=()
 if [[ -n "${SWIFT_TEST_SKIP:-}" ]]; then

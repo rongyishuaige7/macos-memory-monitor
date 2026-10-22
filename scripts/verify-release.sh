@@ -25,6 +25,7 @@ fi
 git -C "$project_root" diff --check
 git -C "$project_root" diff --cached --check
 
+zsh "$script_dir/test-bundle-replacement.sh"
 print "Running Swift tests..."
 # Native AppKit tests share activation and window state on the same desktop.
 swift test --package-path "$project_root"

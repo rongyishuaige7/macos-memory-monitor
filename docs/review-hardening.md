@@ -72,3 +72,14 @@
   校验分段目录和文件权限。无真实用户数据迁移。
 - 补充索引丢失保护，阻止只从近期 journal 重建而丢弃旧分段；195 项核心
   测试通过。重置/备份契约同步说明需要一起处理分段及 sidecar。
+
+### 3. 可恢复 bundle 替换
+
+- 输出卷内先复制和验证候选，再保留 previous.app 并重命名安装；普通失败
+  和可捕获中断恢复旧 bundle。成功也保留旧 bundle，未自动清理备份。
+- 8 个隔离用例通过：成功、复制/候选验证/安装/最终验证失败、备份后中断、
+  符号链接拒绝及已有锁保留。Release/兼容性脚本已纳入这些用例。
+- SIGKILL/断电不能触发 shell trap；目录锁和 transaction-path 保留恢复位置，
+  后续构建拒绝覆盖，需按 README 核对恢复。
+- 临时输出目录连续两次真实 Release 构建/替换成功，当前与 previous.app
+  均通过 `codesign --verify --deep --strict`（ad-hoc）；未替换部署 bundle。

@@ -177,24 +177,18 @@ if [[ "$skip_signing" != "1" ]]; then
 	codesign --verify --deep --strict "$staged_app_path"
 fi
 
-# Replace only the generated app path. The parent directory is user-selected,
-# while the bundle itself is the artifact owned by this script. Never remove a
-# symlink here: even though `rm` normally unlinks the link itself, rejecting it
-# avoids a race or a surprising replacement of a user-managed alias.
-if [[ -L "$app_path" ]]; then
-	print -u2 "Refusing to replace a symlink at $app_path"
-	exit 2
-fi
-if [[ -e "$app_path" ]]; then
-	rm -rf -- "$app_path"
-fi
-ditto --norsrc "$staged_app_path" "$app_path"
-xattr -r -d com.apple.FinderInfo "$app_path" 2>/dev/null || true
-xattr -r -d com.apple.ResourceFork "$app_path" 2>/dev/null || true
-
-if [[ "$skip_signing" != "1" ]]; then
-	codesign --verify --deep --strict "$app_path"
-fi
+verify_replacement_bundle() {
+	local bundle="$1"
+	xattr -r -d com.apple.FinderInfo "$bundle" 2>/dev/null || true
+	xattr -r -d com.apple.ResourceFork "$bundle" 2>/dev/null || true
+	[[ -x "$bundle/Contents/MacOS/$binary_name" ]] || return 1
+	plutil -lint "$bundle/Contents/Info.plist" >/dev/null || return 1
+	if [[ "$skip_signing" != "1" ]]; then
+		codesign --verify --deep --strict "$bundle" || return 1
+	fi
+}
+source "$script_dir/bundle-replacement.zsh"
+replace_app_bundle "$staged_app_path" "$app_path"
 
 print "Built $app_path"
 print "Configuration: $configuration"

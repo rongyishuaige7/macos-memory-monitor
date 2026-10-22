@@ -504,6 +504,8 @@ open "$HOME/Library/Application Support/MemoryMonitor/dist/MemoryMonitor.app"
 
 也可以通过 `OUTPUT_DIR` 指定其他本机目录；脚本会拒绝 iCloud Drive 或其他 File Provider 路径，因为这些位置可能在签名后重新写入 `com.apple.FinderInfo`。脚本只生成本地产物，不会自动安装、注册登录启动项或修改系统 LaunchAgents。Developer ID 签名、沙盒策略和登录启动开关留到单独阶段决定。
 
+重复构建会先在输出卷复制并验证候选 bundle，再重命名替换；普通失败或可捕获的中断会恢复旧 bundle。成功后旧 bundle 保留在输出目录的隐藏 `.MemoryMonitor.app.replacement.*/previous.app` 中，路径会打印到日志。并发构建会被目录锁拒绝；若断电或 `SIGKILL` 留下 `.MemoryMonitor.app.replacement-lock`，先按其中 `transaction-path` 核对候选、旧 bundle 与目标，再手动恢复并移除锁。脚本不会清理这些恢复备份。
+
 构建脚本默认从 [`Resources/Info.plist`](Resources/Info.plist) 读取 `1.4.1 / 141`，也支持以下环境变量覆盖：`CONFIGURATION=debug|release`、`APP_VERSION`、`BUILD_NUMBER`、`CODE_SIGN_IDENTITY` 和 `SKIP_SIGNING=1`。默认签名身份为本地 ad-hoc（`-`）。发布基线和验收要求见 [`docs/release-readiness-v1.0.3.md`](docs/release-readiness-v1.0.3.md)。
 
 ### Phase 2 completed
