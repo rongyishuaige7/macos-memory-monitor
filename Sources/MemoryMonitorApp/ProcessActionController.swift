@@ -377,6 +377,15 @@ final class ProcessActionController: ObservableObject {
         policy.validate(expected: process, current: process)
     }
 
+    /// Records an action originating outside the manual controller (currently
+    /// Smart Cleanup) in the same append-only audit stream. The caller must
+    /// treat a `false` result as a hard stop before sending any termination
+    /// request.
+    func recordExternalAudit(_ event: ProcessActionAuditEvent) async -> Bool {
+        let result = await appendAuditEvent(event, queueOnFailure: false)
+        return result.appended
+    }
+
     func isBusy(for identity: ProcessIdentity) -> Bool {
         guard isBusy else { return false }
         return stateIdentity == identity

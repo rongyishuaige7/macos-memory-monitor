@@ -89,6 +89,8 @@ protocol SmartCleanupRuntime: AnyObject {
 
 @MainActor
 final class SmartCleanupController: ObservableObject {
+    typealias AuditHandler = @MainActor (ProcessActionAuditEvent) async -> Bool
+
     @Published private(set) var phase: CleanupPhase = .idle
     @Published private(set) var applications: [CleanupObservation] = []
     @Published private(set) var authorizations: Set<CleanupAuthorization>
@@ -104,6 +106,7 @@ final class SmartCleanupController: ObservableObject {
     private let runtime: any SmartCleanupRuntime
     private let defaults: UserDefaults
     private let manualActionIsBusy: @MainActor () -> Bool
+    private let audit: AuditHandler?
     private let executionEnabled: Bool
     private let approvalKey = "smartCleanup.authorizedApplications.v1"
     private var task: Task<Void, Never>?
@@ -115,11 +118,13 @@ final class SmartCleanupController: ObservableObject {
     init(runtime: (any SmartCleanupRuntime)? = nil, defaults: UserDefaults = .standard,
          operationGate: MonitorOperationGate = MonitorOperationGate(),
          executionEnabled: Bool = true,
-         manualActionIsBusy: @escaping @MainActor () -> Bool = { false }) {
+         manualActionIsBusy: @escaping @MainActor () -> Bool = { false },
+         audit: AuditHandler? = nil) {
         self.runtime = runtime ?? LiveSmartCleanupRuntime()
         self.defaults = defaults
         self.operationGate = operationGate
         self.manualActionIsBusy = manualActionIsBusy
+        self.audit = audit
         self.executionEnabled = executionEnabled
         if executionEnabled, let data = defaults.data(forKey: approvalKey),
            let saved = try? JSONDecoder().decode([CleanupAuthorization].self, from: data) {
@@ -290,6 +295,7 @@ final class SmartCleanupController: ObservableObject {
 
     private func quit(_ app: CleanupApplication) async {
         var requestSent = false
+        let operationID = UUID().uuidString
         do {
             var observation = await runtime.inspect(app)
             if observation?.cpuPercent == nil {
@@ -303,10 +309,51 @@ final class SmartCleanupController: ObservableObject {
                 append(app, .skipped, "应用已退出或身份发生变化"); return
             }
             if let reason = observation.protection { append(app, .skipped, reason); return }
+
+            // The intent is a durable prerequisite for sending the quit
+            // request, mirroring the manual process-action audit gate.
+            guard await recordAudit(
+                app,
+                operationID: operationID,
+                phase: .intent,
+                outcome: .completed,
+                detail: "智能清理：用户已授权，准备请求正常退出"
+            ) else {
+                append(app, .skipped, "无法记录清理意图，未发送退出请求")
+                notice = "清理审计不可用，已阻止本次退出请求。"
+                return
+            }
+
             switch runtime.requestQuit(observation.application) {
-            case .refused: append(app, .refused, "应用未接受退出请求"); return
-            case .changed: append(app, .skipped, "应用状态已变化"); return
-            case .sent: requestSent = true
+            case .refused:
+                append(app, .refused, "应用未接受退出请求")
+                await recordAudit(
+                    app,
+                    operationID: operationID,
+                    phase: .terminal,
+                    outcome: .denied,
+                    detail: "智能清理：应用未接受正常退出请求"
+                )
+                return
+            case .changed:
+                append(app, .skipped, "应用状态已变化")
+                await recordAudit(
+                    app,
+                    operationID: operationID,
+                    phase: .terminal,
+                    outcome: .cancelled,
+                    detail: "智能清理：应用状态在请求前发生变化"
+                )
+                return
+            case .sent:
+                requestSent = true
+                await recordAudit(
+                    app,
+                    operationID: operationID,
+                    phase: .signalSent,
+                    outcome: .completed,
+                    detail: "智能清理：已发送正常退出请求"
+                )
             }
             phase = .waiting
             let deadline = runtime.now + 8
@@ -315,18 +362,86 @@ final class SmartCleanupController: ObservableObject {
                 switch runtime.exitState(app) {
                 case .exited:
                     append(app, .exited, "已正常退出")
+                    await recordAudit(
+                        app,
+                        operationID: operationID,
+                        phase: .terminal,
+                        outcome: .completed,
+                        detail: "智能清理：应用已正常退出"
+                    )
                     completionPulse += 1
                     return
-                case .relaunched: append(app, .relaunched, "应用已重新启动"); return
+                case .relaunched:
+                    append(app, .relaunched, "应用已重新启动")
+                    await recordAudit(
+                        app,
+                        operationID: operationID,
+                        phase: .terminal,
+                        outcome: .failed,
+                        detail: "智能清理：应用已重新启动"
+                    )
+                    return
                 case .running: break
                 }
-                if wantsSkip { append(app, .skipped, "已跳过等待；退出请求已发出"); return }
-                if runtime.now >= deadline { append(app, .timedOut, "尚未退出，可能需要保存确认"); return }
+                if wantsSkip {
+                    append(app, .skipped, "已跳过等待；退出请求已发出")
+                    await recordAudit(
+                        app,
+                        operationID: operationID,
+                        phase: .terminal,
+                        outcome: .cancelled,
+                        detail: "智能清理：已跳过等待，退出请求已发出"
+                    )
+                    return
+                }
+                if runtime.now >= deadline {
+                    append(app, .timedOut, "尚未退出，可能需要保存确认")
+                    await recordAudit(
+                        app,
+                        operationID: operationID,
+                        phase: .terminal,
+                        outcome: .timedOut,
+                        detail: "智能清理：等待正常退出超时"
+                    )
+                    return
+                }
                 try await runtime.sleep(seconds: 0.25)
             }
         } catch {
-            append(app, .cancelled, requestSent ? "已停止等待；退出请求已发出" : "尚未发送退出请求")
+            let detail = requestSent ? "已停止等待；退出请求已发出" : "尚未发送退出请求"
+            append(app, .cancelled, detail)
+            await recordAudit(
+                app,
+                operationID: operationID,
+                phase: .terminal,
+                outcome: .cancelled,
+                detail: "智能清理：" + detail
+            )
         }
+    }
+
+    private func recordAudit(
+        _ app: CleanupApplication,
+        operationID: String,
+        phase: ProcessActionAuditPhase,
+        outcome: ProcessActionOutcome,
+        detail: String
+    ) async -> Bool {
+        guard let audit else { return true }
+        let event = ProcessActionAuditEvent(
+            operationID: operationID,
+            action: .gracefulExit,
+            phase: phase,
+            outcome: outcome,
+            processLabel: app.name,
+            applicationName: app.process.applicationName,
+            detail: detail
+        )
+        let recorded = await audit(event)
+        if !recorded {
+            notice = "清理审计写入失败；本次操作可能无法在审计面板中查看。"
+        }
+        return recorded
     }
 
     private func append(_ app: CleanupApplication, _ outcome: CleanupEntry.Outcome, _ detail: String) {

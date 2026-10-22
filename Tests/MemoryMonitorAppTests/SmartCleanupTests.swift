@@ -198,6 +198,54 @@ final class SmartCleanupTests: XCTestCase {
         XCTAssertFalse(controller.result?.hasMeasuredBenefit == true)
     }
 
+    func testAuditRecordsIntentSignalAndTerminalOutcome() async {
+        let suite = "cleanup-audit-" + UUID().uuidString
+        addTeardownBlock { UserDefaults.standard.removePersistentDomain(forName: suite) }
+        let defaults = UserDefaults(suiteName: suite)!
+        let runtime = FakeCleanupRuntime()
+        let app = cleanupApp(1)
+        runtime.observations = [observation(app)]
+        var events: [ProcessActionAuditEvent] = []
+        let controller = SmartCleanupController(
+            runtime: runtime,
+            defaults: defaults,
+            audit: { event in
+                events.append(event)
+                return true
+            }
+        )
+        controller.setAuthorized(app, true)
+        controller.start()
+        await controller.waitUntilFinished()
+
+        XCTAssertEqual(events.map(\.phase), [.intent, .signalSent, .terminal])
+        XCTAssertEqual(events.map(\.outcome), [.completed, .completed, .completed])
+        XCTAssertEqual(Set(events.map(\.operationID)).count, 1)
+        XCTAssertEqual(controller.entries.first?.outcome, .exited)
+        XCTAssertNil(controller.notice)
+    }
+
+    func testAuditFailureBlocksQuitBeforeSendingRequest() async {
+        let suite = "cleanup-audit-failure-" + UUID().uuidString
+        addTeardownBlock { UserDefaults.standard.removePersistentDomain(forName: suite) }
+        let defaults = UserDefaults(suiteName: suite)!
+        let runtime = FakeCleanupRuntime()
+        let app = cleanupApp(1)
+        runtime.observations = [observation(app)]
+        let controller = SmartCleanupController(
+            runtime: runtime,
+            defaults: defaults,
+            audit: { _ in false }
+        )
+        controller.setAuthorized(app, true)
+        controller.start()
+        await controller.waitUntilFinished()
+
+        XCTAssertTrue(runtime.requests.isEmpty)
+        XCTAssertEqual(controller.entries.first?.outcome, .skipped)
+        XCTAssertTrue(controller.notice?.contains("审计") == true)
+    }
+
     func testOperationGateBlocksManualAndMemoryTest() async {
         let (controller, _, _) = setup()
         XCTAssertTrue(controller.operationGate.acquire(.memoryTest))

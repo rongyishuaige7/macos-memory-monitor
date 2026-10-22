@@ -410,7 +410,11 @@ final class MonitorViewModel: ObservableObject {
         self.processActions = processActions
         smartCleanup = SmartCleanupController(operationGate: processActions.operationGate,
             executionEnabled: cleanupExecutionEnabled,
-            manualActionIsBusy: { [weak processActions] in processActions?.isBusy != false })
+            manualActionIsBusy: { [weak processActions] in processActions?.isBusy != false },
+            audit: { [weak processActions] event in
+                guard let processActions else { return false }
+                return await processActions.recordExternalAudit(event)
+            })
         loginLaunch = LoginLaunchCoordinator(runtime: loginLaunchRuntime)
         self.sampler = sampler
         self.historyStore = historyStore
