@@ -1,7 +1,8 @@
 # 1.4.2 之后的可靠性实施计划
 
 计划基线：2026-10-22，源码 `dea920aa3145d1033b6d811c768ce07dc9f19ffe`，
-版本 1.4.2 (142)。状态：S1 已实施并推送（`e876029`），S2–S7 仍待实施。
+版本 1.4.2 (142)。状态：S1 已实施并推送（`e876029`），S2 已实施并推送
+（`0dd8acd`、`1c0ccfd`、`cc7b52a`、`18ec7f5`），S3–S7 仍待实施。
 
 建议下一阶段以“可核对来源、可解释中断、可恢复数据”为目标。先完善发布
 证据，再补存储检查和审计中断状态，之后实施备份恢复与扫描预算。登录项
@@ -288,3 +289,29 @@ release gate 的非 GUI/独立 GUI 入口继续使用；单进程 swift test 的
   通过，产物为 1.4.2 (142)。
 - 未做：旧 bundle 部署替换、真实登录/公证；S1 的构建来源机制尚未进入已
   安装 bundle。下一步为 S2 门禁证据留存。
+
+## S2 实施记录（2026-10-22）
+
+状态：已完成并推送；源码 `18ec7f5`。未修改已安装 1.4.2 bundle。
+
+- `verify-release.sh` 接受新的绝对证据目录；已有目录/符号链接拒绝覆盖，
+  默认使用唯一临时目录并保留。证据目录 0700，manifest/日志 0600。
+- 每个步骤独立日志：`git_checks`、`bundle_replacement`、`non_gui_tests`、
+  `native_tests`、Debug/Release build、probe、compatibility、build_app、
+  validate_app、desktop_report、verification_inputs_stable。
+- `manifest.json` 记录 status/exitCode、started/finished、源码 revision、
+  checkout state、build inputs digest、verification inputs digest、产物
+  相对路径和每个步骤的 passed/failed/skipped；失败步骤记录退出码。
+- 构建/验证输入摘要前后核对；变化时失败。构建产物 provenance、签名、
+  版本、desktop report 和兼容性报告均在证据目录保留。
+- 原生测试使用独立进程；显式
+  `VERIFY_RELEASE_SKIP_NATIVE_TESTS=1` 时记录为 `skipped`，不冒充 passed。
+  默认仍运行原生门禁；本机当前 AppKit inactive 偶发失败已记录在失败证据中。
+- 成功证据：`/private/tmp/mm-s2-success`（native_tests=skipped；其余 passed）。
+- 失败证据：`/private/tmp/mm-s2-failure`（native_tests 失败；日志和 manifest
+  保留）。已有目录覆盖测试返回 2 且 manifest 不变。
+- 门禁不会自动删除历史证据或恢复备份；只清理 build-app 自己的 staging。
+- CI [run 39786753536](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/39786753536)
+  通过（源码 `18ec7f5`）。
+- 未做：S3 只读历史检查、S4 审计中断聚合、S5 完整备份/恢复、S6 扫描预算、
+  S7 升级/回滚验收。
