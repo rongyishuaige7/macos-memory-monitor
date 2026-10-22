@@ -120,7 +120,7 @@ struct CleanupObservation: Identifiable, Equatable, Sendable {
     }
 }
 
-enum CleanupSkipReason: String, Sendable, Equatable {
+enum CleanupSkipReason: String, Sendable, Equatable, Error {
     case missingBundle
     case missingExecutable
     case systemPath

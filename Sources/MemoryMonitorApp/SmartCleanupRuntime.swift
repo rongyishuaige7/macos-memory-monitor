@@ -57,10 +57,11 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
                 skipped.append(CleanupSkip(name: displayName(for: app), reason: reason))
                 continue
             }
-            if let observation = await observe(app) {
+            switch await observeResult(app) {
+            case .success(let observation):
                 observations.append(observation)
-            } else {
-                skipped.append(CleanupSkip(name: displayName(for: app), reason: .samplingFailed))
+            case .failure(let reason):
+                skipped.append(CleanupSkip(name: displayName(for: app), reason: reason))
             }
         }
         observations.sort { ProcessSnapshot.memoryDescending($0.application.process, $1.application.process) }
@@ -103,13 +104,37 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
     }
 
     private func observe(_ app: NSRunningApplication) async -> CleanupObservation? {
-        guard let key = authorization(app), app.isFinishedLaunching, !app.isTerminated else { return nil }
+        if case .success(let observation) = await observeResult(app) {
+            return observation
+        }
+        return nil
+    }
+
+    private func observeResult(
+        _ app: NSRunningApplication
+    ) async -> Result<CleanupObservation, CleanupSkipReason> {
+        guard let key = authorization(app), app.isFinishedLaunching, !app.isTerminated else {
+            return .failure(CleanupSkipReason.notReady)
+        }
         let pid = app.processIdentifier
         let sampler = sampler
-        guard let process = await Task.detached(priority: .utility, operation: { sampler.sample(pid: pid) }).value,
-              !Task.isCancelled, !app.isTerminated, authorization(app) == key,
-              process.executablePath.map(Self.canonical) == key.executablePath,
-              policy.validate(expected: process, current: process).allowed else { return nil }
+        guard let process = await Task.detached(
+            priority: .utility,
+            operation: { sampler.sample(pid: pid) }
+        ).value else {
+            return .failure(CleanupSkipReason.samplingFailed)
+        }
+        guard !Task.isCancelled, !app.isTerminated, authorization(app) == key,
+              process.executablePath.map(Self.canonical) == key.executablePath else {
+            return .failure(CleanupSkipReason.samplingFailed)
+        }
+        let validation = policy.validate(expected: process, current: process)
+        guard validation.allowed else {
+            let reason: CleanupSkipReason = validation.reason == .protectedProcess
+                ? .protectedProcess
+                : .samplingFailed
+            return .failure(reason)
+        }
         let instant = now
         if cpuSamples.keys.contains(where: { $0.pid == pid && $0 != process.identity }) {
             activity[pid] = instant
@@ -123,9 +148,12 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
         }
         cpuSamples[process.identity] = (instant, process.cpuTimeNanos)
         handles[process.identity] = app
-        return CleanupObservation(application: .init(process: process, authorization: key),
+        return .success(CleanupObservation(
+            application: .init(process: process, authorization: key),
             isFrontmost: app.isActive || NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
-            secondsSinceActivity: instant - (activity[pid] ?? instant), cpuPercent: cpu)
+            secondsSinceActivity: instant - (activity[pid] ?? instant),
+            cpuPercent: cpu
+        ))
     }
 
     func requestQuit(_ application: CleanupApplication) -> CleanupQuitRequest {
