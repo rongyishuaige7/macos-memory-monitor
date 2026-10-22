@@ -94,7 +94,7 @@ run_step() {
 	shift
 	local log="$logs_dir/$id.log"
 	print "== $id =="
-	if ( set -e; "$@" ) >"$log" 2>&1; then
+	if "$@" >"$log" 2>&1; then
 		record_step "$id" passed "${log#$evidence_root/}" ""
 	else
 		local code=$?
@@ -106,57 +106,57 @@ run_step() {
 }
 
 step_git_checks() {
-	git -C "$project_root" diff --check
-	git -C "$project_root" diff --cached --check
+	git -C "$project_root" diff --check || return 1
+	git -C "$project_root" diff --cached --check || return 1
 }
 
 step_bundle_replacement() {
-	zsh "$script_dir/test-bundle-replacement.sh"
+	zsh "$script_dir/test-bundle-replacement.sh" || return 1
 }
 
 step_non_gui_tests() {
 	swift test "${test_flags[@]}" --package-path "$project_root" \
-		--skip 'CleanupMotionTests|DesktopMotionTests|SmartCleanupNativeTests|DesktopWindowTests'
+		--skip 'CleanupMotionTests|DesktopMotionTests|SmartCleanupNativeTests|DesktopWindowTests' || return 1
 }
 
 step_non_gui_scope() {
 	local log="$logs_dir/non_gui_tests.log"
 	local count
-	count="$(grep -Eo 'Executed [0-9]+ tests' "$log" | tail -1 | awk '{print $2}')"
-	[[ "$count" =~ ^[0-9]+$ ]]
-	(( count >= ${MIN_NON_GUI_TESTS:-300} ))
+	count="$(grep -Eo 'Executed [0-9]+ tests' "$log" | tail -1 | awk '{print $2}')" || true
+	[[ "$count" =~ ^[0-9]+$ ]] || return 1
+	(( count >= ${MIN_NON_GUI_TESTS:-300} )) || return 1
 }
 
 step_native_tests() {
-	"$script_dir/verify-native-tests.sh" "$native_logs"
+	"$script_dir/verify-native-tests.sh" "$native_logs" || return 1
 }
 
 step_debug_build() {
 	swift build "${build_flags[@]}" --package-path "$project_root" \
-		--configuration debug -Xswiftc -strict-concurrency=complete
+		--configuration debug -Xswiftc -strict-concurrency=complete || return 1
 }
 
 step_release_build() {
 	swift build "${build_flags[@]}" --package-path "$project_root" \
-		--configuration release -Xswiftc -strict-concurrency=complete
+		--configuration release -Xswiftc -strict-concurrency=complete || return 1
 }
 
 step_probe() {
 	swift run "${build_flags[@]}" --package-path "$project_root" \
-		--configuration release memory-monitor-probe >"$probe_log"
-	grep -q '^Memory Monitor Probe$' "$probe_log"
-	grep -q '^Processes:[[:space:]]' "$probe_log"
+		--configuration release memory-monitor-probe >"$probe_log" || return 1
+	grep -q '^Memory Monitor Probe$' "$probe_log" || return 1
+	grep -q '^Processes:[[:space:]]' "$probe_log" || return 1
 }
 
 step_compatibility() {
-	"$script_dir/collect-compatibility-report.sh" >"$compatibility_report"
-	plutil -convert xml1 -o "$evidence_root/compatibility.plist" -- "$compatibility_report"
+	"$script_dir/collect-compatibility-report.sh" >"$compatibility_report" || return 1
+	plutil -convert xml1 -o "$evidence_root/compatibility.plist" -- "$compatibility_report" || return 1
 	local plist="$evidence_root/compatibility.plist"
 	local schema architecture limitations process_scan
-	schema="$(plutil -extract schemaVersion raw -o - "$plist")"
-	architecture="$(plutil -extract platform.architecture raw -o - "$plist")"
-	limitations="$(plutil -extract limitations raw -o - "$plist")"
-	process_scan="$(plutil -extract sampling.processes.samplingPerformed raw -o - "$plist")"
+	schema="$(plutil -extract schemaVersion raw -o - "$plist")" || return 1
+	architecture="$(plutil -extract platform.architecture raw -o - "$plist")" || return 1
+	limitations="$(plutil -extract limitations raw -o - "$plist")" || return 1
+	process_scan="$(plutil -extract sampling.processes.samplingPerformed raw -o - "$plist")" || return 1
 	if [[ "$schema" != "1" || "$architecture" != "arm64" || \
 		"$limitations" != "3" || "$process_scan" != "true" ]]; then
 		return 1
@@ -166,39 +166,39 @@ step_compatibility() {
 step_build_app() {
 	env -u APP_VERSION -u BUILD_NUMBER \
 		OUTPUT_DIR="$evidence_root/dist" \
-		"$script_dir/build-app.sh"
+		"$script_dir/build-app.sh" || return 1
 }
 
 step_validate_app() {
 	local app_plist="$artifact_path/Contents/Info.plist"
 	local app_binary="$artifact_path/Contents/MacOS/memory-monitor-app"
-	[[ -d "$artifact_path" && -f "$app_plist" && -x "$app_binary" ]]
+	[[ -d "$artifact_path" && -f "$app_plist" && -x "$app_binary" ]] || return 1
 	local bundle_version bundle_build
-	bundle_version="$(plutil -extract CFBundleShortVersionString raw -o - "$app_plist")"
-	bundle_build="$(plutil -extract CFBundleVersion raw -o - "$app_plist")"
-	[[ "$bundle_version" == "$source_version" && "$bundle_build" == "$source_build" ]]
-	[[ "$(file -b "$app_binary")" == *arm64* ]]
-	codesign --verify --deep --strict "$artifact_path"
+	bundle_version="$(plutil -extract CFBundleShortVersionString raw -o - "$app_plist")" || return 1
+	bundle_build="$(plutil -extract CFBundleVersion raw -o - "$app_plist")" || return 1
+	[[ "$bundle_version" == "$source_version" && "$bundle_build" == "$source_build" ]] || return 1
+	[[ "$(file -b "$app_binary")" == *arm64* ]] || return 1
+	codesign --verify --deep --strict "$artifact_path" || return 1
 
 	local provenance_file="$artifact_path/Contents/Resources/BuildProvenance.json"
-	[[ -f "$provenance_file" ]]
+	[[ -f "$provenance_file" ]] || return 1
 	local artifact_revision artifact_state artifact_digest artifact_version artifact_build expected_digest
-	artifact_revision="$(build_provenance_value "$provenance_file" sourceRevision)"
-	artifact_state="$(build_provenance_value "$provenance_file" checkoutState)"
-	artifact_digest="$(build_provenance_value "$provenance_file" buildInputsDigest)"
-	artifact_version="$(build_provenance_value "$provenance_file" productVersion)"
-	artifact_build="$(build_provenance_value "$provenance_file" productBuild)"
-	expected_digest="$(build_inputs_digest "$project_root")"
+	artifact_revision="$(build_provenance_value "$provenance_file" sourceRevision)" || return 1
+	artifact_state="$(build_provenance_value "$provenance_file" checkoutState)" || return 1
+	artifact_digest="$(build_provenance_value "$provenance_file" buildInputsDigest)" || return 1
+	artifact_version="$(build_provenance_value "$provenance_file" productVersion)" || return 1
+	artifact_build="$(build_provenance_value "$provenance_file" productBuild)" || return 1
+	expected_digest="$(build_inputs_digest "$project_root")" || return 1
 	[[ "$artifact_state" == "clean" && \
 		"$artifact_version" == "$bundle_version" && \
 		"$artifact_build" == "$bundle_build" && \
-		"$artifact_digest" == "$expected_digest" ]]
+		"$artifact_digest" == "$expected_digest" ]] || return 1
 }
 
 step_desktop_report() {
 	"$script_dir/verify-desktop-integration.sh" \
 		--app "$artifact_path" \
-		--output "$desktop_report"
+		--output "$desktop_report" || return 1
 }
 
 build_flags=()
