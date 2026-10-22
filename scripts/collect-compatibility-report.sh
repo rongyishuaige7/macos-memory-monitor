@@ -26,6 +26,11 @@ if ! git -C "$project_root" diff --quiet -- || \
 	checkout_state="modified"
 fi
 
+build_flags=()
+if [[ -n "${SWIFT_BUILD_FLAGS:-}" ]]; then
+	build_flags=(${=SWIFT_BUILD_FLAGS})
+fi
+
 report_root="$(mktemp -d "${TMPDIR:-/tmp}/memory-monitor-compatibility.XXXXXX")"
 trap 'if [[ -n "${report_root:-}" && -d "$report_root" ]]; then rm -rf -- "$report_root"; fi' EXIT
 report_file="$report_root/report.json"
@@ -39,6 +44,7 @@ env \
 	MEMORY_MONITOR_CHECKOUT_STATE="$checkout_state" \
 	MEMORY_MONITOR_BUILD_INPUTS_DIGEST="$build_digest" \
 	swift run \
+		"${build_flags[@]}" \
 		--package-path "$project_root" \
 		--configuration release \
 		memory-monitor-probe \

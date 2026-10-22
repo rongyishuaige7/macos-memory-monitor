@@ -99,3 +99,34 @@ with open(path, encoding="utf-8") as handle:
 print(value)
 PY
 }
+
+# Digest used by release/verification gates. It includes build inputs plus the
+# tests, scripts and workflow definitions that determine what was executed.
+verification_inputs_digest() {
+	local root="$1"
+	local manifest
+	manifest="$(mktemp "${TMPDIR:-/tmp}/memory-monitor-verification-inputs.XXXXXX")"
+	trap 'rm -f -- "${manifest:-}"' EXIT
+
+	local -a files
+	files=(Package.swift)
+	local relative_path
+	while IFS= read -r relative_path; do
+		case "$relative_path" in
+			*.DS_Store|*/.DS_Store|*/BuildProvenance.json) continue ;;
+		esac
+		files+=("$relative_path")
+	done < <(find "$root/Tests" "$root/scripts" "$root/.github/workflows" \
+		"$root/Sources" "$root/Resources" -type f -print 2>/dev/null |
+		sed "s#^$root/##" | LC_ALL=C sort)
+
+	for relative_path in "${files[@]}"; do
+		[[ -f "$root/$relative_path" ]] || continue
+		printf '%s\0' "$relative_path" >> "$manifest"
+		shasum -a 256 "$root/$relative_path" | awk '{print $1}' >> "$manifest"
+	done
+
+	shasum -a 256 "$manifest" | awk '{print $1}'
+	rm -f -- "$manifest"
+	trap - EXIT
+}
