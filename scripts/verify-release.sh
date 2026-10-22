@@ -74,10 +74,10 @@ manifest_path="$evidence_root/manifest.json"
 
 record_step() {
 	local id="$1"
-	local status="$2"
+	local step_status="$2"
 	local log="$3"
 	local detail="$4"
-	printf '%s\t%s\t%s\t%s\n' "$id" "$status" "$log" "$detail" >> "$steps_file"
+	printf '%s\t%s\t%s\t%s\n' "$id" "$step_status" "$log" "$detail" >> "$steps_file"
 }
 
 run_step() {
@@ -194,9 +194,9 @@ if [[ -n "${SWIFT_TEST_FLAGS:-}" ]]; then
 fi
 
 write_manifest() {
-	local status="$1"
+	local gate_status="$1"
 	local exit_code="$2"
-	python3 - "$manifest_path" "$status" "$exit_code" "$started_at" \
+	python3 - "$manifest_path" "$gate_status" "$exit_code" "$started_at" \
 		"$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$evidence_root" \
 		"$source_revision" "$checkout_state" "$build_digest" \
 		"$verification_digest_before" "$verification_digest_after" \
@@ -286,15 +286,15 @@ PY
 finalize() {
 	local exit_code=$?
 	trap - EXIT
-	local status="passed"
+	local gate_status="passed"
 	if (( exit_code != 0 )); then
-		status="failed"
+		gate_status="failed"
 	fi
 	if [[ -n "${evidence_root:-}" && -d "$evidence_root" ]]; then
 		if [[ -z "${verification_digest_after:-}" ]]; then
 			verification_digest_after="$(verification_inputs_digest "$project_root" 2>/dev/null || true)"
 		fi
-		write_manifest "$status" "$exit_code" || true
+		write_manifest "$gate_status" "$exit_code" || true
 		print -u2 "Evidence retained: $evidence_root"
 	fi
 	exit "$exit_code"
