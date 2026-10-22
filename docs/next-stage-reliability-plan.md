@@ -2,7 +2,8 @@
 
 计划基线：2026-10-22，源码 `dea920aa3145d1033b6d811c768ce07dc9f19ffe`，
 版本 1.4.2 (142)。状态：S1 已实施并推送（`e876029`），S2 已实施并推送
-（`0dd8acd`、`1c0ccfd`、`cc7b52a`、`18ec7f5`），S3–S7 仍待实施。
+（`0dd8acd`、`1c0ccfd`、`cc7b52a`、`18ec7f5`），S3 已实施并推送
+（`14a908a`），S4–S7 仍待实施。
 
 建议下一阶段以“可核对来源、可解释中断、可恢复数据”为目标。先完善发布
 证据，再补存储检查和审计中断状态，之后实施备份恢复与扫描预算。登录项
@@ -315,3 +316,32 @@ release gate 的非 GUI/独立 GUI 入口继续使用；单进程 swift test 的
   通过（源码 `18ec7f5`）。
 - 未做：S3 只读历史检查、S4 审计中断聚合、S5 完整备份/恢复、S6 扫描预算、
   S7 升级/回滚验收。
+
+## S3 实施记录（2026-10-22）
+
+状态：已完成并推送；源码 `14a908a`。未修改已安装 1.4.2 bundle。
+
+- 新增 `HistoryInspection`（Core）：独立只读解析 v1 index、v2 index +
+  15 分钟分段、journal、clock sidecar；不调用 `HistoryStore.load/flush/
+  merge`，不创建锁、不修复 journal、不修剪历史。
+- 分类：`healthy`、`legacy`、`empty`、`unsupportedVersion`、`missingIndex`、
+  `missingSegment`、`checksumMismatch`、`tornJournal`、`permissionDenied`、
+  `busy`、`changedDuringInspection`、`unsafePath`、`invalidData`、
+  `fileTooLarge`。报告包含格式、记录数、分段数、journal 数、时间覆盖、
+  文件字节数和问题计数；不含路径、workload 标签或历史内容。
+- 检查前后对 index/segments/journal/clock 做 inode/size/mtime 指纹核对；
+  现有锁文件只读打开并尝试共享锁，绝不创建锁；busy 时直接返回。
+- 新增独立可执行 `memory-monitor-storage inspect --root ... --output ...`；
+  输出必须绝对路径、位于检查根之外且不存在；报告 0600；不覆盖已有报告。
+- 应用健康页在历史错误时显示“磁盘历史受限 / 正在显示内存中的 N 个样本 /
+  最后成功写入时间”；`HistoryStoreDiagnostics` 新增
+  `lastSuccessfulWriteAt`，只在真实 snapshot/journal 写入成功后更新。
+- 测试：`HistoryInspectionTests` 11 项通过；全量 `swift test` 352 项中
+  351 项通过，唯一失败仍是 `CleanupMotionTests` 的无前台 AppKit 状态；
+  Release 严格并发构建通过。
+- 真实存储只读检查：`legacyV1`，1 条记录，报告 0600，检查前后
+  `history.json`/journal 哈希一致；报告位于 `/private/tmp/mm-s3-report.json`。
+- CI [run 39790073109](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/39790073109)
+  通过（源码 `14a908a`）。
+- 未做：S4 审计中断聚合、S5 完整备份/恢复、S6 扫描预算、S7 升级/回滚；
+  真实登录、公证和部署仍未变更。
