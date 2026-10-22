@@ -329,6 +329,7 @@ swift test --disable-sandbox --package-path . --scratch-path /tmp/memory-monitor
 - 新增测试覆盖 external audit、inode 授权、legacy 授权清理、可配置
   eligibility、inventory 诊断和手动/智能清理互斥。
 
-验证：全量 Swift 测试通过；Release `-strict-concurrency=complete` 构建
-通过。上述改动尚未重新打包/部署，当前已安装的 1.4.0 bundle 不包含这组
+验证：`swift test` **315 项全部通过**；Release
+`-strict-concurrency=complete` 构建通过；CI run `39713539176` 通过。
+上述改动尚未重新打包/部署，当前已安装的 1.4.0 bundle 不包含这组
 post-release 加固；下一次 patch release 需要重新构建、签名和部署。
