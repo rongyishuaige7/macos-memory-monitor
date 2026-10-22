@@ -4,8 +4,8 @@
 版本 1.4.2 (142)。状态：S1 已实施并推送（`e876029`），S2 已实施并推送
 （`0dd8acd`、`1c0ccfd`、`cc7b52a`、`18ec7f5`），S3 已实施并推送
 （`14a908a`），S2/S3 审查修复已推送（`4f421b3`、`c8d0a42`），S4 已实施
-并推送（`f0b2a22`），S5 已实施并推送（`efe799b`、`39c939f`），S6–S7
-仍待实施。
+并推送（`f0b2a22`），S5 已实施并推送（`efe799b`、`39c939f`），S6 已实施
+并推送（`f869f4d`），S7 仍待实施。
 
 建议下一阶段以“可核对来源、可解释中断、可恢复数据”为目标。先完善发布
 证据，再补存储检查和审计中断状态，之后实施备份恢复与扫描预算。登录项
@@ -416,3 +416,25 @@ release gate 的非 GUI/独立 GUI 入口继续使用；单进程 swift test 的
   在临时根恢复并逐文件 hash 一致，未对真实数据执行 restore。
 - 未完成/边界：未做每个 rename 阶段的强退注入矩阵；未做应用内备份/恢复
   按钮；未对真实数据执行恢复；S6 扫描预算、S7 升级/回滚仍待实施。
+
+## S6 实施记录（2026-10-22）
+
+状态：已完成并推送；源码 `f869f4d`。未修改已安装 1.4.2 bundle。
+
+- 新增 `ProcessScanBudget`：1.5 秒 monotonic deadline、总成员上限 20,000；
+  `sampleDetailed` 和 `descendantProcessIDs` 在每个 PID/父子枚举循环检查
+  取消、deadline 和成员上限。
+- `LiveSmartCleanupRuntime` 的每次 ActivityInventory 共享同一预算；所有
+  root 的后代枚举共用剩余成员预算。扫描失败/超时/成员超限/取消时
+  `metrics.complete=false`，不产出候选退出对象。
+- 清理扫描最多一个 detached worker；新扫描先取消并等待旧 worker，旧结果
+  通过 generation 丢弃。worker 显式保存并响应调用方取消。
+- 同一请求内按 root 缓存已确认后代集合，减少重叠 root 的重复枚举；不把
+  普通监控旧样本用于退出判断。
+- `CleanupInventoryMetrics` 记录 generation、扫描次数、成员数、完整性、
+  耗时、取消延迟和预算耗尽；清理 UI 显示扫描指标。
+- 验证：非 GUI `swift test` **376 项通过**；`ProcessScanBudgetTests` 3 项
+  通过；Release 严格并发构建通过；CI job `39816072143` 的 macOS 15 任务
+  成功。
+- 未完成/边界：未做合成大进程族、连续取消和真实 1.5 秒预算基准；原生
+  AppKit 套件仍有环境相关偶发失败；S7 升级/回滚验收仍待实施。
