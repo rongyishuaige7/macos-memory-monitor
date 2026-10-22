@@ -509,6 +509,8 @@ open "$HOME/Library/Application Support/MemoryMonitor/dist/MemoryMonitor.app"
 
 重复构建会先在输出卷复制并验证候选 bundle，再重命名替换；普通失败或可捕获的中断会恢复旧 bundle。成功后旧 bundle 保留在输出目录的隐藏 `.MemoryMonitor.app.replacement.*/previous.app` 中，路径会打印到日志。并发构建会被目录锁拒绝；若断电或 `SIGKILL` 留下 `.MemoryMonitor.app.replacement-lock`，先按其中 `transaction-path` 核对候选、旧 bundle 与目标，再手动恢复并移除锁。脚本不会清理这些恢复备份。
 
+原生桌面回归使用 `./scripts/verify-native-tests.sh [新的绝对日志目录]`，需要当前用户的登录桌面，会显示测试窗口并仅退出专用 fixture 应用。四个套件分别运行，覆盖窗口、动效生命周期及 AppKit 正常退出/拒绝退出；失败保留日志并返回非零，不修改登录项或 TCC。`verify-release.sh` 会先运行逻辑测试，再调用此入口；托管 CI 继续只运行非 GUI 测试。
+
 构建脚本默认从 [`Resources/Info.plist`](Resources/Info.plist) 读取 `1.4.1 / 141`，也支持以下环境变量覆盖：`CONFIGURATION=debug|release`、`APP_VERSION`、`BUILD_NUMBER`、`CODE_SIGN_IDENTITY` 和 `SKIP_SIGNING=1`。默认签名身份为本地 ad-hoc（`-`）。发布基线和验收要求见 [`docs/release-readiness-v1.0.3.md`](docs/release-readiness-v1.0.3.md)。
 
 ### Phase 2 completed

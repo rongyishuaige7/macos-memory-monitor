@@ -27,8 +27,11 @@ git -C "$project_root" diff --cached --check
 
 zsh "$script_dir/test-bundle-replacement.sh"
 print "Running Swift tests..."
-# Native AppKit tests share activation and window state on the same desktop.
-swift test --package-path "$project_root"
+# Isolate native suites: AppKit activation state survives NSApp.stop() and can
+# otherwise contaminate the next suite in a single XCTest process.
+swift test --package-path "$project_root" \
+	--skip 'CleanupMotionTests|DesktopMotionTests|SmartCleanupNativeTests|DesktopWindowTests'
+"$script_dir/verify-native-tests.sh"
 
 print "Building Debug with strict concurrency..."
 swift build \
