@@ -4,13 +4,19 @@ import MemoryMonitorCore
 
 @MainActor
 final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
+    private struct ActivityInventory: Sendable {
+        let scan: ProcessSamplingResult?
+        let families: [Int32: Set<Int32>]
+        let sampledAt: TimeInterval
+    }
     private let clock = ContinuousClock()
     private let origin = ContinuousClock.now
     private let timeProvider: (@MainActor () -> TimeInterval)?
     private let sampler = ProcessSampler()
     private let policy = ProcessActionPolicy(currentUserID: UInt32(getuid()), monitorPID: Int32(getpid()))
     private var activity: [Int32: TimeInterval] = [:]
-    private var cpuSamples: [ProcessIdentity: (time: TimeInterval, nanos: UInt64)] = [:]
+    private var cpuSamples: [ProcessIdentity: (time: TimeInterval, percent: Double?)] = [:]
+    private var cpuActivity = CleanupCPUActivityTracker()
     private var handles: [ProcessIdentity: NSRunningApplication] = [:]
 
     var now: TimeInterval {
@@ -44,6 +50,14 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
         activity = activity.filter { pids.contains($0.key) }
         handles = handles.filter { !$0.value.isTerminated }
         cpuSamples = cpuSamples.filter { pids.contains($0.key.pid) }
+        cpuActivity.retain(Set(cpuSamples.keys))
+        let bundles = Dictionary(running.compactMap { app -> (Int32, String)? in
+            guard app.processIdentifier != getpid(), app.activationPolicy == .regular,
+                  inventorySkipReason(app) == nil, let path = app.bundleURL?.path else { return nil }
+            return (app.processIdentifier, Self.canonical(path))
+        }, uniquingKeysWith: { first, _ in first })
+        let scan = await processScan(bundles: bundles)
+        let sampledAt = scan.sampledAt
         var observations: [CleanupObservation] = []
         var skipped: [CleanupSkip] = []
         for app in running {
@@ -57,7 +71,7 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
                 skipped.append(CleanupSkip(name: displayName(for: app), reason: reason))
                 continue
             }
-            switch await observeResult(app) {
+            switch observeResult(app, scan: scan, sampledAt: sampledAt) {
             case .success(let observation):
                 observations.append(observation)
             case .failure(let reason):
@@ -104,24 +118,22 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
     }
 
     private func observe(_ app: NSRunningApplication) async -> CleanupObservation? {
-        if case .success(let observation) = await observeResult(app) {
+        guard let path = app.bundleURL?.path else { return nil }
+        let scan = await processScan(bundles: [app.processIdentifier: Self.canonical(path)])
+        if case .success(let observation) = observeResult(app, scan: scan, sampledAt: scan.sampledAt) {
             return observation
         }
         return nil
     }
 
     private func observeResult(
-        _ app: NSRunningApplication
-    ) async -> Result<CleanupObservation, CleanupSkipReason> {
+        _ app: NSRunningApplication, scan inventory: ActivityInventory, sampledAt: TimeInterval
+    ) -> Result<CleanupObservation, CleanupSkipReason> {
         guard let key = authorization(app), app.isFinishedLaunching, !app.isTerminated else {
             return .failure(CleanupSkipReason.notReady)
         }
         let pid = app.processIdentifier
-        let sampler = sampler
-        guard let process = await Task.detached(
-            priority: .utility,
-            operation: { sampler.sample(pid: pid) }
-        ).value else {
+        guard let scan = inventory.scan, let process = scan.processes.first(where: { $0.identity.pid == pid }) else {
             return .failure(CleanupSkipReason.samplingFailed)
         }
         guard !Task.isCancelled, !app.isTerminated, authorization(app) == key,
@@ -135,18 +147,21 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
                 : .samplingFailed
             return .failure(reason)
         }
-        let instant = now
+        let instant = sampledAt
         if cpuSamples.keys.contains(where: { $0.pid == pid && $0 != process.identity }) {
             activity[pid] = instant
             cpuSamples = cpuSamples.filter { $0.key.pid != pid }
         }
         if activity[pid] == nil { activity[pid] = instant }
-        var cpu: Double?
-        if let previous = cpuSamples[process.identity], instant - previous.time >= 0.25,
-           instant - previous.time <= 15, process.cpuTimeNanos >= previous.nanos {
-            cpu = Double(process.cpuTimeNanos - previous.nanos) / 1e9 / (instant - previous.time) * 100
+        let application = CleanupApplication(process: process, authorization: key)
+        let cpu: Double?
+        if let family = inventory.families[pid] {
+            cpu = cpuActivity.update(application: application, scan: scan, at: instant, descendantPIDs: family)
+        } else {
+            cpuActivity.retain(Set(cpuSamples.keys).subtracting([process.identity]))
+            cpu = nil
         }
-        cpuSamples[process.identity] = (instant, process.cpuTimeNanos)
+        cpuSamples[process.identity] = (instant, cpu)
         handles[process.identity] = app
         return .success(CleanupObservation(
             application: .init(process: process, authorization: key),
@@ -163,7 +178,9 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
               authorization(app) == application.authorization,
               !app.isActive, NSWorkspace.shared.frontmostApplication?.processIdentifier != app.processIdentifier,
               now - (activity[app.processIdentifier] ?? now) >= 120,
-              let sample = cpuSamples[application.id], now - sample.time < 2 else { return .changed }
+              let sample = cpuSamples[application.id], now >= sample.time, now - sample.time < 2,
+              let cpu = sample.percent, cpu.isFinite, cpu >= 0,
+              cpu < CleanupEligibilityPolicy.standard.busyCPUPercent else { return .changed }
         return app.terminate() ? .sent : .refused
     }
 
@@ -191,6 +208,34 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
             bundleInode: bundleInode,
             executableInode: executableInode
         )
+    }
+
+    private func processScan(bundles: [Int32: String]) async -> ActivityInventory {
+        let sampler = sampler
+        // Include scan/relationship enumeration latency in the final two-second
+        // freshness guard. A slow scan must never make old counters look new.
+        let sampledAt = now
+        return await Task.detached(priority: .utility) {
+            guard let scan = try? sampler.sampleDetailed() else {
+                return ActivityInventory(scan: nil, families: [:], sampledAt: sampledAt)
+            }
+            var families: [Int32: Set<Int32>] = [:]
+            for (pid, path) in bundles {
+                var roots: Set<Int32> = [pid]
+                for process in scan.processes where process.executablePath?.hasPrefix(path + "/") == true {
+                    roots.insert(process.identity.pid)
+                }
+                for failure in scan.readFailures where failure.executablePath?.hasPrefix(path + "/") == true {
+                    roots.insert(failure.pid)
+                }
+                do {
+                    var family = roots
+                    for root in roots { family.formUnion(try sampler.descendantProcessIDs(of: root)) }
+                    families[pid] = family
+                } catch { /* Incomplete relationship scan keeps this application protected. */ }
+            }
+            return ActivityInventory(scan: scan, families: families, sampledAt: sampledAt)
+        }.value
     }
 
     private static func inode(at path: String) -> UInt64? {

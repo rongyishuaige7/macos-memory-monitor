@@ -1663,6 +1663,48 @@ public struct ProcessSampler: Sendable {
         return snapshot(pid: pid_t(pid), failure: &failure)
     }
 
+    /// Enumerate relationships independently of task/BSD-info permission.
+    /// Cleanup uses this to detect unreadable children without treating every
+    /// protected system process as a possible child of every application.
+    public func descendantProcessIDs(of rootPID: Int32) throws -> Set<Int32> {
+        guard rootPID > 0 else { throw MemoryMonitorError.invalidData(description: "无效的父进程") }
+        var seen: Set<Int32> = [rootPID]
+        var frontier = [rootPID]
+        let started = DispatchTime.now().uptimeNanoseconds
+        while let parent = frontier.popLast() {
+            guard !Task.isCancelled, seen.count <= 8192,
+                  DispatchTime.now().uptimeNanoseconds - started < 1_000_000_000 else {
+                throw MemoryMonitorError.invalidData(description: "进程族枚举未完成")
+            }
+            var capacity = 32
+            var children: [Int32]?
+            while capacity <= 8192 {
+                var buffer = [pid_t](repeating: 0, count: capacity)
+                let bytes = Int32(capacity * MemoryLayout<pid_t>.stride)
+                errno = 0
+                let returned = buffer.withUnsafeMutableBytes {
+                    proc_listpids(UInt32(PROC_PPID_ONLY), UInt32(parent), $0.baseAddress, bytes)
+                }
+                let code = errno
+                guard returned >= 0, returned > 0 || code == 0,
+                      Self.isPIDByteCountAligned(Int(returned)) else {
+                    throw MemoryMonitorError.systemCall(name: "proc_listpids(children)", code: code)
+                }
+                if returned < bytes {
+                    children = Array(buffer.prefix(Int(returned) / MemoryLayout<pid_t>.stride))
+                    break
+                }
+                capacity *= 2
+            }
+            guard let children else {
+                throw MemoryMonitorError.invalidData(description: "进程族列表被截断")
+            }
+            for child in children where child > 0 && seen.insert(child).inserted { frontier.append(child) }
+        }
+        seen.remove(rootPID)
+        return seen
+    }
+
     /// Enumerates all visible processes and reports processes that disappear
     /// or become inaccessible during the scan instead of silently hiding the
     /// partial result.

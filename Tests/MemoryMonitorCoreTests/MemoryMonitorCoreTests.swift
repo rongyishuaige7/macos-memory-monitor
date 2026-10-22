@@ -802,6 +802,20 @@ final class MemoryMonitorCoreTests: XCTestCase {
         XCTAssertTrue(processes.contains { $0.identity.pid == getpid() })
     }
 
+    func testProcessFamilyEnumerationFindsOwnedChildAndHandlesLeaf() throws {
+        let child = Process()
+        child.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        child.arguments = ["30"]
+        try child.run()
+        defer { if child.isRunning { child.terminate() }; child.waitUntilExit() }
+        let sampler = ProcessSampler()
+        let descendants = try sampler.descendantProcessIDs(of: getpid())
+        XCTAssertTrue(descendants.contains(child.processIdentifier))
+        XCTAssertFalse(descendants.contains(getpid()))
+        XCTAssertTrue(try sampler.descendantProcessIDs(of: child.processIdentifier).isEmpty)
+        XCTAssertThrowsError(try sampler.descendantProcessIDs(of: 0))
+    }
+
     func testProcessSamplerCanReadOneCurrentProcessByPID() throws {
         let process = try XCTUnwrap(ProcessSampler().sample(pid: getpid()))
         XCTAssertEqual(process.identity.pid, getpid())
