@@ -17,7 +17,7 @@ final class SmartCleanupTests: XCTestCase {
     func testDefaultDenyAndBoundAuthorizationPersistence() async {
         let app = cleanupApp(1)
         let (controller, runtime, defaults) = setup([observation(app)])
-        controller.start()
+        controller.start(confirmedApplications: runtime.confirmationApplications)
         await controller.waitUntilFinished()
         XCTAssertTrue(runtime.requests.isEmpty)
         XCTAssertEqual(controller.result?.exitedCount, 0)
@@ -73,7 +73,7 @@ final class SmartCleanupTests: XCTestCase {
             observation(apps[2], cpu: 5), observation(apps[3], cpu: nil), observation(apps[4], cpu: .nan)
         ])
         for app in apps { controller.setAuthorized(app, true) }
-        controller.start()
+        controller.start(confirmedApplications: runtime.confirmationApplications)
         await controller.waitUntilFinished()
         XCTAssertTrue(runtime.requests.isEmpty)
         XCTAssertEqual(controller.entries.count, 5)
@@ -86,8 +86,8 @@ final class SmartCleanupTests: XCTestCase {
         apps.forEach { controller.setAuthorized($0, true) }
         runtime.afterBytes = runtime.beforeBytes + 64 * 1024 * 1024
         runtime.onRequest = { _ in XCTAssertEqual(runtime.requests.count, controller.completedCount + 1) }
-        controller.start()
-        controller.start()
+        controller.start(confirmedApplications: runtime.confirmationApplications)
+        controller.start(confirmedApplications: runtime.confirmationApplications)
         await controller.waitUntilFinished()
         XCTAssertEqual(runtime.requests.count, 2)
         XCTAssertEqual(controller.result?.exitedCount, 2)
@@ -95,7 +95,7 @@ final class SmartCleanupTests: XCTestCase {
         XCTAssertEqual(controller.completionPulse, 2)
         XCTAssertTrue(controller.result?.hasMeasuredBenefit == true)
         XCTAssertNil(controller.operationGate.owner)
-        controller.start()
+        controller.start(confirmedApplications: runtime.confirmationApplications)
         XCTAssertFalse(controller.isBusy, "Repeated cleaning is cooled down")
     }
 
@@ -111,7 +111,7 @@ final class SmartCleanupTests: XCTestCase {
                 if scenario == 3 { return nil }
                 return observation(app)
             }
-            controller.start()
+            controller.start(confirmedApplications: runtime.confirmationApplications)
             await controller.waitUntilFinished()
             XCTAssertTrue(runtime.requests.isEmpty, "scenario \(scenario)")
             XCTAssertEqual(controller.entries.first?.outcome, .skipped)
@@ -125,7 +125,7 @@ final class SmartCleanupTests: XCTestCase {
             controller.setAuthorized(app, true)
             runtime.quitResult = refusal ? .refused : .sent
             runtime.exitResult = .running
-            controller.start()
+            controller.start(confirmedApplications: runtime.confirmationApplications)
             await controller.waitUntilFinished()
             XCTAssertEqual(controller.result?.exitedCount, 0)
             XCTAssertEqual(controller.completionPulse, 0)
@@ -141,7 +141,7 @@ final class SmartCleanupTests: XCTestCase {
         runtime.onSleep = {
             if controller.phase == .waiting { controller.cancel() }
         }
-        controller.start()
+        controller.start(confirmedApplications: runtime.confirmationApplications)
         await controller.waitUntilFinished()
         XCTAssertEqual(runtime.requests.count, 1)
         XCTAssertTrue(controller.result?.cancelled == true)
@@ -156,7 +156,7 @@ final class SmartCleanupTests: XCTestCase {
         apps.forEach { controller.setAuthorized($0, true) }
         runtime.exitResult = .running
         runtime.onSleep = { if controller.phase == .waiting { controller.skipCurrent() } }
-        controller.start()
+        controller.start(confirmedApplications: runtime.confirmationApplications)
         await controller.waitUntilFinished()
         XCTAssertEqual(runtime.requests.count, 2)
         XCTAssertEqual(controller.entries.filter { $0.outcome == .skipped }.count, 2)
@@ -168,7 +168,7 @@ final class SmartCleanupTests: XCTestCase {
         let (controller, runtime, _) = setup([observation(app)])
         controller.setAuthorized(app, true)
         runtime.onExitState = { _ in runtime.memoryReads > 3 ? .relaunched : .exited }
-        controller.start()
+        controller.start(confirmedApplications: runtime.confirmationApplications)
         await controller.waitUntilFinished()
         XCTAssertEqual(controller.result?.exitedCount, 0)
         XCTAssertEqual(controller.entries.first?.outcome, .relaunched)
@@ -182,7 +182,7 @@ final class SmartCleanupTests: XCTestCase {
             controller.setAuthorized(app, true)
             runtime.afterBytes = runtime.beforeBytes - 64 * 1024 * 1024
             runtime.failMemoryRead = failure
-            controller.start()
+            controller.start(confirmedApplications: runtime.confirmationApplications)
             await controller.waitUntilFinished()
             if failure == 0 {
                 XCTAssertEqual(controller.result?.observedChangeBytes, -64 * 1024 * 1024)
@@ -200,7 +200,7 @@ final class SmartCleanupTests: XCTestCase {
         let (controller, runtime, _) = setup(apps.map { observation($0) })
         apps.forEach { controller.setAuthorized($0, true) }
         runtime.onRequest = { _ in if runtime.requests.count == 1 { controller.revokeAll() } }
-        controller.start()
+        controller.start(confirmedApplications: runtime.confirmationApplications)
         await controller.waitUntilFinished()
         XCTAssertEqual(runtime.requests.count, 1)
         XCTAssertEqual(controller.plannedCount, 8)
@@ -213,7 +213,7 @@ final class SmartCleanupTests: XCTestCase {
         let (controller, runtime, _) = setup([observation(app)])
         controller.setAuthorized(app, true)
         runtime.onSleep = { controller.cancel() }
-        controller.start()
+        controller.start(confirmedApplications: runtime.confirmationApplications)
         await controller.waitUntilFinished()
         XCTAssertTrue(runtime.requests.isEmpty)
         XCTAssertEqual(runtime.reliefCalls, 0)
@@ -226,7 +226,7 @@ final class SmartCleanupTests: XCTestCase {
         controller.setAuthorized(app, true)
         runtime.afterBytes = runtime.beforeBytes + 64 * 1024 * 1024
         runtime.onMemoryRead = { if runtime.memoryReads == 6 { controller.cancel() } }
-        controller.start()
+        controller.start(confirmedApplications: runtime.confirmationApplications)
         await controller.waitUntilFinished()
         XCTAssertTrue(controller.result?.cancelled == true)
         XCTAssertNil(controller.result?.observedChangeBytes)
@@ -280,7 +280,7 @@ final class SmartCleanupTests: XCTestCase {
             }
         )
         controller.setAuthorized(app, true)
-        controller.start()
+        controller.start(confirmedApplications: runtime.confirmationApplications)
         await controller.waitUntilFinished()
 
         XCTAssertEqual(events.map(\.phase), [.intent, .signalSent, .terminal])
@@ -303,7 +303,7 @@ final class SmartCleanupTests: XCTestCase {
             audit: { _ in false }
         )
         controller.setAuthorized(app, true)
-        controller.start()
+        controller.start(confirmedApplications: runtime.confirmationApplications)
         await controller.waitUntilFinished()
 
         XCTAssertTrue(runtime.requests.isEmpty)
@@ -336,10 +336,100 @@ final class SmartCleanupTests: XCTestCase {
         XCTAssertTrue(controller.inventory.skippedSummary?.contains("1 个受系统保护") == true)
     }
 
+    func testConfirmationCannotAcquireNewlyEligibleTargets() async {
+        let apps = [cleanupApp(1), cleanupApp(2)]
+        let (controller, runtime, _) = setup([observation(apps[0], frontmost: true)])
+        apps.forEach { controller.setAuthorized($0, true) }
+        controller.refreshApplications()
+        await controller.waitUntilRefreshed()
+        let confirmed = controller.confirmationApplications
+        XCTAssertTrue(confirmed.isEmpty)
+
+        runtime.observations = apps.map { observation($0) }
+        controller.start(confirmedApplications: confirmed)
+        await controller.waitUntilFinished()
+        XCTAssertTrue(runtime.requests.isEmpty)
+        XCTAssertEqual(controller.plannedCount, 0)
+    }
+
+    func testConfirmationKeepsOriginalIdentityAndNeverFillsVacancies() async {
+        let original = cleanupApp(1)
+        let replacement = cleanupApp(1, start: 2000)
+        let other = cleanupApp(2)
+        let (controller, runtime, _) = setup([observation(replacement), observation(other)])
+        controller.setAuthorized(original, true)
+        controller.setAuthorized(other, true)
+        controller.start(confirmedApplications: [original])
+        await controller.waitUntilFinished()
+        XCTAssertTrue(runtime.requests.isEmpty)
+        XCTAssertTrue(controller.entries.contains { $0.id == original.id && $0.outcome == .skipped })
+    }
+
+    func testConfirmationIsBoundedAndDeduplicated() async {
+        let apps = (1...10).map { cleanupApp($0) }
+        let (controller, runtime, _) = setup(apps.map { observation($0) })
+        apps.forEach { controller.setAuthorized($0, true) }
+        controller.start(confirmedApplications: apps.flatMap { [$0, $0] })
+        await controller.waitUntilFinished()
+        XCTAssertEqual(Set(runtime.requests.map(\.id)), Set(apps.prefix(8).map(\.id)))
+        XCTAssertEqual(runtime.requests.count, 8)
+    }
+
+    func testRevocationAndCancellationDuringIntentPreventQuit() async {
+        for cancel in [false, true] {
+            let (_, runtime, defaults) = setup([observation(cleanupApp(1))])
+            let reference = CleanupControllerReference()
+            var events: [ProcessActionAuditEvent] = []
+            let controller = SmartCleanupController(runtime: runtime, defaults: defaults, audit: { event in
+                events.append(event)
+                if event.phase == .intent {
+                    await Task.yield()
+                    if cancel { reference.controller?.cancel() }
+                    else { reference.controller?.revokeAll() }
+                }
+                return true
+            })
+            reference.controller = controller
+            controller.setAuthorized(cleanupApp(1), true)
+            controller.start(confirmedApplications: runtime.confirmationApplications)
+            await controller.waitUntilFinished()
+            XCTAssertTrue(runtime.requests.isEmpty)
+            XCTAssertEqual(events.map(\.phase), [.intent, .terminal])
+            XCTAssertEqual(events.last?.outcome, .cancelled)
+            XCTAssertNil(controller.operationGate.owner)
+        }
+    }
+
+    func testFinalRelaunchAndInterruptedMeasurementKeepAuditConsistent() async {
+        for scenario in 0..<3 {
+            let app = cleanupApp(1)
+            let (_, runtime, defaults) = setup([observation(app)])
+            var events: [ProcessActionAuditEvent] = []
+            let controller = SmartCleanupController(runtime: runtime, defaults: defaults, audit: { event in
+                events.append(event)
+                return true
+            })
+            controller.setAuthorized(app, true)
+            if scenario == 0 {
+                runtime.onExitState = { _ in runtime.memoryReads > 3 ? .relaunched : .exited }
+            } else if scenario == 1 {
+                runtime.failMemoryRead = 4
+            } else {
+                runtime.onMemoryRead = { if runtime.memoryReads == 4 { controller.cancel() } }
+            }
+            controller.start(confirmedApplications: [app])
+            await controller.waitUntilFinished()
+            XCTAssertEqual(events.map(\.phase), [.intent, .signalSent, .terminal])
+            XCTAssertEqual(Set(events.map(\.operationID)).count, 1)
+            XCTAssertEqual(events.last?.outcome, scenario == 0 ? .failed : .completed)
+            XCTAssertEqual(controller.entries.first?.outcome, scenario == 0 ? .relaunched : .exited)
+        }
+    }
+
     func testOperationGateBlocksManualAndMemoryTest() async {
-        let (controller, _, _) = setup()
+        let (controller, runtime, _) = setup()
         XCTAssertTrue(controller.operationGate.acquire(.memoryTest))
-        controller.start()
+        controller.start(confirmedApplications: runtime.confirmationApplications)
         XCTAssertFalse(controller.isBusy)
         controller.operationGate.release(.memoryTest)
 
@@ -359,14 +449,14 @@ final class SmartCleanupTests: XCTestCase {
     func testManualBusyAndShutdownBlockCleanup() async {
         let (_, runtime, defaults) = setup()
         let controller = SmartCleanupController(runtime: runtime, defaults: defaults, manualActionIsBusy: { true })
-        controller.start()
+        controller.start(confirmedApplications: runtime.confirmationApplications)
         XCTAssertFalse(controller.isBusy)
         let second = SmartCleanupController(runtime: runtime, defaults: defaults)
         await second.shutdown()
-        second.start()
+        second.start(confirmedApplications: [])
         XCTAssertFalse(second.isBusy)
         let disabled = SmartCleanupController(runtime: runtime, defaults: defaults, executionEnabled: false)
-        disabled.start()
+        disabled.start(confirmedApplications: [])
         XCTAssertFalse(disabled.isBusy, "UI fixture launches cannot terminate real applications")
         disabled.setAuthorized(cleanupApp(1), true)
         XCTAssertTrue(disabled.authorizations.isEmpty)
@@ -374,10 +464,20 @@ final class SmartCleanupTests: XCTestCase {
 }
 
 @MainActor
+private final class CleanupControllerReference {
+    weak var controller: SmartCleanupController?
+}
+
+@MainActor
 final class FakeCleanupRuntime: SmartCleanupRuntime {
     var now: TimeInterval = 1000
     var observations: [CleanupObservation] = []
     var inventoryReportValue: CleanupInventory?
+    var confirmationApplications: [CleanupApplication] {
+        Array(observations.sorted {
+            ProcessSnapshot.memoryDescending($0.application.process, $1.application.process)
+        }.prefix(8).map(\.application))
+    }
     var requests: [CleanupApplication] = []
     var quitResult: CleanupQuitRequest = .sent
     var exitResult: CleanupExitState = .exited

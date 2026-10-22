@@ -9,6 +9,8 @@ struct DesktopRelease: View {
     @State private var showsApplications = false
     @State private var showsResults = false
     @State private var showsCleanupConfirmation = false
+    @State private var confirmationRequest: UUID?
+    @State private var confirmedApplications: [CleanupApplication] = []
     @AppStorage("desktopMotionEnabled") private var motionEnabled = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -39,9 +41,9 @@ struct DesktopRelease: View {
                     } else {
                         Button {
                             if cleanup.authorizations.isEmpty { showsApplications = true }
-                            else { showsCleanupConfirmation = true }
+                            else { confirmationRequest = UUID() }
                         } label: { Label("智能释放", systemImage: "sparkles") }
-                            .buttonStyle(MonitorPrimaryButtonStyle()).disabled(!cleanup.canStart)
+                            .buttonStyle(MonitorPrimaryButtonStyle()).disabled(!cleanup.canStart || cleanup.isRefreshing)
                             .accessibilityIdentifier("cleanup-start")
                     }
                 }.frame(height: 42)
@@ -88,26 +90,30 @@ struct DesktopRelease: View {
             isPresented: $showsCleanupConfirmation,
             titleVisibility: .visible
         ) {
-            Button("请求正常退出", role: .destructive) { cleanup.start() }
+            Button("请求正常退出", role: .destructive) {
+                cleanup.start(confirmedApplications: confirmedApplications)
+            }
             Button("取消", role: .cancel) {}
         } message: {
             Text(cleanupConfirmationMessage)
         }
         .onChange(of: cleanup.phase) { if cleanup.phase == .scanning { showsResults = false } }
-    }
-
-    private var cleanupConfirmationApplications: [CleanupObservation] {
-        Array(cleanup.applications.filter {
-            cleanup.isAuthorized($0.application) && $0.protection == nil
-        }.prefix(8))
+        .task(id: confirmationRequest) {
+            guard confirmationRequest != nil else { return }
+            cleanup.refreshApplications()
+            await cleanup.waitUntilRefreshed()
+            guard !Task.isCancelled, cleanup.canStart else { return }
+            confirmedApplications = cleanup.confirmationApplications
+            showsCleanupConfirmation = true
+        }
     }
 
     private var cleanupConfirmationMessage: String {
-        let apps = cleanupConfirmationApplications
+        let apps = confirmedApplications
         guard !apps.isEmpty else {
             return "当前没有同时满足“已授权、不在使用中、CPU 不忙碌”的应用。不会发送退出请求。"
         }
-        let names = apps.map(\.application.name).joined(separator: "、")
+        let names = apps.map(\.name).joined(separator: "、")
         return "将请求退出 \(apps.count) 个应用：\(names)。只发送正常退出请求，不会强制结束；应用可能拒绝或询问是否保存。"
     }
 

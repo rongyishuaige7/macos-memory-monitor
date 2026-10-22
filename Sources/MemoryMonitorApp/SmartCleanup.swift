@@ -253,6 +253,7 @@ final class SmartCleanupController: ObservableObject {
     private var wantsSkip = false
     private var shuttingDown = false
     private var cooldownUntil: TimeInterval = 0
+    private var pendingExitAudits: [ProcessIdentity: String] = [:]
 
     init(runtime: (any SmartCleanupRuntime)? = nil, defaults: UserDefaults = .standard,
          operationGate: MonitorOperationGate = MonitorOperationGate(),
@@ -281,6 +282,16 @@ final class SmartCleanupController: ObservableObject {
 
     var isBusy: Bool { task != nil }
     var canStart: Bool { executionEnabled && !isBusy && !shuttingDown && operationGate.owner == nil && !manualActionIsBusy() }
+
+    /// The UI freezes this value after refreshing activity samples. Execution
+    /// may skip these identities, but must never fill their places with others.
+    var confirmationApplications: [CleanupApplication] {
+        Array(applications.filter {
+            isAuthorized($0.application) && eligibilityPolicy.decision(for: $0).isAllowed
+        }.sorted {
+            ProcessSnapshot.memoryDescending($0.application.process, $1.application.process)
+        }.prefix(8).map(\.application))
+    }
 
     func isAuthorized(_ application: CleanupApplication) -> Bool {
         authorizations.contains(application.authorization)
@@ -325,7 +336,7 @@ final class SmartCleanupController: ObservableObject {
 
     private func finishRefresh() { isRefreshing = false; refreshTask = nil }
 
-    func start() {
+    func start(confirmedApplications: [CleanupApplication]) {
         guard canStart else { notice = "请等待当前操作结束。"; return }
         guard runtime.now >= cooldownUntil else { notice = "刚刚完成清理，请稍后再试。"; return }
         guard operationGate.acquire(.cleanup) else { return }
@@ -337,11 +348,16 @@ final class SmartCleanupController: ObservableObject {
         plannedCount = 0
         completedCount = 0
         currentName = nil
+        pendingExitAudits = [:]
+        var identities = Set<ProcessIdentity>()
+        let confirmed = Array(confirmedApplications.filter {
+            identities.insert($0.id).inserted
+        }.prefix(8))
         phase = .scanning
         task = Task { [weak self] in
             await previousRefresh?.value
             guard let self else { return }
-            await run()
+            await run(confirmedApplications: confirmed)
             phase = .finished
             currentName = nil
             cooldownUntil = runtime.now + 10
@@ -382,7 +398,7 @@ final class SmartCleanupController: ObservableObject {
         return MemoryWindow(available: samples.map(\.availableEstimateBytes).sorted()[1], total: samples[0].totalBytes)
     }
 
-    private func run() async {
+    private func run(confirmedApplications: [CleanupApplication]) async {
         var before: MemoryWindow?
         var after: MemoryWindow?
         var planned: [CleanupApplication] = []
@@ -396,11 +412,20 @@ final class SmartCleanupController: ObservableObject {
             applications = report.observations
             try Task.checkCancellation()
             let authorized = applications.filter { isAuthorized($0.application) }
+            let confirmedByID = Dictionary(uniqueKeysWithValues: confirmedApplications.map { ($0.id, $0) })
             for observation in authorized {
                 let decision = eligibilityPolicy.decision(for: observation)
                 if !decision.isAllowed {
                     append(observation.application, .skipped, decision.message ?? "已跳过")
-                } else { planned.append(observation.application) }
+                } else if let confirmed = confirmedByID[observation.id],
+                          confirmed.authorization == observation.application.authorization {
+                    planned.append(confirmed)
+                } else {
+                    append(observation.application, .skipped, "未包含在本次确认中")
+                }
+            }
+            for app in confirmedApplications where !applications.contains(where: { $0.id == app.id }) {
+                append(app, .skipped, "应用已退出或身份发生变化")
             }
             planned.sort { ProcessSnapshot.memoryDescending($0.process, $1.process) }
             // Bound a click's scope even if a large authorization list is imported.
@@ -420,18 +445,24 @@ final class SmartCleanupController: ObservableObject {
             phase = .measuring
             try await runtime.sleep(seconds: 0.6)
             after = try await memoryWindow()
-            // A verified exit followed by a relaunch must not remain a success.
-            for app in planned where runtime.exitState(app) == .relaunched {
-                if let index = entries.firstIndex(where: { $0.id == app.id && $0.outcome == .exited }) {
-                    entries[index].outcome = .relaunched
-                    entries[index].detail = "应用已重新启动"
-                }
-            }
         } catch {
             if !Task.isCancelled { notice = "清理已中断，请稍后重试。" }
         }
         for app in planned where !entries.contains(where: { $0.id == app.id }) {
             append(app, .cancelled, "尚未发送退出请求")
+        }
+        // Finalize verified exits even when measurement was cancelled/failed.
+        // Keep one terminal record that agrees with the final relaunch check.
+        for app in planned {
+            guard let operationID = pendingExitAudits.removeValue(forKey: app.id) else { continue }
+            let relaunched = runtime.exitState(app) == .relaunched
+            if relaunched, let index = entries.firstIndex(where: { $0.id == app.id && $0.outcome == .exited }) {
+                entries[index].outcome = .relaunched
+                entries[index].detail = "应用已重新启动"
+            }
+            await recordAudit(app, operationID: operationID, phase: .terminal,
+                              outcome: relaunched ? .failed : .completed,
+                              detail: relaunched ? "智能清理：应用已重新启动" : "智能清理：应用已正常退出")
         }
         finishResult(before: before, after: after)
     }
@@ -480,6 +511,14 @@ final class SmartCleanupController: ObservableObject {
                 return
             }
 
+            try Task.checkCancellation()
+            guard isAuthorized(app) else {
+                append(app, .skipped, "已取消授权")
+                await recordAudit(app, operationID: operationID, phase: .terminal,
+                                  outcome: .cancelled, detail: "智能清理：请求前已取消授权，未发送退出请求")
+                return
+            }
+
             switch runtime.requestQuit(observation.application) {
             case .refused:
                 append(app, .refused, "应用未接受退出请求")
@@ -518,13 +557,7 @@ final class SmartCleanupController: ObservableObject {
                 switch runtime.exitState(app) {
                 case .exited:
                     append(app, .exited, "已正常退出")
-                    await recordAudit(
-                        app,
-                        operationID: operationID,
-                        phase: .terminal,
-                        outcome: .completed,
-                        detail: "智能清理：应用已正常退出"
-                    )
+                    pendingExitAudits[app.id] = operationID
                     completionPulse += 1
                     return
                 case .relaunched:

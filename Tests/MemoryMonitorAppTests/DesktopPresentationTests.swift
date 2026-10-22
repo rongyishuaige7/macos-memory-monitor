@@ -191,7 +191,7 @@ final class DesktopPresentationTests: XCTestCase {
                 }
                 if cleanup.phase == .waiting { runtime.exitResult = .exited }
             }
-            cleanup.start()
+            cleanup.start(confirmedApplications: runtime.confirmationApplications)
             await cleanup.waitUntilFinished()
             XCTAssertTrue(recorded.contains("scanning"))
             XCTAssertTrue(recorded.contains("waiting"))

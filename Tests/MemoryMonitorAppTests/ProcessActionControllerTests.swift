@@ -822,13 +822,36 @@ final class ProcessActionControllerTests: XCTestCase {
         actions.requestGracefulExit(for: process)
         XCTAssertEqual(actions.operationGate.owner, .manualAction)
 
-        cleanup.start()
+        cleanup.start(confirmedApplications: [app])
         XCTAssertFalse(cleanup.isBusy, "Smart Cleanup must not start while a manual action holds the gate")
         XCTAssertTrue(cleanupRuntime.requests.isEmpty)
 
         actions.cancel(for: process.identity)
         XCTAssertNil(actions.operationGate.owner)
         await actions.shutdown()
+    }
+
+    func testExternalAuditRetriesSentFactsButNeverRetriesFailedIntent() async throws {
+        let paths = makeActionPaths()
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+        try FileManager.default.createDirectory(at: paths.file, withIntermediateDirectories: true)
+        let store = ProcessActionAuditStore(fileURL: paths.file)
+        let actions = ProcessActionController(auditStore: store)
+        await actions.refreshAudit()
+        var retainedIDs = Set<String>()
+        for phase in [ProcessActionAuditPhase.intent, .signalSent, .terminal] {
+            let event = ProcessActionAuditEvent(operationID: "external-retry", action: .gracefulExit,
+                phase: phase, outcome: .completed, processLabel: "fixture", detail: "fixture event")
+            let appended = await actions.recordExternalAudit(event)
+            XCTAssertFalse(appended)
+            if phase != .intent { retainedIDs.insert(event.id) }
+        }
+        try FileManager.default.removeItem(at: paths.file)
+        await actions.shutdown()
+        let events = try await store.load()
+        XCTAssertEqual(Set(events.map(\.id)), retainedIDs)
+        XCTAssertEqual(Set(events.map(\.phase)), Set([.signalSent, .terminal]))
+        XCTAssertNil(actions.auditError)
     }
 
     private func makeActionPaths() -> (file: URL, directory: URL) {

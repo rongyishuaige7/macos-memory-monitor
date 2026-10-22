@@ -382,7 +382,9 @@ final class ProcessActionController: ObservableObject {
     /// treat a `false` result as a hard stop before sending any termination
     /// request.
     func recordExternalAudit(_ event: ProcessActionAuditEvent) async -> Bool {
-        let result = await appendAuditEvent(event, queueOnFailure: false)
+        // A failed intent must stop execution. Once a request has been sent,
+        // preserve its facts for idempotent retry just like manual actions.
+        let result = await appendAuditEvent(event, queueOnFailure: event.phase != .intent)
         return result.appended
     }
 
