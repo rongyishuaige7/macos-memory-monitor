@@ -92,7 +92,7 @@ run_step() {
 		record_step "$id" failed "${log#$evidence_root/}" "exit $code"
 		print -u2 "Step failed: $id (exit $code)"
 		tail -n 40 "$log" >&2 || true
-		return "$code"
+		finalize "$code"
 	fi
 }
 
@@ -284,7 +284,11 @@ PY
 }
 
 finalize() {
-	local exit_code=$?
+	local exit_code="${1:-$?}"
+	if [[ -n "${gate_finalized:-}" ]]; then
+		exit "$exit_code"
+	fi
+	gate_finalized=1
 	trap - EXIT
 	local gate_status="passed"
 	if (( exit_code != 0 )); then
