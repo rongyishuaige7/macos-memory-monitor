@@ -73,12 +73,18 @@ private func printCompatibilityJSON(_ snapshot: MonitorSnapshot) throws {
     let checkoutState = CompatibilityCheckoutState(
         rawValue: environment["MEMORY_MONITOR_CHECKOUT_STATE"] ?? ""
     ) ?? .unknown
+    let invocationRevision = environment["MEMORY_MONITOR_SOURCE_REVISION"]
     let report = CompatibilityProbeReport.current(
         snapshot: snapshot,
         productVersion: environment["MEMORY_MONITOR_PRODUCT_VERSION"],
         buildNumber: environment["MEMORY_MONITOR_BUILD_NUMBER"],
-        sourceRevision: environment["MEMORY_MONITOR_SOURCE_REVISION"],
-        checkoutState: checkoutState
+        // A bare SwiftPM probe has no signed bundle manifest. Preserve the
+        // caller context for diagnostics, but label it explicitly so it can
+        // never be mistaken for artifact provenance.
+        sourceRevision: invocationRevision,
+        checkoutState: checkoutState,
+        buildInputsDigest: environment["MEMORY_MONITOR_BUILD_INPUTS_DIGEST"],
+        provenanceSource: invocationRevision == nil ? "unknown" : "invocation"
     )
     let encoder = JSONEncoder()
     encoder.dateEncodingStrategy = .iso8601

@@ -126,7 +126,9 @@ struct DesktopIntegrationReport: Codable, Sendable, Equatable {
         osPatch: Int,
         architecture: String,
         loginStatus: LoginLaunchStatus,
-        auditToken: DesktopAuditTokenCheckReport
+        auditToken: DesktopAuditTokenCheckReport,
+        buildInputsDigest: String? = nil,
+        provenanceSource: String? = nil
     ) {
         let timestamp = snapshot.timestamp.timeIntervalSince1970
         let validTimestampRange = -62_135_596_800.0...253_402_300_799.0
@@ -139,7 +141,9 @@ struct DesktopIntegrationReport: Codable, Sendable, Equatable {
             version: productVersion,
             build: buildNumber,
             sourceRevision: sourceRevision,
-            checkoutState: checkoutState
+            checkoutState: checkoutState,
+            buildInputsDigest: buildInputsDigest,
+            provenanceSource: provenanceSource
         )
         platform = CompatibilityPlatformReport(
             osMajor: osMajor,
@@ -168,7 +172,7 @@ struct DesktopIntegrationReport: Codable, Sendable, Equatable {
         loginStatus: LoginLaunchStatus,
         auditToken: DesktopAuditTokenCheckReport,
         bundle: Bundle = .main,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        provenance: BuildProvenance? = nil
     ) -> DesktopIntegrationReport {
         let version = ProcessInfo.processInfo.operatingSystemVersion
         #if arch(arm64)
@@ -179,23 +183,24 @@ struct DesktopIntegrationReport: Codable, Sendable, Equatable {
         let architecture = "unknown"
         #endif
 
-        let checkoutState = CompatibilityCheckoutState(
-            rawValue: environment["MEMORY_MONITOR_CHECKOUT_STATE"] ?? ""
-        ) ?? .unknown
+        let resolved = provenance ?? BuildProvenance.load(from: bundle)
         return DesktopIntegrationReport(
             snapshot: snapshot,
-            productVersion: bundle.object(
+            productVersion: resolved?.productVersion ?? bundle.object(
                 forInfoDictionaryKey: "CFBundleShortVersionString"
             ) as? String,
-            buildNumber: bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
-            sourceRevision: environment["MEMORY_MONITOR_SOURCE_REVISION"],
-            checkoutState: checkoutState,
+            buildNumber: resolved?.productBuild
+                ?? bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+            sourceRevision: resolved?.sourceRevision,
+            checkoutState: resolved?.checkoutState ?? .unknown,
             osMajor: version.majorVersion,
             osMinor: version.minorVersion,
             osPatch: version.patchVersion,
-            architecture: architecture,
+            architecture: resolved?.architecture ?? architecture,
             loginStatus: loginStatus,
-            auditToken: auditToken
+            auditToken: auditToken,
+            buildInputsDigest: resolved?.buildInputsDigest,
+            provenanceSource: resolved == nil ? "unknown" : "bundle"
         )
     }
 }

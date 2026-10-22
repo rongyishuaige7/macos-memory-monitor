@@ -110,6 +110,45 @@ final class DesktopIntegrationTests: XCTestCase {
         XCTAssertEqual(report.platform.architecture, "arm64private")
     }
 
+    func testCurrentReportUsesBundleProvenance() {
+        let provenance = BuildProvenance(
+            sourceRevision: "abc1234",
+            checkoutState: .clean,
+            buildInputsDigest: String(repeating: "a", count: 64),
+            productVersion: "1.4.2",
+            productBuild: "142",
+            architecture: "arm64",
+            toolchainVersion: "Swift 6.0"
+        )
+        let report = DesktopIntegrationReport.current(
+            snapshot: makeSnapshot(timestamp: Date(timeIntervalSince1970: 1_700_000_000)),
+            loginStatus: .notRegistered,
+            auditToken: .notRun,
+            provenance: provenance
+        )
+
+        XCTAssertEqual(report.product.version, "1.4.2")
+        XCTAssertEqual(report.product.build, "142")
+        XCTAssertEqual(report.product.sourceRevision, "abc1234")
+        XCTAssertEqual(report.product.checkoutState, .clean)
+        XCTAssertEqual(report.product.buildInputsDigest, String(repeating: "a", count: 64))
+        XCTAssertEqual(report.product.provenanceSource, "bundle")
+    }
+
+    func testCurrentReportWithoutProvenanceDoesNotInventSource() {
+        let report = DesktopIntegrationReport.current(
+            snapshot: makeSnapshot(timestamp: Date(timeIntervalSince1970: 1_700_000_000)),
+            loginStatus: .notRegistered,
+            auditToken: .notRun,
+            provenance: nil
+        )
+
+        XCTAssertNil(report.product.sourceRevision)
+        XCTAssertEqual(report.product.checkoutState, .unknown)
+        XCTAssertNil(report.product.buildInputsDigest)
+        XCTAssertEqual(report.product.provenanceSource, "unknown")
+    }
+
     private func makeReport(
         loginStatus: LoginLaunchStatus,
         auditToken: DesktopAuditTokenCheckReport

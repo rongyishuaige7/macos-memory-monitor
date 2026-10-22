@@ -17,17 +17,27 @@ public struct CompatibilityProductReport: Codable, Sendable, Equatable {
     public let build: String?
     public let sourceRevision: String?
     public let checkoutState: CompatibilityCheckoutState
+    /// Digest of the ordered build inputs embedded with the artifact. Nil for
+    /// legacy reports and for callers that cannot read a signed manifest.
+    public let buildInputsDigest: String?
+    /// `bundle` when the source came from the signed BuildProvenance file,
+    /// `invocation` for CLI environment context, or `unknown`.
+    public let provenanceSource: String?
 
     public init(
         version: String?,
         build: String?,
         sourceRevision: String?,
-        checkoutState: CompatibilityCheckoutState
+        checkoutState: CompatibilityCheckoutState,
+        buildInputsDigest: String? = nil,
+        provenanceSource: String? = nil
     ) {
         self.version = CompatibilityReportSanitizer.text(version, limit: 64)
         self.build = CompatibilityReportSanitizer.text(build, limit: 64)
         self.sourceRevision = CompatibilityReportSanitizer.text(sourceRevision, limit: 64)
         self.checkoutState = checkoutState
+        self.buildInputsDigest = CompatibilityReportSanitizer.text(buildInputsDigest, limit: 64)
+        self.provenanceSource = CompatibilityReportSanitizer.text(provenanceSource, limit: 32)
     }
 }
 
@@ -154,6 +164,8 @@ public struct CompatibilityProbeReport: Codable, Sendable, Equatable {
         buildNumber: String? = nil,
         sourceRevision: String? = nil,
         checkoutState: CompatibilityCheckoutState = .unknown,
+        buildInputsDigest: String? = nil,
+        provenanceSource: String? = nil,
         osMajor: Int,
         osMinor: Int,
         osPatch: Int,
@@ -168,7 +180,9 @@ public struct CompatibilityProbeReport: Codable, Sendable, Equatable {
             version: productVersion,
             build: buildNumber,
             sourceRevision: sourceRevision,
-            checkoutState: checkoutState
+            checkoutState: checkoutState,
+            buildInputsDigest: buildInputsDigest,
+            provenanceSource: provenanceSource
         )
         self.platform = CompatibilityPlatformReport(
             osMajor: osMajor,
@@ -185,7 +199,9 @@ public struct CompatibilityProbeReport: Codable, Sendable, Equatable {
         productVersion: String? = nil,
         buildNumber: String? = nil,
         sourceRevision: String? = nil,
-        checkoutState: CompatibilityCheckoutState = .unknown
+        checkoutState: CompatibilityCheckoutState = .unknown,
+        buildInputsDigest: String? = nil,
+        provenanceSource: String? = nil
     ) -> CompatibilityProbeReport {
         let version = ProcessInfo.processInfo.operatingSystemVersion
         #if arch(arm64)
@@ -202,6 +218,8 @@ public struct CompatibilityProbeReport: Codable, Sendable, Equatable {
             buildNumber: buildNumber,
             sourceRevision: sourceRevision,
             checkoutState: checkoutState,
+            buildInputsDigest: buildInputsDigest,
+            provenanceSource: provenanceSource,
             osMajor: version.majorVersion,
             osMinor: version.minorVersion,
             osPatch: version.patchVersion,

@@ -3,6 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd -P)"
 project_root="$(cd -- "$script_dir/.." && pwd -P)"
+source "$script_dir/build-provenance.zsh"
 source_plist="$project_root/Resources/Info.plist"
 
 app_path=""
@@ -56,7 +57,7 @@ if (( include_audit_token )) && [[ "${MEMORY_MONITOR_ALLOW_AUDIT_TOKEN_TEST:-}" 
 	exit 2
 fi
 
-for command_name in awk codesign env file git install mktemp plutil; do
+for command_name in awk codesign env file git install mktemp plutil python3 shasum; do
 	if ! command -v "$command_name" >/dev/null 2>&1; then
 		print -u2 "Required command not found: $command_name"
 		exit 2
@@ -120,12 +121,30 @@ fi
 output_parent="${output_parent:A}"
 output_path="$output_parent/${output_path:t}"
 
-source_revision="$(git -C "$project_root" rev-parse HEAD)"
-checkout_state="clean"
-if ! git -C "$project_root" diff --quiet -- || \
-	! git -C "$project_root" diff --cached --quiet -- || \
-	[[ -n "$(git -C "$project_root" ls-files --others --exclude-standard -- Package.swift Resources Sources scripts)" ]]; then
-	checkout_state="modified"
+provenance_file="$app_path/Contents/Resources/BuildProvenance.json"
+if [[ ! -f "$provenance_file" ]]; then
+	print -u2 "Signed build provenance is missing from the app bundle"
+	exit 1
+fi
+artifact_revision="$(build_provenance_value "$provenance_file" sourceRevision)"
+artifact_state="$(build_provenance_value "$provenance_file" checkoutState)"
+artifact_digest="$(build_provenance_value "$provenance_file" buildInputsDigest)"
+current_revision="$(build_source_revision "$project_root")"
+current_state="$(build_checkout_state "$project_root")"
+current_digest="$(build_inputs_digest "$project_root")"
+if [[ "$artifact_state" != "clean" || "$current_state" != "clean" ]]; then
+	print -u2 "Desktop integration verification requires clean artifact and checkout inputs"
+	exit 1
+fi
+if [[ "$artifact_digest" != "$current_digest" ]]; then
+	print -u2 "Artifact build inputs do not match the current checkout"
+	exit 1
+fi
+# A documentation-only commit can change HEAD without changing build inputs.
+# Keep the artifact's real revision and report the input-equivalence check
+# instead of relabelling the artifact as the newer commit.
+if [[ "$artifact_revision" != "$current_revision" ]]; then
+	print -u2 "Artifact revision $artifact_revision differs from HEAD $current_revision; build inputs are equivalent"
 fi
 
 report_root="$(mktemp -d "${TMPDIR:-/tmp}/memory-monitor-desktop.XXXXXX")"
@@ -141,8 +160,6 @@ fi
 print -u2 "Collecting desktop integration report from $app_path..."
 report_status=0
 env \
-	MEMORY_MONITOR_SOURCE_REVISION="$source_revision" \
-	MEMORY_MONITOR_CHECKOUT_STATE="$checkout_state" \
 	MEMORY_MONITOR_ALLOW_AUDIT_TOKEN_TEST="${MEMORY_MONITOR_ALLOW_AUDIT_TOKEN_TEST:-0}" \
 	"$app_binary" "${report_arguments[@]}" >"$report_file" || report_status=$?
 
@@ -164,6 +181,8 @@ if (( ! parse_failed )); then
 		! reported_version="$(plutil -extract product.version raw -o - "$report_plist")" || \
 		! reported_build="$(plutil -extract product.build raw -o - "$report_plist")" || \
 		! reported_revision="$(plutil -extract product.sourceRevision raw -o - "$report_plist")" || \
+		! reported_digest="$(plutil -extract product.buildInputsDigest raw -o - "$report_plist")" || \
+		! reported_source="$(plutil -extract product.provenanceSource raw -o - "$report_plist")" || \
 		! reported_architecture="$(plutil -extract platform.architecture raw -o - "$report_plist")" || \
 		! process_quality="$(plutil -extract processes.quality raw -o - "$report_plist")" || \
 		! process_usable="$(plutil -extract processes.usable raw -o - "$report_plist")" || \
@@ -189,7 +208,9 @@ login_state_valid=1
 if [[ "$schema_version" != "1" || \
 	"$reported_version" != "$bundle_version" || \
 	"$reported_build" != "$bundle_build" || \
-	"$reported_revision" != "$source_revision" || \
+	"$reported_revision" != "$artifact_revision" || \
+	"$reported_digest" != "$artifact_digest" || \
+	"$reported_source" != "bundle" || \
 	"$reported_architecture" != "arm64" || \
 	("$process_quality" != "available" && "$process_quality" != "estimated") || \
 	"$process_usable" != "true" || \

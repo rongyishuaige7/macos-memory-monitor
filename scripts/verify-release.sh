@@ -3,9 +3,10 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd -P)"
 project_root="$(cd -- "$script_dir/.." && pwd -P)"
+source "$script_dir/build-provenance.zsh"
 info_plist="$project_root/Resources/Info.plist"
 
-for command_name in git plutil swift awk grep mktemp file codesign env; do
+for command_name in git plutil swift awk grep mktemp file codesign env python3 shasum; do
 	if ! command -v "$command_name" >/dev/null 2>&1; then
 		print -u2 "Required command not found: $command_name"
 		exit 2
@@ -106,6 +107,23 @@ if [[ "$binary_description" != *arm64* ]]; then
 	exit 1
 fi
 codesign --verify --deep --strict "$app_path"
+
+provenance_file="$app_path/Contents/Resources/BuildProvenance.json"
+[[ -f "$provenance_file" ]]
+artifact_revision="$(build_provenance_value "$provenance_file" sourceRevision)"
+artifact_state="$(build_provenance_value "$provenance_file" checkoutState)"
+artifact_digest="$(build_provenance_value "$provenance_file" buildInputsDigest)"
+artifact_version="$(build_provenance_value "$provenance_file" productVersion)"
+artifact_build="$(build_provenance_value "$provenance_file" productBuild)"
+expected_digest="$(build_inputs_digest "$project_root")"
+if [[ "$artifact_state" != "clean" || \
+	"$artifact_version" != "$bundle_version" || \
+	"$artifact_build" != "$bundle_build" || \
+	"$artifact_digest" != "$expected_digest" ]]; then
+	print -u2 "Release artifact provenance failed validation"
+	exit 1
+fi
+print "Artifact provenance: $artifact_revision ($artifact_state), digest=$artifact_digest"
 
 probe_sampling="$(awk '/^Sampling:/{sub(/^Sampling:[[:space:]]*/, ""); print; exit}' "$probe_log")"
 probe_processes="$(awk '/^Processes:/{sub(/^Processes:[[:space:]]*/, ""); print; exit}' "$probe_log")"

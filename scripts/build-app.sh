@@ -3,6 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd -P)"
 project_root="$(cd -- "$script_dir/.." && pwd -P)"
+source "$script_dir/build-provenance.zsh"
 
 configuration="${CONFIGURATION:-release}"
 output_was_explicit=0
@@ -36,7 +37,7 @@ if (( system_major < 14 )); then
 	exit 2
 fi
 
-for command_name in swift plutil file install codesign xattr ditto mktemp; do
+for command_name in swift plutil file install codesign xattr ditto mktemp shasum python3; do
 	if ! command -v "$command_name" >/dev/null 2>&1; then
 		print -u2 "Required command not found: $command_name"
 		exit 2
@@ -114,12 +115,25 @@ if [[ -n "$file_provider_ancestor" ]]; then
 	exit 2
 fi
 
+source_revision="$(build_source_revision "$project_root")"
+checkout_state="$(build_checkout_state "$project_root")"
+build_digest_before="$(build_inputs_digest "$project_root")"
+toolchain_version="$(swift --version 2>/dev/null | head -n 1 | tr -d '\n')"
+[[ -n "$toolchain_version" ]] || toolchain_version="unknown"
+
+build_flags=()
+if [[ -n "${SWIFT_BUILD_FLAGS:-}" ]]; then
+	build_flags=(${=SWIFT_BUILD_FLAGS})
+fi
+
 swift build \
+	"${build_flags[@]}" \
 	--package-path "$project_root" \
 	--configuration "$configuration" \
 	--product "$binary_name"
 
 binary_dir="$(swift build \
+	"${build_flags[@]}" \
 	--package-path "$project_root" \
 	--configuration "$configuration" \
 	--show-bin-path)"
@@ -132,6 +146,12 @@ fi
 binary_description="$(file -b "$source_binary")"
 if [[ "$binary_description" != *arm64* ]]; then
 	print -u2 "Built executable is not arm64: $binary_description"
+	exit 1
+fi
+
+build_digest_after="$(build_inputs_digest "$project_root")"
+if [[ "$build_digest_before" != "$build_digest_after" ]]; then
+	print -u2 "Build inputs changed during the build; refusing to label the artifact"
 	exit 1
 fi
 
@@ -159,6 +179,19 @@ install -m 0644 "$app_icon" "$staged_app_path/Contents/Resources/MemoryMonitor.i
 plutil -replace CFBundleShortVersionString -string "$app_version" "$staged_app_path/Contents/Info.plist"
 plutil -replace CFBundleVersion -string "$build_number" "$staged_app_path/Contents/Info.plist"
 plutil -lint "$staged_app_path/Contents/Info.plist" >/dev/null
+
+# Embed provenance before codesigning so the manifest is covered by the
+# signature. The app must never infer its source from the invoking shell.
+write_build_provenance \
+	"$project_root" \
+	"$staged_app_path/Contents/Resources/BuildProvenance.json" \
+	"$app_version" \
+	"$build_number" \
+	"arm64" \
+	"$toolchain_version" \
+	"$source_revision" \
+	"$checkout_state" \
+	"$build_digest_before"
 
 # Clear inherited metadata before signing. The staging directory is outside
 # Desktop/File Provider storage, so it remains stable for final verification.
@@ -193,6 +226,8 @@ replace_app_bundle "$staged_app_path" "$app_path"
 print "Built $app_path"
 print "Configuration: $configuration"
 print "Architecture: arm64"
+print "Source revision: $source_revision ($checkout_state)"
+print "Build inputs digest: $build_digest_before"
 if [[ "$skip_signing" == "1" ]]; then
 	print "Signature: skipped"
 else
