@@ -330,6 +330,7 @@ swift test --disable-sandbox --package-path . --scratch-path /tmp/memory-monitor
   eligibility、inventory 诊断和手动/智能清理互斥。
 
 验证：`swift test` **315 项全部通过**；Release
-`-strict-concurrency=complete` 构建通过；CI run `39713539176` 通过。
-上述改动尚未重新打包/部署，当前已安装的 1.4.0 bundle 不包含这组
-post-release 加固；下一次 patch release 需要重新构建、签名和部署。
+`-strict-concurrency=complete` 构建通过。该组加固已作为 **1.4.1（141）**
+patch release 部署到登录项注册路径；1.4.0 保留在
+`~/Library/Application Support/MemoryMonitor/backup-1.4.1-release/`。
+`sfltool dumpbtm` 复核登录项仍为 enabled/allowed/notified，Generation 13。

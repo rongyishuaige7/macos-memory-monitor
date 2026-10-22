@@ -6,11 +6,11 @@
 - 物理内存基线：16 GiB
 - 首版形态：菜单栏常驻 + 点击弹出详细面板
 - 首版范围（历史基线）：只监视、分析和给出建议，不执行进程退出或强制结束
-- 当前 App bundle：v1.4.0（build 140）；独立桌面窗口 + 菜单栏快捷面板
+- 当前 App bundle：v1.4.1（build 141）；独立桌面窗口 + 菜单栏快捷面板
 - 当前本地 App bundle 使用 Apple Development 签名；Developer ID、notarization 和沙盒策略尚未启用
 - 文档状态：设计基线，可作为后续实现的验收依据
 
-## 当前桌面版（v1.4.0）
+## 当前桌面版（v1.4.1）
 
 主窗口提供内存概览、进程管理、释放内存、24 小时历史、压力测试和设置。
 菜单栏保留快速查看及页面入口；设置和进程详情归主窗口管理，避免菜单栏
@@ -47,7 +47,8 @@ UI fixture 模式禁用智能清理执行，避免演示数据触发真实应用
 [1.2.0 界面优化](docs/visual-refinement-v1.2.0.md)、
 [1.2.1 应用标识](docs/brand-identity-v1.2.1.md)、
 [1.3.0 智能清理](docs/smart-cleanup-v1.3.0.md) 和
-[1.3.1 统计图优化](docs/history-chart-v1.3.1.md)。v1.4.0 稳定化的范围、
+[1.3.1 统计图优化](docs/history-chart-v1.3.1.md)。v1.4.0 稳定化与 1.4.1
+安全补丁的范围、
 风险、分阶段验收和剩余限制见
 [stabilization-v1.4.0.md](docs/stabilization-v1.4.0.md)。以下章节保留
 早期设计与历次实现背景，当前界面以上述文档为准。
@@ -501,7 +502,7 @@ open "$HOME/Library/Application Support/MemoryMonitor/dist/MemoryMonitor.app"
 
 也可以通过 `OUTPUT_DIR` 指定其他本机目录；脚本会拒绝 iCloud Drive 或其他 File Provider 路径，因为这些位置可能在签名后重新写入 `com.apple.FinderInfo`。脚本只生成本地产物，不会自动安装、注册登录启动项或修改系统 LaunchAgents。Developer ID 签名、沙盒策略和登录启动开关留到单独阶段决定。
 
-构建脚本默认从 [`Resources/Info.plist`](Resources/Info.plist) 读取 `1.4.0 / 140`，也支持以下环境变量覆盖：`CONFIGURATION=debug|release`、`APP_VERSION`、`BUILD_NUMBER`、`CODE_SIGN_IDENTITY` 和 `SKIP_SIGNING=1`。默认签名身份为本地 ad-hoc（`-`）。发布基线和验收要求见 [`docs/release-readiness-v1.0.3.md`](docs/release-readiness-v1.0.3.md)。
+构建脚本默认从 [`Resources/Info.plist`](Resources/Info.plist) 读取 `1.4.1 / 141`，也支持以下环境变量覆盖：`CONFIGURATION=debug|release`、`APP_VERSION`、`BUILD_NUMBER`、`CODE_SIGN_IDENTITY` 和 `SKIP_SIGNING=1`。默认签名身份为本地 ad-hoc（`-`）。发布基线和验收要求见 [`docs/release-readiness-v1.0.3.md`](docs/release-readiness-v1.0.3.md)。
 
 ### Phase 2 completed
 
