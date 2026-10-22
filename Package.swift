@@ -23,6 +23,10 @@ let package = Package(
         .executable(
             name: "memory-monitor-app",
             targets: ["MemoryMonitorApp"]
+        ),
+        .executable(
+            name: "memory-monitor-storage",
+            targets: ["MemoryMonitorStorage"]
         )
     ],
     targets: [
@@ -41,6 +45,10 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("ServiceManagement")
             ]
+        ),
+        .executableTarget(
+            name: "MemoryMonitorStorage",
+            dependencies: ["MemoryMonitorCore"]
         ),
         .testTarget(
             name: "MemoryMonitorCoreTests",

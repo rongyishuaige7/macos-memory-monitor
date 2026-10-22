@@ -718,12 +718,17 @@ enum MonitorHealthEvaluator {
     }
 
     private static func historyItem(_ input: MonitorHealthInput) -> MonitorHealthItem {
+        let lastWrite = input.historyDiagnostics?.lastSuccessfulWriteAt.map {
+            $0.formatted(date: .omitted, time: .shortened)
+        }
         if let error = input.historyError, !error.isEmpty {
+            let samples = input.historyRecordCount
+            let writeText = lastWrite.map { "最后成功写入 \($0)" } ?? "最后成功写入时间未知"
             return MonitorHealthItem(
                 id: "history",
                 title: "24 小时历史",
-                status: "写入受限",
-                detail: error,
+                status: "磁盘历史受限",
+                detail: "正在显示内存中的 \(samples) 个样本；\(writeText)。\(error)",
                 level: .attention
             )
         }
@@ -737,13 +742,13 @@ enum MonitorHealthEvaluator {
             )
         }
         let bytes = input.historyDiagnostics?.totalBytes ?? 0
+        let sizeText = bytes > 0 ? " · " + MemoryFormatter.bytes(UInt64(bytes)) : ""
+        let writeText = lastWrite.map { " · 最后写入 \($0)" } ?? ""
         return MonitorHealthItem(
             id: "history",
             title: "24 小时历史",
             status: "正常",
-            detail: bytes > 0
-                ? String(input.historyRecordCount) + " 个样本 · " + MemoryFormatter.bytes(UInt64(bytes))
-                : String(input.historyRecordCount) + " 个样本",
+            detail: String(input.historyRecordCount) + " 个样本" + sizeText + writeText,
             level: .healthy
         )
     }

@@ -4845,6 +4845,10 @@ public struct HistoryStoreDiagnostics: Sendable, Equatable {
     public let journalRecordCount: Int
     public let compactionCount: Int
     public let lastCompactionAt: Date?
+    /// Last time the store durably wrote a snapshot or journal append. Nil
+    /// means the current process has not written yet; it is not a claim that
+    /// no prior process ever wrote.
+    public let lastSuccessfulWriteAt: Date?
     public let fullReloadCount: Int
     public let generationFastPathCount: Int
     public let snapshotWriteBytes: Int
@@ -4857,6 +4861,7 @@ public struct HistoryStoreDiagnostics: Sendable, Equatable {
         journalRecordCount: Int,
         compactionCount: Int,
         lastCompactionAt: Date?,
+        lastSuccessfulWriteAt: Date? = nil,
         fullReloadCount: Int = 0,
         generationFastPathCount: Int = 0,
         snapshotWriteBytes: Int = 0,
@@ -4868,6 +4873,7 @@ public struct HistoryStoreDiagnostics: Sendable, Equatable {
         self.journalRecordCount = max(journalRecordCount, 0)
         self.compactionCount = max(compactionCount, 0)
         self.lastCompactionAt = lastCompactionAt
+        self.lastSuccessfulWriteAt = lastSuccessfulWriteAt
         self.fullReloadCount = max(fullReloadCount, 0)
         self.generationFastPathCount = max(generationFastPathCount, 0)
         self.snapshotWriteBytes = max(snapshotWriteBytes, 0)
@@ -5635,6 +5641,7 @@ public actor HistoryStore {
     private var snapshotExists = false
     private var compactionCount = 0
     private var lastCompactionAt: Date?
+    private var lastSuccessfulWriteAt: Date?
     /// Highest validated wall-clock instant observed by this store. The
     /// sidecar anchor restores it after a restart so a clock rollback cannot
     /// make otherwise-valid history look like far-future garbage.
@@ -5849,6 +5856,7 @@ public actor HistoryStore {
             journalRecordCount: journalRecordCount,
             compactionCount: compactionCount,
             lastCompactionAt: lastCompactionAt,
+            lastSuccessfulWriteAt: lastSuccessfulWriteAt,
             fullReloadCount: fullReloadCount,
             generationFastPathCount: generationFastPathCount,
             snapshotWriteBytes: snapshotWriteBytes,
@@ -6649,6 +6657,7 @@ public actor HistoryStore {
 
         journalRecordCount += ordered.count
         journalByteCount += payload.count
+        lastSuccessfulWriteAt = timestamp
         pendingRecords.removeAll(keepingCapacity: false)
         pendingWriteNeedsRetry = false
         dirty = false
@@ -6835,6 +6844,7 @@ public actor HistoryStore {
         lastPersistedMinute = records.last?.timestamp
         compactionCount += 1
         lastCompactionAt = timestamp
+        lastSuccessfulWriteAt = timestamp
     }
 
     private func prepareDirectory() throws {
