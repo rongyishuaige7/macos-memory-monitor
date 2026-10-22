@@ -4892,6 +4892,7 @@ public enum HistoryStoreError: Error, CustomStringConvertible, LocalizedError, S
     case fileTooLarge
     case lockTimedOut
     case invalidData
+    case recoveryRequired
     case unsupportedVersion(Int)
 
     public var description: String {
@@ -4908,6 +4909,8 @@ public enum HistoryStoreError: Error, CustomStringConvertible, LocalizedError, S
             return "24 小时历史文件格式无效或已损坏"
         case let .unsupportedVersion(version):
             return "不支持的历史文件版本 " + String(version)
+        case .recoveryRequired:
+            return "检测到未完成的数据恢复事务，请先运行 storage recover"
         }
     }
 
@@ -5797,6 +5800,15 @@ public actor HistoryStore {
         _ body: () throws -> T
     ) throws -> T {
         do {
+            let maintenanceDescriptor = try MaintenanceLock.acquire(
+                root: fileURL.deletingLastPathComponent(),
+                mode: .shared,
+                timeoutSeconds: lockTimeoutSeconds
+            )
+            defer { MaintenanceLock.release(maintenanceDescriptor) }
+            guard !MaintenanceTransaction.exists(root: fileURL.deletingLastPathComponent()) else {
+                throw HistoryStoreError.recoveryRequired
+            }
             let lockDescriptor = try acquireExclusivePersistedFileLock(
                 at: lockURL,
                 timeoutSeconds: lockTimeoutSeconds
@@ -5829,6 +5841,12 @@ public actor HistoryStore {
         } catch PersistedFileLockError.cancelled {
             durableGeneration = nil
             throw CancellationError()
+        } catch is CancellationError {
+            durableGeneration = nil
+            throw CancellationError()
+        } catch MaintenanceLockError.timedOut {
+            durableGeneration = nil
+            throw HistoryStoreError.lockTimedOut
         } catch {
             durableGeneration = nil
             throw failure
@@ -7254,6 +7272,7 @@ public enum ProcessActionAuditStoreError: Error, CustomStringConvertible, Locali
     case fileTooLarge
     case lockTimedOut
     case invalidData
+    case recoveryRequired
 
     public var description: String {
         switch self {
@@ -7267,6 +7286,8 @@ public enum ProcessActionAuditStoreError: Error, CustomStringConvertible, Locali
             return "等待进程操作记录文件锁超时"
         case .invalidData:
             return "进程操作记录格式无效或已损坏"
+        case .recoveryRequired:
+            return "检测到未完成的数据恢复事务，请先运行 storage recover"
         }
     }
 
@@ -7438,6 +7459,15 @@ public actor ProcessActionAuditStore {
         _ body: () throws -> T
     ) throws -> T {
         do {
+            let maintenanceDescriptor = try MaintenanceLock.acquire(
+                root: fileURL.deletingLastPathComponent(),
+                mode: .shared,
+                timeoutSeconds: lockTimeoutSeconds
+            )
+            defer { MaintenanceLock.release(maintenanceDescriptor) }
+            guard !MaintenanceTransaction.exists(root: fileURL.deletingLastPathComponent()) else {
+                throw ProcessActionAuditStoreError.recoveryRequired
+            }
             let lockDescriptor = try acquireExclusivePersistedFileLock(
                 at: lockURL,
                 timeoutSeconds: lockTimeoutSeconds
@@ -7463,6 +7493,12 @@ public actor ProcessActionAuditStore {
         } catch PersistedFileLockError.cancelled {
             durableGeneration = nil
             throw CancellationError()
+        } catch is CancellationError {
+            durableGeneration = nil
+            throw CancellationError()
+        } catch MaintenanceLockError.timedOut {
+            durableGeneration = nil
+            throw ProcessActionAuditStoreError.lockTimedOut
         } catch {
             durableGeneration = nil
             throw failure
