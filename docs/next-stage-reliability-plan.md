@@ -256,3 +256,35 @@ release gate 的非 GUI/独立 GUI 入口继续使用；单进程 swift test 的
 签名前的构建清单与报告读取，补齐来源拒绝用例和严格构建。该切片通过并
 推送后进入 S2。任何正式部署均需使用可核对的候选产物和完整数据恢复准备；
 本计划不自动执行登录项迁移或真实用户会话操作。
+
+## S1 实施记录（2026-10-22）
+
+状态：已完成并推送，源码 `e876029`；未部署、未修改 1.4.2 已安装 bundle。
+
+- 新增 `BuildProvenance`（Core）：schema、源码 revision、clean/modified、
+  有序构建输入摘要、产品版本/构建号、架构、工具链版本；缺失/非法/未知
+  checkout state 一律返回 nil，不猜测来源。
+- `scripts/build-provenance.zsh` 统一计算 revision、checkout state 和构建
+  输入摘要；输入按相对路径 + 内容排序，不含用户名、绝对路径、环境变量或
+  时间戳。`build-app.sh` 在签名前写入
+  `Contents/Resources/BuildProvenance.json`，构建前后摘要不一致则失败。
+- 桌面集成报告 `DesktopIntegrationReport.current` 只读签名 bundle 内的
+  provenance；环境变量不再参与来源字段。缺失清单时报告
+  `sourceRevision=nil`、`checkoutState=unknown`、`provenanceSource=unknown`。
+- `CompatibilityProductReport` 增加可选 `buildInputsDigest` /
+  `provenanceSource`；旧 JSON 仍可解码。裸 SwiftPM probe 将环境来源标为
+  `provenanceSource=invocation`，不能冒充 bundle 来源；collector 校验该
+  invocation digest 与当前构建输入一致。
+- `verify-desktop-integration.sh` 校验产物 provenance、当前输入摘要、
+  clean 状态和报告中的 bundle 来源；仅文档变化导致 HEAD 不同而输入摘要
+  一致时保留产物真实 revision 并报告输入等价。
+- `verify-release.sh` 校验生成 bundle 的 provenance 版本/构建号/clean/
+  digest 后才继续发布门禁。
+- 验证：`swift test` **341 项全部通过**；Debug/Release 严格并发构建通过；
+  干净提交构建的 bundle provenance 为 `e876029` / clean；环境变量伪造
+  `deadbeef` 被拒绝；桌面报告 `provenanceSource=bundle`；兼容性报告为
+  `invocation` 且 digest 与当前输入一致；CI
+  [run 39783266878](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/39783266878)
+  通过，产物为 1.4.2 (142)。
+- 未做：旧 bundle 部署替换、真实登录/公证；S1 的构建来源机制尚未进入已
+  安装 bundle。下一步为 S2 门禁证据留存。
