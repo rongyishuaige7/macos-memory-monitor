@@ -228,6 +228,16 @@ struct CleanupApplicationsSheet: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if let metrics = cleanup.inventory.metrics {
+                let budget = metrics.budgetExhausted ? " · 预算耗尽" : ""
+                let completeness = metrics.complete ? "" : " · 结果不完整"
+                let cancellation = metrics.cancellationLatencyMilliseconds.map {
+                    " · 取消延迟 \(Int($0)) ms"
+                } ?? ""
+                Text("扫描 \(metrics.scanCount) 次 · \(metrics.memberCount) 个成员 · \(Int(metrics.durationMilliseconds)) ms\(cancellation)\(budget)\(completeness)")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
             HStack {
                 Button("全部取消授权") { cleanup.revokeAll() }.buttonStyle(.borderless)
                     .disabled(cleanup.authorizations.isEmpty)

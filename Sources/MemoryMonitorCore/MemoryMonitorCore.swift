@@ -1577,6 +1577,28 @@ public struct ProcessSamplingResult: Sendable, Equatable {
     }
 }
 
+public enum ProcessScanBudgetError: Error, Sendable, Equatable {
+    case budgetExhausted
+    case memberLimit
+}
+
+public struct ProcessScanBudget: Sendable, Equatable {
+    public let deadline: ContinuousClock.Instant
+    public let maximumMembers: Int
+
+    public init(deadline: ContinuousClock.Instant, maximumMembers: Int) {
+        self.deadline = deadline
+        self.maximumMembers = max(maximumMembers, 1)
+    }
+
+    public func check() throws {
+        try Task.checkCancellation()
+        guard ContinuousClock.now < deadline else {
+            throw ProcessScanBudgetError.budgetExhausted
+        }
+    }
+}
+
 public struct ProcessSampler: Sendable {
     public init() {}
 
@@ -1666,13 +1688,18 @@ public struct ProcessSampler: Sendable {
     /// Enumerate relationships independently of task/BSD-info permission.
     /// Cleanup uses this to detect unreadable children without treating every
     /// protected system process as a possible child of every application.
-    public func descendantProcessIDs(of rootPID: Int32) throws -> Set<Int32> {
+    public func descendantProcessIDs(
+        of rootPID: Int32,
+        budget: ProcessScanBudget? = nil
+    ) throws -> Set<Int32> {
         guard rootPID > 0 else { throw MemoryMonitorError.invalidData(description: "无效的父进程") }
         var seen: Set<Int32> = [rootPID]
         var frontier = [rootPID]
         let started = DispatchTime.now().uptimeNanoseconds
+        let maximumMembers = min(budget?.maximumMembers ?? 8192, 8192)
         while let parent = frontier.popLast() {
-            guard !Task.isCancelled, seen.count <= 8192,
+            if let budget { try budget.check() }
+            guard !Task.isCancelled, seen.count <= maximumMembers,
                   DispatchTime.now().uptimeNanoseconds - started < 1_000_000_000 else {
                 throw MemoryMonitorError.invalidData(description: "进程族枚举未完成")
             }
@@ -1708,10 +1735,14 @@ public struct ProcessSampler: Sendable {
     /// Enumerates all visible processes and reports processes that disappear
     /// or become inaccessible during the scan instead of silently hiding the
     /// partial result.
-    public func sampleDetailed(at timestamp: Date = Date()) throws -> ProcessSamplingResult {
+    public func sampleDetailed(
+        at timestamp: Date = Date(),
+        budget: ProcessScanBudget? = nil
+    ) throws -> ProcessSamplingResult {
         guard timestamp.timeIntervalSince1970.isFinite else {
             throw MemoryMonitorError.invalidData(description: "进程采样时间无效")
         }
+        if let budget { try budget.check() }
         let requestedBytes = proc_listpids(UInt32(PROC_ALL_PIDS), 0, nil, 0)
         guard requestedBytes > 0 else {
             throw MemoryMonitorError.systemCall(name: "proc_listpids(size)", code: requestedBytes)
@@ -1769,9 +1800,13 @@ public struct ProcessSampler: Sendable {
         let candidatePIDs = pids.prefix(returnedCount).filter { pid in
             pid > 0 && seenPIDs.insert(pid).inserted
         }
+        if let budget, candidatePIDs.count > budget.maximumMembers {
+            throw ProcessScanBudgetError.memberLimit
+        }
         var processes: [ProcessSnapshot] = []
         var failures: [ProcessReadDiagnostic] = []
         for pid in candidatePIDs {
+            if let budget { try budget.check() }
             var failure = ProcessReadFailure.unavailable
             if let process = snapshot(pid: pid, failure: &failure) {
                 processes.append(process)

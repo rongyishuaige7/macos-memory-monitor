@@ -152,13 +152,29 @@ struct CleanupSkip: Identifiable, Sendable, Equatable {
     }
 }
 
+struct CleanupInventoryMetrics: Sendable, Equatable {
+    let generation: UInt64
+    let scanCount: Int
+    let memberCount: Int
+    let complete: Bool
+    let durationMilliseconds: Double
+    let cancellationLatencyMilliseconds: Double?
+    let budgetExhausted: Bool
+}
+
 struct CleanupInventory: Sendable, Equatable {
     let observations: [CleanupObservation]
     let skipped: [CleanupSkip]
+    let metrics: CleanupInventoryMetrics?
 
-    init(observations: [CleanupObservation], skipped: [CleanupSkip] = []) {
+    init(
+        observations: [CleanupObservation],
+        skipped: [CleanupSkip] = [],
+        metrics: CleanupInventoryMetrics? = nil
+    ) {
         self.observations = observations
         self.skipped = skipped
+        self.metrics = metrics
     }
 
     var evaluatedCount: Int { observations.count + skipped.count }

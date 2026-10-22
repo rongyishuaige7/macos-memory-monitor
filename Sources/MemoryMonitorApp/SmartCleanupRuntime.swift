@@ -8,6 +8,8 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
         let scan: ProcessSamplingResult?
         let families: [Int32: Set<Int32>]
         let sampledAt: TimeInterval
+        let generation: UInt64
+        let metrics: CleanupInventoryMetrics
     }
     private let clock = ContinuousClock()
     private let origin = ContinuousClock.now
@@ -18,6 +20,10 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
     private var cpuSamples: [ProcessIdentity: (time: TimeInterval, percent: Double?)] = [:]
     private var cpuActivity = CleanupCPUActivityTracker()
     private var handles: [ProcessIdentity: NSRunningApplication] = [:]
+    private var worker: Task<ActivityInventory, Never>?
+    private var scanGeneration: UInt64 = 0
+    private let scanBudgetMilliseconds = 1_500
+    private let maximumScanMembers = 20_000
 
     var now: TimeInterval {
         if let timeProvider { return timeProvider() }
@@ -57,7 +63,22 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
             return (app.processIdentifier, Self.canonical(path))
         }, uniquingKeysWith: { first, _ in first })
         let scan = await processScan(bundles: bundles)
+        guard scan.generation == scanGeneration else {
+            return CleanupInventory(observations: [], skipped: [], metrics: scan.metrics)
+        }
         let sampledAt = scan.sampledAt
+        if !scan.metrics.complete {
+            let skipped = running.compactMap { app -> CleanupSkip? in
+                guard app.processIdentifier != getpid(),
+                      app.activationPolicy == .regular else { return nil }
+                return CleanupSkip(name: displayName(for: app), reason: .samplingFailed)
+            }
+            return CleanupInventory(
+                observations: [],
+                skipped: skipped,
+                metrics: scan.metrics
+            )
+        }
         var observations: [CleanupObservation] = []
         var skipped: [CleanupSkip] = []
         for app in running {
@@ -85,7 +106,11 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
             }
             return $0.name < $1.name
         }
-        return CleanupInventory(observations: observations, skipped: skipped)
+        return CleanupInventory(
+            observations: observations,
+            skipped: skipped,
+            metrics: scan.metrics
+        )
     }
 
     private func inventorySkipReason(_ app: NSRunningApplication) -> CleanupSkipReason? {
@@ -120,6 +145,7 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
     private func observe(_ app: NSRunningApplication) async -> CleanupObservation? {
         guard let path = app.bundleURL?.path else { return nil }
         let scan = await processScan(bundles: [app.processIdentifier: Self.canonical(path)])
+        guard scan.metrics.complete, scan.generation == scanGeneration else { return nil }
         if case .success(let observation) = observeResult(app, scan: scan, sampledAt: scan.sampledAt) {
             return observation
         }
@@ -211,31 +237,151 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
     }
 
     private func processScan(bundles: [Int32: String]) async -> ActivityInventory {
-        let sampler = sampler
-        // Include scan/relationship enumeration latency in the final two-second
-        // freshness guard. A slow scan must never make old counters look new.
+        scanGeneration &+= 1
+        let requestGeneration = scanGeneration
+        if let worker {
+            worker.cancel()
+            _ = await worker.value
+            self.worker = nil
+        }
+
+        let started = ContinuousClock.now
+        let deadline = started.advanced(by: .milliseconds(scanBudgetMilliseconds))
+        let budget = ProcessScanBudget(
+            deadline: deadline,
+            maximumMembers: maximumScanMembers
+        )
+        let sampler = self.sampler
         let sampledAt = now
-        return await Task.detached(priority: .utility) {
-            guard let scan = try? sampler.sampleDetailed() else {
-                return ActivityInventory(scan: nil, families: [:], sampledAt: sampledAt)
-            }
-            var families: [Int32: Set<Int32>] = [:]
-            for (pid, path) in bundles {
-                var roots: Set<Int32> = [pid]
-                for process in scan.processes where process.executablePath?.hasPrefix(path + "/") == true {
-                    roots.insert(process.identity.pid)
-                }
-                for failure in scan.readFailures where failure.executablePath?.hasPrefix(path + "/") == true {
-                    roots.insert(failure.pid)
-                }
-                do {
+        let cancellation = ScanCancellationBox()
+
+        let task = Task.detached(priority: .utility) { () -> ActivityInventory in
+            let scanStarted = ContinuousClock.now
+            do {
+                let scan = try sampler.sampleDetailed(at: Date(), budget: budget)
+                var families: [Int32: Set<Int32>] = [:]
+                var descendantCache: [Int32: Set<Int32>] = [:]
+                var remainingMembers = max(budget.maximumMembers - scan.sampledProcessCount, 0)
+                var complete = true
+                var budgetExhausted = false
+
+                for (pid, path) in bundles {
+                    try Task.checkCancellation()
+                    var roots: Set<Int32> = [pid]
+                    for process in scan.processes where process.executablePath?.hasPrefix(path + "/") == true {
+                        roots.insert(process.identity.pid)
+                    }
+                    for failure in scan.readFailures where failure.executablePath?.hasPrefix(path + "/") == true {
+                        roots.insert(failure.pid)
+                    }
                     var family = roots
-                    for root in roots { family.formUnion(try sampler.descendantProcessIDs(of: root)) }
+                    for root in roots {
+                        if let cached = descendantCache[root] {
+                            family.formUnion(cached)
+                            continue
+                        }
+                        guard remainingMembers > 0 else {
+                            complete = false
+                            budgetExhausted = true
+                            break
+                        }
+                        do {
+                            let descendants = try sampler.descendantProcessIDs(
+                                of: root,
+                                budget: ProcessScanBudget(
+                                    deadline: deadline,
+                                    maximumMembers: remainingMembers
+                                )
+                            )
+                            descendantCache[root] = descendants
+                            family.formUnion(descendants)
+                            remainingMembers = max(remainingMembers - descendants.count, 0)
+                        } catch {
+                            complete = false
+                            if error is ProcessScanBudgetError {
+                                budgetExhausted = true
+                            }
+                            break
+                        }
+                    }
+                    guard complete else { break }
                     families[pid] = family
-                } catch { /* Incomplete relationship scan keeps this application protected. */ }
+                }
+
+                let memberCount = scan.sampledProcessCount
+                    + Set(families.values.flatMap { $0 }).count
+                return ActivityInventory(
+                    scan: scan,
+                    families: families,
+                    sampledAt: sampledAt,
+                    generation: requestGeneration,
+                    metrics: CleanupInventoryMetrics(
+                        generation: requestGeneration,
+                        scanCount: 1,
+                        memberCount: memberCount,
+                        complete: complete,
+                        durationMilliseconds: Self.milliseconds(scanStarted.duration(to: ContinuousClock.now)),
+                        cancellationLatencyMilliseconds: nil,
+                        budgetExhausted: budgetExhausted
+                    )
+                )
+            } catch {
+                return ActivityInventory(
+                    scan: nil,
+                    families: [:],
+                    sampledAt: sampledAt,
+                    generation: requestGeneration,
+                    metrics: CleanupInventoryMetrics(
+                        generation: requestGeneration,
+                        scanCount: 1,
+                        memberCount: 0,
+                        complete: false,
+                        durationMilliseconds: Self.milliseconds(scanStarted.duration(to: ContinuousClock.now)),
+                        cancellationLatencyMilliseconds: nil,
+                        budgetExhausted: error is ProcessScanBudgetError
+                    )
+                )
             }
-            return ActivityInventory(scan: scan, families: families, sampledAt: sampledAt)
-        }.value
+        }
+        self.worker = task
+
+        let result = await withTaskCancellationHandler(operation: {
+            await task.value
+        }, onCancel: {
+            task.cancel()
+            cancellation.record(ContinuousClock.now)
+        })
+        if scanGeneration == requestGeneration {
+            self.worker = nil
+        }
+        let completed = ContinuousClock.now
+        let cancellationLatency = cancellation.instant.map {
+            Self.milliseconds($0.duration(to: completed))
+        }
+        return ActivityInventory(
+            scan: result.scan,
+            families: result.families,
+            sampledAt: result.sampledAt,
+            generation: result.generation,
+            metrics: CleanupInventoryMetrics(
+                generation: result.metrics.generation,
+                scanCount: result.metrics.scanCount,
+                memberCount: result.metrics.memberCount,
+                complete: result.metrics.complete,
+                durationMilliseconds: result.metrics.durationMilliseconds,
+                cancellationLatencyMilliseconds: cancellationLatency,
+                budgetExhausted: result.metrics.budgetExhausted
+            )
+        )
+    }
+
+    nonisolated private static func milliseconds(_ duration: Duration) -> Double {
+        let components = duration.components
+        return max(
+            Double(components.seconds) * 1000
+                + Double(components.attoseconds) / 1_000_000_000_000_000,
+            0
+        )
     }
 
     private static func inode(at path: String) -> UInt64? {
@@ -262,4 +408,24 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
     func sleep(seconds: TimeInterval) async throws { try await Task.sleep(for: .seconds(seconds)) }
 
     deinit { NSWorkspace.shared.notificationCenter.removeObserver(self) }
+}
+
+
+private final class ScanCancellationBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: ContinuousClock.Instant?
+
+    func record(_ instant: ContinuousClock.Instant) {
+        lock.lock()
+        defer { lock.unlock() }
+        if value == nil {
+            value = instant
+        }
+    }
+
+    var instant: ContinuousClock.Instant? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
 }
