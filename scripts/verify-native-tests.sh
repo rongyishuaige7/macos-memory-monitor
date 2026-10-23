@@ -32,9 +32,9 @@ scratch_args=()
 if [[ -n "${SWIFT_SCRATCH_PATH:-}" ]]; then scratch_args=(--scratch-path "$SWIFT_SCRATCH_PATH"); fi
 test_flags=()
 if [[ -n "${SWIFT_TEST_FLAGS:-}" ]]; then test_flags=(${=SWIFT_TEST_FLAGS}); fi
-suites=(CleanupMotionTests DesktopMotionTests DesktopWindowTests SmartCleanupNativeTests)
-expected_counts=(2 1 4 1)
-for index in {1..4}; do
+suites=(CleanupMotionTests DesktopMotionTests DesktopWindowTests SmartCleanupNativeTests DesktopScrollTests)
+expected_counts=(2 1 3 1 1)
+for (( index = 1; index <= ${#suites[@]}; index++ )); do
 	suite="$suites[$index]"
 	log="$native_output/$suite.log"
 	print "Running native suite in its own process: $suite"
