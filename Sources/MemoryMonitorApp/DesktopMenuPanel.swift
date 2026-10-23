@@ -4,8 +4,21 @@ import SwiftUI
 struct DesktopMenuPanel: View {
     @ObservedObject var model: MonitorViewModel
     let openDesktop: (DesktopPage) -> Void
+    let openAudit: () -> Void
     let terminationAction: ApplicationTerminationAction
     @AppStorage("desktopAppearance") private var appearance = "dark"
+
+    init(
+        model: MonitorViewModel,
+        openDesktop: @escaping (DesktopPage) -> Void,
+        terminationAction: ApplicationTerminationAction,
+        openAudit: (() -> Void)? = nil
+    ) {
+        self._model = ObservedObject(wrappedValue: model)
+        self.openDesktop = openDesktop
+        self.terminationAction = terminationAction
+        self.openAudit = openAudit ?? { openDesktop(.settings) }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -50,7 +63,7 @@ struct DesktopMenuPanel: View {
                                 .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                        .help("打开设置查看操作记录")
+                        .help("直接打开操作记录和待写状态")
                     }
                 }
                 .padding(18)

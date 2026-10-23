@@ -515,9 +515,18 @@ struct DesktopPreferences: View {
                     Button("查看记录", systemImage: "clock.arrow.circlepath") { navigation.showsAudit = true }
                 }
                 HStack {
-                    Text("隐私")
+                    Text("本地数据与隐私")
                     Spacer()
-                    Button("查看隐私设置", systemImage: "lock.shield") {
+                    Button("查看说明与诊断", systemImage: "externaldrive.badge.checkmark") {
+                        navigation.showsLocalData = true
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityIdentifier("desktop-settings-local-data")
+                }
+                HStack {
+                    Text("系统隐私权限")
+                    Spacer()
+                    Button("查看系统设置", systemImage: "lock.shield") {
                         openPrivacySettings()
                     }
                     .buttonStyle(.borderless)
@@ -577,8 +586,9 @@ struct DesktopPreferences: View {
         }
     }
 
+    @ViewBuilder
     private func healthRow(_ item: MonitorHealthItem) -> some View {
-        HStack(alignment: .top, spacing: 8) {
+        let content = HStack(alignment: .top, spacing: 8) {
             Image(systemName: item.level.iconName)
                 .foregroundStyle(healthLevelColor(item.level))
                 .frame(width: 18)
@@ -595,6 +605,38 @@ struct DesktopPreferences: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if MonitorStatusProjection.healthRoute(for: item.id) != nil {
+                Image(systemName: "chevron.right")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        if let route = MonitorStatusProjection.healthRoute(for: item.id) {
+            Button {
+                navigate(to: route)
+            } label: {
+                content
+            }
+            .buttonStyle(.plain)
+            .contentShape(Rectangle())
+            .accessibilityHint("打开对应的状态或诊断区域")
+        } else {
+            content
+        }
+    }
+
+    private func navigate(to route: MonitorHealthRoute) {
+        switch route {
+        case .audit:
+            navigation.showsAudit = true
+        case .localData:
+            navigation.showsLocalData = true
+        case .processes:
+            navigation.page = .processes
+        case .login:
+            break
+        case .runtime:
+            break
         }
     }
 

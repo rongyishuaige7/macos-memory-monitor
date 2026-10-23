@@ -297,7 +297,16 @@ final class SmartCleanupController: ObservableObject {
     }
 
     var isBusy: Bool { task != nil }
-    var canStart: Bool { executionEnabled && !isBusy && !shuttingDown && operationGate.owner == nil && !manualActionIsBusy() }
+    var startAvailability: ActionAvailability {
+        if !executionEnabled { return .disabled("当前版本未启用智能清理") }
+        if isBusy { return .disabled("清理正在进行，请先完成或停止当前操作") }
+        if shuttingDown { return .disabled("应用正在退出") }
+        if operationGate.owner != nil { return .disabled("另一个进程操作正在进行") }
+        if manualActionIsBusy() { return .disabled("另一个进程操作正在进行") }
+        if runtime.now < cooldownUntil { return .disabled("刚刚完成清理，请稍后再试") }
+        return .enabled
+    }
+    var canStart: Bool { startAvailability.isEnabled }
 
     /// The UI freezes this value after refreshing activity samples. Execution
     /// may skip these identities, but must never fill their places with others.

@@ -52,7 +52,8 @@ struct MemoryMonitorApp: App {
             DesktopMenuPanel(
                 model: applicationDelegate.model,
                 openDesktop: { page in applicationDelegate.desktop.show(page) },
-                terminationAction: applicationDelegate.terminationAction
+                terminationAction: applicationDelegate.terminationAction,
+                openAudit: { applicationDelegate.desktop.show(.settings, audit: true) }
             )
                 .onAppear { applicationDelegate.model.setPanelPresented(true) }
                 .onDisappear { applicationDelegate.model.setPanelPresented(false) }
@@ -1509,7 +1510,7 @@ struct ProcessDetailView: View {
         Button("退出进程", systemImage: "rectangle.portrait.and.arrow.right") {
             showGracefulConfirmation = true
         }
-        .disabled(actions.isBusy || actions.canForceTerminate(for: identity))
+        .disabled(!actions.manualActionAvailability.isEnabled || actions.canForceTerminate(for: identity))
         if actions.canForceTerminate(for: identity) {
             Button("强制结束", systemImage: "xmark.octagon", role: .destructive) {
                 showForceConfirmation = true
@@ -1536,6 +1537,13 @@ struct ProcessDetailView: View {
                 .foregroundStyle(.secondary)
         }
         if validation.allowed {
+            let availability = actions.manualActionAvailability
+            if let reason = availability.reason, !availability.isEnabled {
+                Label(reason, systemImage: "hourglass")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 10) { actionButtons }
                 VStack(alignment: .leading, spacing: 8) { actionButtons }

@@ -32,6 +32,7 @@ final class DesktopNavigation: ObservableObject {
     @Published var page: DesktopPage = .overview
     @Published var selectedProcess: ProcessIdentity?
     @Published var showsAudit = false
+    @Published var showsLocalData = false
 }
 
 /// Pure policy for whether the desktop window should request panel-level
@@ -111,10 +112,16 @@ final class DesktopWindowCoordinator: NSObject, NSWindowDelegate {
         NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
-    func show(_ page: DesktopPage = .overview, process: ProcessIdentity? = nil, audit: Bool = false) {
+    func show(
+        _ page: DesktopPage = .overview,
+        process: ProcessIdentity? = nil,
+        audit: Bool = false,
+        localData: Bool = false
+    ) {
         navigation.page = page
         navigation.selectedProcess = process
         navigation.showsAudit = audit
+        navigation.showsLocalData = localData
         if window == nil {
             let window = NSWindow(
                 contentRect: NSRect(x: 0, y: 0, width: 960, height: 650),
@@ -204,6 +211,9 @@ struct DesktopWindowRoot: View {
         }
         .sheet(isPresented: $navigation.showsAudit) {
             OperationsAuditPanel(actions: model.processActions)
+        }
+        .sheet(isPresented: $navigation.showsLocalData) {
+            LocalDataPanel()
         }
         .background(DesktopWindowAppearance(dark: appearance != "light"))
         .preferredColorScheme(appearance == "light" ? .light : .dark)

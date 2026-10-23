@@ -47,6 +47,16 @@ struct DesktopRelease: View {
                             .accessibilityIdentifier("cleanup-start")
                     }
                 }.frame(height: 42)
+                if cleanup.authorizations.isEmpty {
+                    Text("先在清理名单中选择允许退出的应用")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if let reason = cleanup.startAvailability.reason, !cleanup.canStart {
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
                 if let notice = cleanup.notice {
                     Text(notice).font(.caption).foregroundStyle(.orange).multilineTextAlignment(.center)
                 }
@@ -229,14 +239,19 @@ struct CleanupApplicationsSheet: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             if let metrics = cleanup.inventory.metrics {
-                let budget = metrics.budgetExhausted ? " · 预算耗尽" : ""
-                let completeness = metrics.complete ? "" : " · 结果不完整"
-                let cancellation = metrics.cancellationLatencyMilliseconds.map {
-                    " · 取消延迟 \(Int($0)) ms"
-                } ?? ""
-                Text("扫描 \(metrics.scanCount) 次 · \(metrics.memberCount) 个成员 · \(Int(metrics.durationMilliseconds)) ms\(cancellation)\(budget)\(completeness)")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                DisclosureGroup("技术详情") {
+                    let budget = metrics.budgetExhausted ? " · 预算耗尽" : ""
+                    let completeness = metrics.complete ? "" : " · 结果不完整"
+                    let cancellation = metrics.cancellationLatencyMilliseconds.map {
+                        " · 取消延迟 \(Int($0)) ms"
+                    } ?? ""
+                    Text("扫描 \(metrics.scanCount) 次 · \(metrics.memberCount) 个成员 · \(Int(metrics.durationMilliseconds)) ms\(cancellation)\(budget)\(completeness)")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .font(.caption2)
+                .accessibilityIdentifier("cleanup-technical-details")
             }
             HStack {
                 Button("全部取消授权") { cleanup.revokeAll() }.buttonStyle(.borderless)

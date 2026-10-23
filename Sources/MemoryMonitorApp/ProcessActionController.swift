@@ -387,6 +387,15 @@ final class ProcessActionController: ObservableObject {
         pendingAuditCount >= maximumPendingAuditEvents
     }
 
+    var manualActionAvailability: ActionAvailability {
+        MonitorStatusProjection.manualAction(
+            busy: isBusy,
+            shuttingDown: isShuttingDown,
+            auditQueueFull: auditQueueIsFull,
+            auditError: auditError
+        )
+    }
+
     private var gracefulTimeoutDisplaySeconds: Int {
         // `maximumGracefulTimeout` keeps this conversion bounded, but retain a
         // defensive clamp in case the policy changes independently later.
