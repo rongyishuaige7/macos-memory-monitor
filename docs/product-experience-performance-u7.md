@@ -1,7 +1,7 @@
 # U7 可见需求与采样性能记录
 
 日期：2026-10-23  
-实现源码：`b7d15b7`（U7 提交；复审修复源码 `377ac0b`）
+实现源码：`b7d15b7`（U7 提交；复审修复源码 `377ac0b`；计数测试 `df878ca`）
 
 ## 已实现
 
@@ -23,6 +23,20 @@
   扫进程、关闭一个可见面不撤销另一个。
 - 非 GUI 全量 423 项通过；完整门禁见
   [product-experience-delivery.md](product-experience-delivery.md)。
+
+## 确定性扫描计数
+
+`ProductExperienceU7Tests.testTenMinuteProcessScanCountsFollowVisibleSurfaceTargets`
+按 10 分钟、每 3 秒一个刷新点模拟同一策略：
+
+| 可见面 | 10 分钟进程扫描次数 |
+| --- | ---: |
+| 进程页/详情（3 秒） | 201 |
+| 概览/菜单（15 秒） | 41 |
+| 历史/设置（60 秒） | 11 |
+
+以进程页 201 次为基线，概览约减少 80%，历史/设置约减少 95%。这是策略
+计数，不是 CPU、RSS 或实际扫描耗时测量；不能替代下面的连续性能对照。
 
 ## 性能对照：未执行
 

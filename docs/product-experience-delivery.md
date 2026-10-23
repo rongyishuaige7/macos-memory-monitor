@@ -23,12 +23,12 @@
 | --- | --- |
 | 完整 `verify-release.sh` | `/private/tmp/mm-ux-u8-gate-377ac0b`，`status=passed`，`exitCode=0` |
 | 源码/构建 | source `377ac0b`，checkout clean，build inputs digest `e4eb2478dc4586f01f8e41c486b0796294122426aadd3f35541241e2e12246c3` |
-| 非 GUI | 423 项通过；`non_gui_test_scope` 通过 |
+| 非 GUI | 424 项通过；`non_gui_test_scope` 通过 |
 | 原生（当前源码，5 套隔离） | **8/8**：CleanupMotion 2、DesktopMotion 1、DesktopWindow 3、SmartCleanupNative 1、DesktopScroll 1；日志 `/private/tmp/mm-ux-u8-gate-377ac0b/native-tests` |
 | 产物 | 签名、BuildProvenance、probe、兼容性报告、桌面报告、输入稳定性均通过 |
 | CI | [run 39964483745](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/39964483745)，macOS 15 arm64 成功 |
 | UI fixture | `/private/tmp/mm-ux-ui-check-377ac0b`，Launch Services 启动、240 历史/239 journal/12 审计；本次 PID 已停止 |
-| 性能 | U7 连续性能对照**未执行**，见 [product-experience-performance-u7.md](product-experience-performance-u7.md) |
+| 性能 | 10 分钟策略计数已记录（进程页 201、概览 41、历史/设置 11）；CPU/RSS 连续对照**未执行**，见 [product-experience-performance-u7.md](product-experience-performance-u7.md) |
 
 ## A01–A18 覆盖
 
