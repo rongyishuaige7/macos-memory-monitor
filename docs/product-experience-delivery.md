@@ -1,7 +1,7 @@
 # 产品体验 U1–U8 候选交付记录
 
 日期：2026-10-23  
-实现源码：`9672820`（最终完整门禁源码）  
+实现源码：`c687ded`（当前复审修复源码）  
 产品版本：1.4.2 (142)，**未 bump、未部署**
 
 ## 交付范围
@@ -21,13 +21,14 @@
 
 | 项目 | 结果 |
 | --- | --- |
-| 完整 `verify-release.sh` | `/private/tmp/mm-ux-u8-gate`，`status=passed`，`exitCode=0` |
-| 源码/构建 | source `9672820`，checkout clean，build inputs digest `c0d161d4adeeb6f67c3d0fe796d2bd41f668ced6e7d873c496452b5ca27cad5a` |
-| 非 GUI | 418 项通过；`non_gui_test_scope` 通过 |
+| 完整 `verify-release.sh` | `/private/tmp/mm-ux-u8-gate-c687ded`，`status=failed`；`DesktopMotionTests` inactive 会话失败 |
+| 非原生 artifact gate | `/private/tmp/mm-ux-u8-gate-c687ded-noskip`，`status=passed`，`native_tests=skipped`（不冒充完整原生通过） |
+| 源码/构建 | source `c687ded`，checkout clean，build inputs digest `29882a10512df8b260d8cb1f3256841ae1ad06a67321ebaa3eb3174933e65f3a` |
+| 非 GUI | 422 项通过；`non_gui_test_scope` 通过 |
 | 原生 | 4 套隔离测试 7/7 通过（CleanupMotion 2、DesktopMotion 1、DesktopWindow 3、SmartCleanupNative 1） |
 | 产物 | 签名、BuildProvenance、probe、兼容性报告、桌面报告、输入稳定性均通过 |
-| CI | [run 39941268345](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/39941268345)，macOS 15 arm64 成功 |
-| UI fixture | `/private/tmp/mm-ux-ui-check`，Launch Services 启动、240 历史/239 journal/12 审计；本次 PID 已停止 |
+| CI | [run 39955036496](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/39955036496)，macOS 15 arm64 成功 |
+| UI fixture | `/private/tmp/mm-ux-ui-check-c687ded`，Launch Services 启动、240 历史/239 journal/12 审计；本次 PID 已停止 |
 | 性能 | U7 连续性能对照**未执行**，见 [product-experience-performance-u7.md](product-experience-performance-u7.md) |
 
 ## A01–A18 覆盖
@@ -43,10 +44,23 @@
 - A12/A13：U1 只读检查前后文件/hash/权限/mtime 不变、未完成恢复标记可见；
   摘要白名单、0600、拒绝覆盖测试。
 - A14：生产 fixture 执行总闸保持关闭；UI fixture 只启动隔离实例。
-- A15/A16：U6 会话上下文、搜索命中成员、跟随系统、快捷键和高级工具入口；
-  原生 DesktopWindow/SmartCleanup 套件通过。
+- A15/A16：U6 会话上下文、搜索命中成员、稳定排序、滚动锚点、跟随系统、
+  快捷键和高级工具入口；原生 DesktopWindow/SmartCleanup 套件通过。
 - A17：U7 需求合并/压力合并/稀疏页面/多消费者生命周期测试；性能对照待补。
 - A18：上述完整门禁、CI、来源和输入稳定性证据。
+
+## 复审修复
+
+- P1 预览过期：确认按钮重新读取当前单调时间；`SmartCleanupController.start(preview:)`
+  再校验 preview ID、有效期和选中集合，过期预览不会发出退出请求。
+- P2 历史归因：工作组归因时间与记录时间偏差超过 300 秒（含未来）标为
+  `.unknown`，不再显示 `.complete`。
+- P2 采样唤醒：可见需求集合变化即递增 revision 并唤醒等待；页面切换不会
+  继续沿用旧 20 秒等待。
+- P2 可见性恢复：隐藏只注销可见需求，保留实际页面；恢复时重新注册原页面，
+  不再固定回 `.overview`。
+- P2 U6 列表稳定：已有组顺序在读数刷新时保持，新组追加；保存组滚动锚点，
+  切页/返回恢复；提供“固定排序”开关。
 
 ## 桌面走查
 
@@ -68,5 +82,5 @@
 
 ## 结论
 
-U1–U8 的代码和自动化候选交付已完成，完整门禁与 CI 全绿。该候选仍缺 U7
+U1–U8 的代码和自动化候选交付已完成，非原生 artifact 门禁与 CI 全绿；完整原生门禁仍受 inactive 会话偶发失败。该候选仍缺 U7
 连续性能对照、完整人工桌面走查和外部发布条件，不能标记为已正式发布。

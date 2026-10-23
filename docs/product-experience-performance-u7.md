@@ -1,7 +1,7 @@
 # U7 可见需求与采样性能记录
 
 日期：2026-10-23  
-实现源码：`b7d15b7`（U7 提交；最终候选源码 `9672820`）
+实现源码：`b7d15b7`（U7 提交；复审修复源码 `c687ded`）
 
 ## 已实现
 
@@ -21,7 +21,7 @@
 
 - `ProductExperienceU7Tests` 4 项通过：需求合并、压力合并、稀疏页面不每 3 秒
   扫进程、关闭一个可见面不撤销另一个。
-- 非 GUI 全量 418 项通过；完整门禁见
+- 非 GUI 全量 422 项通过；完整门禁见
   [product-experience-delivery.md](product-experience-delivery.md)。
 
 ## 性能对照：未执行
