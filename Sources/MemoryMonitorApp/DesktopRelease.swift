@@ -195,52 +195,118 @@ struct DesktopRelease: View {
     }
 }
 
+private enum CleanupAuthorizationTab: String, CaseIterable, Identifiable {
+    case authorized
+    case addable
+
+    var id: String { rawValue }
+    var title: String { self == .authorized ? "已授权" : "可添加" }
+}
+
 struct CleanupApplicationsSheet: View {
     @ObservedObject var cleanup: SmartCleanupController
     @Environment(\.dismiss) private var dismiss
+    @State private var tab: CleanupAuthorizationTab = .authorized
     @State private var query = ""
 
+    private var authorizedEntries: [CleanupAuthorizationEntry] {
+        let entries = cleanup.authorizationEntries
+        guard !query.isEmpty else { return entries }
+        return entries.filter {
+            $0.displayName.localizedCaseInsensitiveContains(query)
+                || $0.authorization.bundleIdentifier.localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    private var addableApplications: [CleanupObservation] {
+        let apps = cleanup.applications.filter { !cleanup.isAuthorized($0.application) }
+        guard !query.isEmpty else { return apps }
+        return apps.filter {
+            $0.application.name.localizedCaseInsensitiveContains(query)
+                || $0.application.authorization.bundleIdentifier.localizedCaseInsensitiveContains(query)
+        }
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 14) {
             HStack {
                 Text("清理名单").font(.title3.weight(.semibold))
                 Spacer()
                 Button { dismiss() } label: { Image(systemName: "xmark").frame(width: 24, height: 24) }
                     .buttonStyle(.borderless).help("关闭").accessibilityLabel("关闭清理名单")
             }
-            Text("仅勾选可以随时退出的应用。清理会请求正常退出，可能询问是否保存；正在使用和近期使用的应用会自动跳过。")
+            Text("已授权名单独立于当前运行应用。仅勾选可以随时退出的应用；清理会请求正常退出，可能询问是否保存。未运行条目可以单独撤销，不会自动启动应用。")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            HStack {
-                TextField("搜索应用", text: $query).textFieldStyle(.roundedBorder)
-                Button { cleanup.refreshApplications() } label: { Image(systemName: "arrow.clockwise") }
-                    .buttonStyle(.borderless).help("刷新应用").disabled(cleanup.isRefreshing || cleanup.isBusy)
+            let counts = cleanup.authorizationCounts
+            Text("已授权 \(counts.total) · 本次运行匹配 \(counts.runningMatched) · 本次符合条件 \(counts.eligible)")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("cleanup-authorization-counts")
+
+            Picker("名单", selection: $tab) {
+                ForEach(CleanupAuthorizationTab.allCases) { item in
+                    Text(item.title).tag(item)
+                }
             }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .accessibilityIdentifier("cleanup-authorization-tab")
+
+            HStack {
+                TextField("搜索名称或 bundle 标识", text: $query)
+                    .textFieldStyle(.roundedBorder)
+                if !query.isEmpty {
+                    Button("清除搜索", systemImage: "xmark.circle") { query = "" }
+                        .buttonStyle(.borderless)
+                }
+                Button { cleanup.refreshApplications() } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help("刷新应用")
+                .disabled(cleanup.isRefreshing || cleanup.isBusy)
+            }
+            if cleanup.isRefreshing {
+                Text("正在刷新；当前列表仍是上次读取结果")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    ForEach(cleanup.applications.filter { query.isEmpty || $0.application.name.localizedCaseInsensitiveContains(query) }) { observation in
-                        let app = observation.application
-                        Toggle(isOn: Binding(get: { cleanup.isAuthorized(app) }, set: { cleanup.setAuthorized(app, $0) })) {
-                            HStack(spacing: 10) {
-                                ProcessAppIcon(process: app.process)
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(app.name).font(.subheadline).lineLimit(1)
-                                    Text(observation.protection ?? "允许后可正常退出")
-                                        .font(.caption2).foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                Text(SimpleMonitorPresentation.memory(app.process.physicalFootprintBytes))
-                                    .font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                    if tab == .authorized {
+                        if authorizedEntries.isEmpty {
+                            emptyState(
+                                title: cleanup.authorizations.isEmpty ? "还没有已授权应用" : "没有匹配的已授权应用",
+                                detail: cleanup.authorizations.isEmpty
+                                    ? "在“可添加”中选择应用，授权只影响之后明确确认的清理。"
+                                    : "尝试清除搜索或切换到“可添加”。"
+                            )
+                        } else {
+                            ForEach(authorizedEntries) { entry in
+                                authorizedRow(entry)
+                                Divider()
                             }
-                        }.toggleStyle(.checkbox).padding(.vertical, 10).disabled(cleanup.isBusy)
-                            .accessibilityIdentifier("cleanup-allow-\(app.authorization.bundleIdentifier)")
-                        Divider()
-                    }
-                    if cleanup.applications.isEmpty {
-                        Text(cleanup.isRefreshing ? "正在读取应用…" : "没有可添加的应用")
-                            .font(.subheadline).foregroundStyle(.secondary).padding(.vertical, 40)
+                        }
+                    } else if addableApplications.isEmpty {
+                        emptyState(
+                            title: cleanup.applications.isEmpty
+                                ? (cleanup.isRefreshing ? "正在读取应用…" : "没有可添加的应用")
+                                : "没有匹配的可添加应用",
+                            detail: cleanup.applications.isEmpty
+                                ? "应用读取完成后会显示在这里；系统保护对象不会出现。"
+                                : "尝试清除搜索；已授权应用请在“已授权”中管理。"
+                        )
+                    } else {
+                        ForEach(addableApplications) { observation in
+                            addableRow(observation)
+                            Divider()
+                        }
                     }
                 }
-            }.frame(minHeight: 180, maxHeight: .infinity)
+            }
+            .frame(minHeight: 180, maxHeight: .infinity)
+
             if let summary = cleanup.inventory.skippedSummary {
                 Text("另有 \(cleanup.inventory.skippedCount) 个应用无法评估：\(summary)")
                     .font(.caption2)
@@ -266,10 +332,63 @@ struct CleanupApplicationsSheet: View {
                 Button("全部取消授权") { cleanup.revokeAll() }.buttonStyle(.borderless)
                     .disabled(cleanup.authorizations.isEmpty)
                 Spacer()
-                Text("已允许 \(cleanup.authorizations.count) 个应用").font(.caption).foregroundStyle(.secondary)
                 Button("完成") { dismiss() }.keyboardShortcut(.defaultAction)
             }
-        }.padding(24).frame(width: 520, height: 480)
+        }.padding(24).frame(width: 540, height: 500)
             .task { cleanup.refreshApplications() }
+    }
+
+    @ViewBuilder
+    private func authorizedRow(_ entry: CleanupAuthorizationEntry) -> some View {
+        HStack(spacing: 10) {
+            if let observation = entry.observation {
+                ProcessAppIcon(process: observation.application.process)
+            } else {
+                Image(systemName: "app.dashed")
+                    .frame(width: 27, height: 27)
+                    .foregroundStyle(.secondary)
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text(entry.displayName).font(.subheadline).lineLimit(1)
+                Text(entry.detail)
+                    .font(.caption2)
+                    .foregroundStyle(entry.state == .identityChanged ? .orange : .secondary)
+            }
+            Spacer()
+            Button("撤销", role: .destructive) {
+                cleanup.revoke(entry.authorization)
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel("撤销 \(entry.displayName)")
+        }
+        .padding(.vertical, 9)
+    }
+
+    @ViewBuilder
+    private func addableRow(_ observation: CleanupObservation) -> some View {
+        let app = observation.application
+        Toggle(isOn: Binding(get: { cleanup.isAuthorized(app) }, set: { cleanup.setAuthorized(app, $0) })) {
+            HStack(spacing: 10) {
+                ProcessAppIcon(process: app.process)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(app.name).font(.subheadline).lineLimit(1)
+                    Text(observation.protection ?? "允许后可正常退出")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text(SimpleMonitorPresentation.memory(app.process.physicalFootprintBytes))
+                    .font(.caption).monospacedDigit().foregroundStyle(.secondary)
+            }
+        }.toggleStyle(.checkbox).padding(.vertical, 9).disabled(cleanup.isBusy)
+            .accessibilityIdentifier("cleanup-allow-\(app.authorization.bundleIdentifier)")
+    }
+
+    private func emptyState(title: String, detail: String) -> some View {
+        VStack(spacing: 8) {
+            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+            Text(title).font(.subheadline.weight(.medium))
+            Text(detail).font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity, minHeight: 160)
     }
 }

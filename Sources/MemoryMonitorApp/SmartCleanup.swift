@@ -43,6 +43,76 @@ struct CleanupAuthorization: Codable, Hashable, Sendable {
     }
 }
 
+struct CleanupAuthorizationMetadata: Codable, Equatable, Sendable {
+    let bundleIdentifier: String
+    let bundlePath: String
+    let executablePath: String
+    let bundleInode: UInt64?
+    let executableInode: UInt64?
+    let displayName: String
+
+    init(authorization: CleanupAuthorization, displayName: String) {
+        self.bundleIdentifier = authorization.bundleIdentifier
+        self.bundlePath = authorization.bundlePath
+        self.executablePath = authorization.executablePath
+        self.bundleInode = authorization.bundleInode
+        self.executableInode = authorization.executableInode
+        self.displayName = displayName
+    }
+
+    func matches(_ authorization: CleanupAuthorization) -> Bool {
+        bundleIdentifier == authorization.bundleIdentifier
+            && bundlePath == authorization.bundlePath
+            && executablePath == authorization.executablePath
+            && bundleInode == authorization.bundleInode
+            && executableInode == authorization.executableInode
+    }
+}
+
+struct CleanupAuthorizationEntry: Identifiable, Equatable, Sendable {
+    enum State: String, Equatable, Sendable {
+        case running
+        case notObserved
+        case identityChanged
+
+        var displayName: String {
+            switch self {
+            case .running: return "正在运行，身份一致"
+            case .notObserved: return "未运行或当前未观察到"
+            case .identityChanged: return "身份已变化，需重新确认"
+            }
+        }
+    }
+
+    let authorization: CleanupAuthorization
+    let displayName: String
+    let state: State
+    let observation: CleanupObservation?
+
+    var id: String {
+        [
+            authorization.bundleIdentifier,
+            authorization.bundlePath,
+            authorization.executablePath,
+            authorization.bundleInode.map(String.init) ?? "-",
+            authorization.executableInode.map(String.init) ?? "-"
+        ].joined(separator: "|")
+    }
+
+    var detail: String {
+        if let observation {
+            return observation.protection ?? "允许后可正常退出"
+        }
+        return state.displayName
+    }
+}
+
+struct CleanupAuthorizationCounts: Equatable, Sendable {
+    let total: Int
+    let runningMatched: Int
+    let eligible: Int
+}
+
 struct CleanupApplication: Identifiable, Equatable, Sendable {
     let process: ProcessSnapshot
     let authorization: CleanupAuthorization
@@ -264,6 +334,8 @@ final class SmartCleanupController: ObservableObject {
     private let eligibilityPolicy: CleanupEligibilityPolicy
     private let executionEnabled: Bool
     private let approvalKey = "smartCleanup.authorizedApplications.v1"
+    private let metadataKey = "smartCleanup.authorizationMetadata.v1"
+    private var authorizationMetadata: [CleanupAuthorization: String] = [:]
     private var task: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
     private var wantsSkip = false
@@ -293,6 +365,21 @@ final class SmartCleanupController: ObservableObject {
             }
         } else {
             authorizations = []
+        }
+        if executionEnabled, let data = defaults.data(forKey: metadataKey),
+           let saved = try? JSONDecoder().decode([CleanupAuthorizationMetadata].self, from: data) {
+            for item in saved {
+                let authorization = CleanupAuthorization(
+                    bundleIdentifier: item.bundleIdentifier,
+                    bundlePath: item.bundlePath,
+                    executablePath: item.executablePath,
+                    bundleInode: item.bundleInode,
+                    executableInode: item.executableInode
+                )
+                if authorizations.contains(authorization) {
+                    authorizationMetadata[authorization] = item.displayName
+                }
+            }
         }
     }
 
@@ -337,25 +424,102 @@ final class SmartCleanupController: ObservableObject {
         authorizations.contains(application.authorization)
     }
 
+    var authorizationEntries: [CleanupAuthorizationEntry] {
+        let observations = applications
+        return authorizations.map { authorization in
+            let exact = observations.first { $0.application.authorization == authorization }
+            let sameBundle = observations.first {
+                $0.application.authorization.bundleIdentifier == authorization.bundleIdentifier
+            }
+            let state: CleanupAuthorizationEntry.State
+            if exact != nil {
+                state = .running
+            } else if sameBundle != nil {
+                state = .identityChanged
+            } else {
+                state = .notObserved
+            }
+            return CleanupAuthorizationEntry(
+                authorization: authorization,
+                displayName: authorizationMetadata[authorization]
+                    ?? authorization.bundleIdentifier,
+                state: state,
+                observation: exact
+            )
+        }.sorted {
+            if $0.displayName != $1.displayName { return $0.displayName < $1.displayName }
+            return $0.id < $1.id
+        }
+    }
+
+    var authorizationCounts: CleanupAuthorizationCounts {
+        let entries = authorizationEntries
+        return CleanupAuthorizationCounts(
+            total: entries.count,
+            runningMatched: entries.filter { $0.state == .running }.count,
+            eligible: entries.filter {
+                guard let observation = $0.observation else { return false }
+                return eligibilityPolicy.decision(for: observation).isAllowed
+            }.count
+        )
+    }
+
     func setAuthorized(_ application: CleanupApplication, _ authorized: Bool) {
         // Revocation is allowed even while a batch is running.
         guard !authorized || !isBusy else { return }
         var next = authorizations
         if authorized { next.insert(application.authorization) }
         else { next.remove(application.authorization) }
-        persist(next)
+        guard persist(next) else { return }
+        if authorized {
+            authorizationMetadata[application.authorization] = application.name
+        } else {
+            authorizationMetadata.removeValue(forKey: application.authorization)
+        }
+        persistMetadata()
     }
 
-    func revokeAll() { persist([]) }
+    func revoke(_ authorization: CleanupAuthorization) {
+        var next = authorizations
+        next.remove(authorization)
+        guard persist(next) else { return }
+        authorizationMetadata.removeValue(forKey: authorization)
+        persistMetadata()
+    }
 
-    private func persist(_ next: Set<CleanupAuthorization>) {
-        guard executionEnabled else { return }
+    func revokeAll() {
+        guard persist([]) else { return }
+        authorizationMetadata.removeAll()
+        persistMetadata()
+    }
+
+    @discardableResult
+    private func persist(_ next: Set<CleanupAuthorization>) -> Bool {
+        guard executionEnabled else { return false }
         guard let encoded = try? JSONEncoder().encode(Array(next)) else {
             notice = "无法保存清理名单，请重试。"
-            return
+            return false
         }
         defaults.set(encoded, forKey: approvalKey)
+        guard defaults.data(forKey: approvalKey) == encoded else {
+            notice = "无法确认清理名单已保存，请重试。"
+            return false
+        }
         authorizations = next
+        return true
+    }
+
+    private func persistMetadata() {
+        guard executionEnabled else { return }
+        let records = authorizationMetadata.map { authorization, name in
+            CleanupAuthorizationMetadata(authorization: authorization, displayName: name)
+        }
+        guard !records.isEmpty else {
+            defaults.removeObject(forKey: metadataKey)
+            return
+        }
+        guard let encoded = try? JSONEncoder().encode(records) else { return }
+        defaults.set(encoded, forKey: metadataKey)
     }
 
     func refreshApplications() {
