@@ -1,7 +1,7 @@
 # 产品体验 U1–U8 候选交付记录
 
 日期：2026-10-23  
-实现源码：`e6d9d9d`（当前复审修复源码）
+实现源码：`d8ac280`（当前复审修复源码）
 产品版本：1.4.2 (142)，**未 bump、未部署**
 
 ## 交付范围
@@ -15,21 +15,21 @@
 | U5 | `cfe9562` | 原始峰值/取点、压缩/交换增量、工作组质量、覆盖与断档 |
 | U6 | `edf17d4` | 会话搜索/排序/展开/历史范围、跟随系统、快捷键、高级工具入口 |
 | U7 | `b7d15b7` | 可见面需求合并、系统/进程间隔分层、生命周期注销 |
-| U8 | `e6d9d9d` | 预览失效、实际滚动锚点、原生结果来源记录 |
+| U8 | `d8ac280` | 预览失效、实际滚动锚点、滚动回归测试、原生结果来源记录 |
 
 ## 验证证据
 
 | 项目 | 结果 |
 | --- | --- |
-| 完整 `verify-release.sh` | `/private/tmp/mm-ux-u8-gate-c687ded`，`status=failed`；`DesktopMotionTests` inactive。当前源码 `e6d9d9d` 的修复后完整门禁尚未重跑 |
-| 非原生 artifact gate | `/private/tmp/mm-ux-u8-gate-e6d9d9d-noskip`，`status=passed`，`native_tests=skipped`（不冒充完整原生通过） |
-| 源码/构建 | source `e6d9d9d`，checkout clean，build inputs digest `5ee2f144a822265d2f5efd4ad8956f0acf2989b2aeb1f6283cde36739296c3ea` |
+| 完整 `verify-release.sh` | 最近尝试 `/private/tmp/mm-ux-u8-gate-c687ded`，`status=failed`；当前源码 `d8ac280` 的完整门禁尚未重跑 |
+| 非原生 artifact gate | `/private/tmp/mm-ux-u8-gate-d8ac280-noskip`，`status=passed`，`native_tests=skipped`（不冒充完整原生通过） |
+| 源码/构建 | source `d8ac280`，checkout clean，build inputs digest `e4eb2478dc4586f01f8e41c486b0796294122426aadd3f35541241e2e12246c3` |
 | 非 GUI | 423 项通过；`non_gui_test_scope` 通过 |
 | 原生（历史全绿，独立运行） | 源码 `9672820` 的完整门禁 7/7：`/private/tmp/mm-ux-u8-gate/native-tests`（CleanupMotion 2、DesktopMotion 1、DesktopWindow 3、SmartCleanupNative 1）；这是修复前源码结果 |
-| 原生（当前源码，独立运行） | 源码 `e6d9d9d`：6/7；CleanupMotion 2、DesktopWindow 3、SmartCleanupNative 1 通过，DesktopMotion 1 因 inactive 失败；日志 `/private/tmp/mm-ux-native-e6d9d9d`；不能写成完整门禁 7/7 |
+| 原生（当前源码，独立运行） | 源码 `d8ac280`：**7/8**；CleanupMotion 2、DesktopWindow 4（含滚动回归）、SmartCleanupNative 1 通过，DesktopMotion 1 因 inactive 失败；日志 `/private/tmp/mm-ux-native-d8ac280`；不能写成完整门禁全绿 |
 | 产物 | 签名、BuildProvenance、probe、兼容性报告、桌面报告、输入稳定性均通过 |
-| CI | [run 39957566763](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/39957566763)，macOS 15 arm64 成功 |
-| UI fixture | `/private/tmp/mm-ux-ui-check-e6d9d9d`，Launch Services 启动、240 历史/239 journal/12 审计；本次 PID 已停止 |
+| CI | [run 39960333605](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/39960333605)，macOS 15 arm64 成功 |
+| UI fixture | `/private/tmp/mm-ux-ui-check-d8ac280`，Launch Services 启动、240 历史/239 journal/12 审计；本次 PID 已停止 |
 | 性能 | U7 连续性能对照**未执行**，见 [product-experience-performance-u7.md](product-experience-performance-u7.md) |
 
 ## A01–A18 覆盖
@@ -45,8 +45,8 @@
 - A12/A13：U1 只读检查前后文件/hash/权限/mtime 不变、未完成恢复标记可见；
   摘要白名单、0600、拒绝覆盖测试。
 - A14：生产 fixture 执行总闸保持关闭；UI fixture 只启动隔离实例。
-- A15/A16：U6 会话上下文、搜索命中成员、稳定排序、滚动锚点、跟随系统、
-  快捷键和高级工具入口；原生 DesktopWindow/SmartCleanup 套件通过。
+- A15/A16：U6 会话上下文、搜索命中成员、稳定排序、实际滚动锚点、跟随系统、
+  快捷键和高级工具入口；DesktopWindow 4/4（含连续滚动回归）通过。
 - A17：U7 需求合并/压力合并/稀疏页面/多消费者生命周期测试；性能对照待补。
 - A18：上述完整门禁、CI、来源和输入稳定性证据。
 
