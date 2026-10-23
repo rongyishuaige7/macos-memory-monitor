@@ -8,7 +8,10 @@ import MemoryMonitorCore
 @MainActor
 final class DesktopScrollTests: XCTestCase {
     func testProcessListDoesNotRecenterWhileScrolling() async throws {
-        try XCTSkipIf(NSScreen.screens.isEmpty, "requires an active macOS desktop")
+        try XCTSkipIf(
+            ProcessInfo.processInfo.environment["CI"] != nil || NSScreen.screens.isEmpty,
+            "requires an active macOS desktop outside CI"
+        )
         let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
         let apps = (1...30).map { cleanupApp($0) }
         let processes = apps.map(\.process)
