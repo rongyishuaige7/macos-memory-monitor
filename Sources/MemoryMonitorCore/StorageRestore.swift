@@ -11,6 +11,7 @@ public enum StorageRestoreError: Error, CustomStringConvertible, LocalizedError,
     case readFailed
     case writeFailed
     case rollbackFailed
+    case manualRecoveryRequired
 
     public var description: String {
         switch self {
@@ -22,6 +23,8 @@ public enum StorageRestoreError: Error, CustomStringConvertible, LocalizedError,
         case .readFailed: return "无法读取备份或当前数据"
         case .writeFailed: return "无法写入恢复数据"
         case .rollbackFailed: return "恢复失败且回滚未完成，请保留现场并运行 storage recover"
+        case .manualRecoveryRequired:
+            return "旧版恢复事务缺少完整性清单，已拒绝自动回滚；请保留现场并人工恢复"
         }
     }
 }
@@ -279,6 +282,12 @@ public enum StorageRestore {
             try removeIfExists(markerURL)
             return StorageRestoreResult(restoredFiles: 0, previousDataRetained: true)
         }
+        guard marker.currentFiles != nil else {
+            // Older markers cannot prove the copy is complete. Refuse to
+            // delete live data automatically; keep the marker and both copies
+            // for manual recovery.
+            throw StorageRestoreError.manualRecoveryRequired
+        }
         guard let currentInfo = try? fileInfo(currentBackupURL.path),
               currentInfo.isDirectory,
               !currentInfo.isSymlink else {
@@ -395,9 +404,7 @@ public enum StorageRestore {
             throw StorageRestoreError.invalidBackup("恢复事务副本缺失")
         }
         guard let expected = marker.currentFiles else {
-            // Markers written before the manifest field was introduced cannot
-            // prove completeness; retain the directory check only.
-            return
+            throw StorageRestoreError.manualRecoveryRequired
         }
         let actual = try snapshotCurrentFiles(at: url)
         guard actual == expected else {

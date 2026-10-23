@@ -165,7 +165,11 @@ final class StorageRestoreTests: XCTestCase {
         try FileManager.default.createDirectory(at: currentBackup, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: stage, withIntermediateDirectories: true)
         try Data("previous".utf8).write(to: currentBackup.appendingPathComponent("history.json"))
-        try writeMarker(currentBackup: currentBackup, stage: stage)
+        try writeMarker(
+            currentBackup: currentBackup,
+            stage: stage,
+            currentFiles: [try markerFile("history.json", "previous")]
+        )
 
         _ = try StorageRestore.recover(root: root)
         let second = try StorageRestore.recover(root: root)
@@ -181,7 +185,7 @@ final class StorageRestoreTests: XCTestCase {
         let missing = root.appendingPathComponent(".missing-current", isDirectory: true)
         let stage = root.appendingPathComponent(".restore-stage", isDirectory: true)
         try FileManager.default.createDirectory(at: stage, withIntermediateDirectories: true)
-        try writeMarker(currentBackup: missing, stage: stage)
+        try writeMarker(currentBackup: missing, stage: stage, currentFiles: [])
 
         XCTAssertThrowsError(try StorageRestore.recover(root: root)) { error in
             guard case StorageRestoreError.invalidBackup = error else {
@@ -198,6 +202,12 @@ final class StorageRestoreTests: XCTestCase {
         let relativePath: String
         let byteCount: Int
         let sha256: String
+    }
+
+    private func markerFile(_ path: String, _ value: String) throws -> MarkerFile {
+        let data = Data(value.utf8)
+        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        return MarkerFile(relativePath: path, byteCount: data.count, sha256: digest)
     }
 
     private func writeMarker(
@@ -295,26 +305,11 @@ final class StorageRestoreTests: XCTestCase {
         try FileManager.default.createDirectory(at: currentBackup, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: stage, withIntermediateDirectories: true)
         try Data("previous".utf8).write(to: currentBackup.appendingPathComponent("history.json"))
-
-        struct Marker: Codable {
-            let schemaVersion: Int
-            let id: String
-            let createdAt: Date
-            let phase: String
-            let currentBackup: String
-            let stage: String
-        }
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        let marker = Marker(
-            schemaVersion: 1,
-            id: "test",
-            createdAt: Date(timeIntervalSince1970: 1),
-            phase: "prepared",
-            currentBackup: currentBackup.path,
-            stage: stage.path
+        try writeMarker(
+            currentBackup: currentBackup,
+            stage: stage,
+            currentFiles: [try markerFile("history.json", "previous")]
         )
-        try encoder.encode(marker).write(to: MaintenanceTransaction.url(root: root))
 
         let result = try StorageRestore.recover(root: root)
         XCTAssertTrue(result.previousDataRetained)
@@ -324,6 +319,27 @@ final class StorageRestoreTests: XCTestCase {
         )
         XCTAssertFalse(FileManager.default.fileExists(atPath: MaintenanceTransaction.url(root: root).path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: currentBackup.path))
+    }
+
+    func testLegacyPreparedMarkerIsRefusedWithoutDeletingData() throws {
+        try write("current", to: "history.json")
+        let currentBackup = root.appendingPathComponent(".restore-current", isDirectory: true)
+        let stage = root.appendingPathComponent(".restore-stage", isDirectory: true)
+        try FileManager.default.createDirectory(at: currentBackup, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: stage, withIntermediateDirectories: true)
+        try Data("previous".utf8).write(to: currentBackup.appendingPathComponent("history.json"))
+        try writeMarker(currentBackup: currentBackup, stage: stage)
+
+        XCTAssertThrowsError(try StorageRestore.recover(root: root)) { error in
+            guard case StorageRestoreError.manualRecoveryRequired = error else {
+                return XCTFail("expected manualRecoveryRequired, got \(error)")
+            }
+        }
+        XCTAssertEqual(
+            try String(contentsOf: root.appendingPathComponent("history.json"), encoding: .utf8),
+            "current"
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: MaintenanceTransaction.url(root: root).path))
     }
 
     func testRestoreRefusesPendingTransaction() throws {

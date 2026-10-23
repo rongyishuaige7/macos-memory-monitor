@@ -462,6 +462,26 @@ final class SmartCleanupTests: XCTestCase {
         XCTAssertTrue(disabled.authorizations.isEmpty)
     }
 
+    func testFourthInventoryRequestCannotClearNewWorker() async {
+        let scanner = ControlledCleanupScanner()
+        let runtime = LiveSmartCleanupRuntime(sampler: scanner)
+        async let first = runtime.inventoryReport()
+        let firstStarted = await Task.detached { waitForSemaphore(scanner.started, timeout: 2) }.value
+        XCTAssertTrue(firstStarted)
+
+        async let second = runtime.inventoryReport()
+        async let third = runtime.inventoryReport()
+        async let fourth = runtime.inventoryReport()
+        try? await Task.sleep(for: .milliseconds(100))
+        scanner.release.signal()
+
+        let secondWorkerStarted = await Task.detached { waitForSemaphore(scanner.started, timeout: 2) }.value
+        XCTAssertTrue(secondWorkerStarted)
+        scanner.release.signal()
+        _ = await (first, second, third, fourth)
+        XCTAssertEqual(scanner.maximumActive, 1)
+    }
+
     func testConcurrentInventoryRequestsUseOneScanWorker() async {
         let scanner = SlowCleanupScanner()
         let runtime = LiveSmartCleanupRuntime(sampler: scanner)
@@ -471,6 +491,53 @@ final class SmartCleanupTests: XCTestCase {
         async let fourth = runtime.inventoryReport()
         _ = await (first, second, third, fourth)
         XCTAssertEqual(scanner.maximumActive, 1)
+    }
+}
+
+private func waitForSemaphore(_ semaphore: DispatchSemaphore, timeout: TimeInterval) -> Bool {
+    semaphore.wait(timeout: .now() + timeout) == .success
+}
+
+private final class ControlledCleanupScanner: CleanupProcessScanning, @unchecked Sendable {
+    let started = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var active = 0
+    private var maximum = 0
+
+    var maximumActive: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return maximum
+    }
+
+    func sampleDetailed(
+        at timestamp: Date,
+        budget: ProcessScanBudget?
+    ) throws -> ProcessSamplingResult {
+        lock.lock()
+        active += 1
+        maximum = max(maximum, active)
+        lock.unlock()
+        started.signal()
+        _ = release.wait(timeout: .now() + 5)
+        lock.lock()
+        active -= 1
+        lock.unlock()
+        return ProcessSamplingResult(
+            processes: [],
+            listedProcessCount: 0,
+            sampledProcessCount: 0,
+            skippedProcessCount: 0,
+            status: .unavailable(message: "test")
+        )
+    }
+
+    func descendantProcessIDs(
+        of rootPID: Int32,
+        budget: ProcessScanBudget?
+    ) throws -> Set<Int32> {
+        []
     }
 }
 

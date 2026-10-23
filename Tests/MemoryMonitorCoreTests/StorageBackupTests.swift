@@ -105,8 +105,31 @@ final class StorageBackupTests: XCTestCase {
         try writeV1()
         let auditURL = root.appendingPathComponent("actions.jsonl")
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: auditURL.path)
-        try Data(repeating: 0x0A, count: ProcessActionAuditStore.maximumFileBytes + 1)
-            .write(to: auditURL)
+        let event = ProcessActionAuditEvent(
+            id: "oversized",
+            operationID: "oversized-op",
+            timestamp: Date(timeIntervalSince1970: 1_700_000_000),
+            action: .gracefulExit,
+            phase: .terminal,
+            outcome: .completed,
+            processLabel: "worker",
+            detail: "valid JSONL line"
+        )
+        let encoder = JSONEncoder()
+        let format = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+        encoder.dateEncodingStrategy = .custom { date, encoder in
+            var container = encoder.singleValueContainer()
+            try container.encode(format.format(date))
+        }
+        var line = try encoder.encode(event)
+        line.append(0x0A)
+        XCTAssertLessThanOrEqual(line.count, ProcessActionAuditStore.maximumLineBytes)
+        var data = Data()
+        data.reserveCapacity(ProcessActionAuditStore.maximumFileBytes + line.count)
+        while data.count <= ProcessActionAuditStore.maximumFileBytes {
+            data.append(line)
+        }
+        try data.write(to: auditURL)
         let manifest = try StorageBackup.create(root: root, output: output)
         XCTAssertFalse(manifest.restorable)
         XCTAssertTrue(manifest.files.contains { $0.role == "audit" && $0.present })
