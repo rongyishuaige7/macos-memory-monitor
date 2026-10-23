@@ -8,9 +8,9 @@ struct DesktopRelease: View {
     @ObservedObject var navigation: DesktopNavigation
     @State private var showsApplications = false
     @State private var showsResults = false
-    @State private var showsCleanupConfirmation = false
-    @State private var confirmationRequest: UUID?
-    @State private var confirmedApplications: [CleanupApplication] = []
+    @State private var preview: CleanupPreview?
+    @State private var previewRequest: UUID?
+    @State private var previewNotice: String?
     @AppStorage("desktopMotionEnabled") private var motionEnabled = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -40,9 +40,13 @@ struct DesktopRelease: View {
                         }
                     } else {
                         Button {
-                            if cleanup.authorizations.isEmpty { showsApplications = true }
-                            else { confirmationRequest = UUID() }
-                        } label: { Label("智能释放", systemImage: "sparkles") }
+                            if cleanup.authorizations.isEmpty {
+                                showsApplications = true
+                            } else {
+                                previewNotice = nil
+                                previewRequest = UUID()
+                            }
+                        } label: { Label("检查可退出应用", systemImage: "sparkles") }
                             .buttonStyle(MonitorPrimaryButtonStyle()).disabled(!cleanup.canStart || cleanup.isRefreshing)
                             .accessibilityIdentifier("cleanup-start")
                     }
@@ -53,6 +57,12 @@ struct DesktopRelease: View {
                         .foregroundStyle(.secondary)
                 } else if let reason = cleanup.startAvailability.reason, !cleanup.canStart {
                     Text(reason)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                if let previewNotice {
+                    Text(previewNotice)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -95,36 +105,35 @@ struct DesktopRelease: View {
                 .frame(maxWidth: 760).frame(maxWidth: .infinity)
         }
         .sheet(isPresented: $showsApplications) { CleanupApplicationsSheet(cleanup: cleanup) }
-        .confirmationDialog(
-            "请求退出这些应用？",
-            isPresented: $showsCleanupConfirmation,
-            titleVisibility: .visible
-        ) {
-            Button("请求正常退出", role: .destructive) {
-                cleanup.start(confirmedApplications: confirmedApplications)
-            }
-            Button("取消", role: .cancel) {}
-        } message: {
-            Text(cleanupConfirmationMessage)
+        .sheet(item: $preview) { frozen in
+            CleanupPreviewSheet(
+                preview: frozen,
+                now: { cleanup.currentTime },
+                onConfirm: { selected in
+                    cleanup.start(confirmedApplications: selected.selectedApplications)
+                },
+                onCancel: {},
+                onRecheck: { previewRequest = UUID() }
+            )
         }
         .onChange(of: cleanup.phase) { if cleanup.phase == .scanning { showsResults = false } }
-        .task(id: confirmationRequest) {
-            guard confirmationRequest != nil else { return }
+        .task(id: previewRequest) {
+            guard previewRequest != nil else { return }
             cleanup.refreshApplications()
             await cleanup.waitUntilRefreshed()
-            guard !Task.isCancelled, cleanup.canStart else { return }
-            confirmedApplications = cleanup.confirmationApplications
-            showsCleanupConfirmation = true
+            guard !Task.isCancelled else { return }
+            if let frozen = cleanup.makePreview() {
+                preview = frozen
+                previewNotice = nil
+            } else if let metrics = cleanup.inventory.metrics, !metrics.complete {
+                previewNotice = "本次检查未完成，无法确定可退出对象；请重新检查。"
+            } else if cleanup.confirmationApplications.isEmpty {
+                previewNotice = "本次检查完成，但没有同时满足条件的应用；可查看清理名单或稍后重试。"
+            } else {
+                previewNotice = "检查未完成，请稍后重试。"
+            }
+            previewRequest = nil
         }
-    }
-
-    private var cleanupConfirmationMessage: String {
-        let apps = confirmedApplications
-        guard !apps.isEmpty else {
-            return "当前没有同时满足“已授权、不在使用中、CPU 不忙碌”的应用。不会发送退出请求。"
-        }
-        let names = apps.map(\.name).joined(separator: "、")
-        return "将请求退出 \(apps.count) 个应用：\(names)。只发送正常退出请求，不会强制结束；应用可能拒绝或询问是否保存。"
     }
 
     private var instrument: some View {

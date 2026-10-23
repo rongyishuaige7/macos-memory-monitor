@@ -307,6 +307,21 @@ final class SmartCleanupController: ObservableObject {
         return .enabled
     }
     var canStart: Bool { startAvailability.isEnabled }
+    var currentTime: TimeInterval { runtime.now }
+
+    /// Freezes the latest complete inventory into a finite preview. A failed,
+    /// incomplete or still-refreshing inventory never becomes a confirmation.
+    func makePreview(now: TimeInterval? = nil) -> CleanupPreview? {
+        guard executionEnabled, !isBusy, !isRefreshing, !shuttingDown else { return nil }
+        if let metrics = inventory.metrics, !metrics.complete { return nil }
+        let candidates = confirmationApplications
+        guard !candidates.isEmpty else { return nil }
+        return CleanupPreview(
+            candidates: candidates,
+            inventory: inventory,
+            now: now ?? runtime.now
+        )
+    }
 
     /// The UI freezes this value after refreshing activity samples. Execution
     /// may skip these identities, but must never fill their places with others.
@@ -664,4 +679,58 @@ final class SmartCleanupController: ObservableObject {
     }
 
     deinit { task?.cancel(); refreshTask?.cancel() }
+}
+
+/// A finite, frozen selection produced after an explicit check. It contains
+/// values only; it cannot send an exit request or manufacture a new candidate.
+struct CleanupPreview: Identifiable, Equatable, Sendable {
+    static let validityInterval: TimeInterval = 30
+
+    let id: UUID
+    let createdAt: TimeInterval
+    let expiresAt: TimeInterval
+    let candidates: [CleanupApplication]
+    let inventory: CleanupInventory
+    let selectedIDs: Set<ProcessIdentity>
+
+    init(
+        id: UUID = UUID(),
+        candidates: [CleanupApplication],
+        inventory: CleanupInventory,
+        selectedIDs: Set<ProcessIdentity>? = nil,
+        now: TimeInterval
+    ) {
+        let frozen = Array(candidates.prefix(8))
+        let identities = Set(frozen.map(\.id))
+        self.id = id
+        self.createdAt = now
+        self.expiresAt = now + Self.validityInterval
+        self.candidates = frozen
+        self.inventory = inventory
+        self.selectedIDs = (selectedIDs ?? identities).intersection(identities)
+    }
+
+    var selectedApplications: [CleanupApplication] {
+        candidates.filter { selectedIDs.contains($0.id) }
+    }
+
+    var skippedSummary: String? { inventory.skippedSummary }
+
+    func isValid(at now: TimeInterval) -> Bool {
+        now.isFinite && createdAt.isFinite && expiresAt.isFinite
+            && now >= createdAt && now < expiresAt
+    }
+
+    func toggling(_ identity: ProcessIdentity, at now: TimeInterval) -> CleanupPreview {
+        guard isValid(at: now) else { return self }
+        var next = selectedIDs
+        if next.contains(identity) { next.remove(identity) } else { next.insert(identity) }
+        return CleanupPreview(
+            id: id,
+            candidates: candidates,
+            inventory: inventory,
+            selectedIDs: next,
+            now: createdAt
+        )
+    }
 }
