@@ -296,6 +296,7 @@ fixture_paths=(
 	"$audit_file"
 	"$audit_clock"
 	"$audit_lock"
+	"$storage_root/.maintenance.lock"
 	"$history_segments"/*.json(N)
 )
 for fixture_path in "${fixture_paths[@]}"; do
@@ -315,7 +316,7 @@ if [[ "$storage_permissions" != "700" ]]; then
 	exit 1
 fi
 storage_entry_count="$(find "$storage_root" -mindepth 1 -maxdepth 1 -print | awk 'END { print NR }')"
-if [[ "$storage_entry_count" != "8" ]]; then
+if [[ "$storage_entry_count" != "9" ]]; then
 	print -u2 "Fixture storage root contains an unexpected number of files: $storage_entry_count"
 	exit 1
 fi
