@@ -125,16 +125,34 @@ final class DesktopWindowTests: XCTestCase {
         hosting.layoutSubtreeIfNeeded()
         let scrollView = try XCTUnwrap(findScrollView(in: hosting))
         scrollView.layoutSubtreeIfNeeded()
-        let target: CGFloat = 260
-        scrollView.contentView.scroll(to: NSPoint(x: 0, y: target))
-        scrollView.reflectScrolledClipView(scrollView.contentView)
-        try await Task.sleep(for: .milliseconds(50))
+        window.makeKeyAndOrderFront(nil as Any?)
+        window.makeFirstResponder(scrollView)
+        let start = scrollView.contentView.bounds.origin.y
+        for _ in 0..<20 {
+            let cgEvent = try XCTUnwrap(CGEvent(
+                scrollWheelEvent2Source: nil,
+                units: .pixel,
+                wheelCount: 1,
+                wheel1: -26,
+                wheel2: 0,
+                wheel3: 0
+            ))
+            cgEvent.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+            cgEvent.setIntegerValueField(.scrollWheelEventScrollPhase, value: 2)
+            let event = try XCTUnwrap(NSEvent(cgEvent: cgEvent))
+            scrollView.scrollWheel(with: event)
+        }
+        try await Task.sleep(for: .milliseconds(200))
+        let moved = scrollView.contentView.bounds.origin.y - start
         XCTAssertEqual(
-            scrollView.contentView.bounds.origin.y,
-            target,
+            moved,
+            520,
             accuracy: 2,
-            "tracking an anchor must not recenter the user's scroll"
+            "continuous scroll must not be recentered"
         )
+        hosting.removeFromSuperview()
+        window.contentView = nil
+        window.orderOut(nil)
         window.close()
         await model.shutdown()
     }

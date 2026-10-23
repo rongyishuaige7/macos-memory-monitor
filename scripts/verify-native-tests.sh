@@ -48,5 +48,9 @@ for index in {1..4}; do
 		exit 1
 	fi
 done
-print "Native validation passed: 7 tests across 4 isolated suites"
+native_total=0
+for expected_count in "${expected_counts[@]}"; do
+	native_total=$(( native_total + expected_count ))
+done
+print "Native validation passed: $native_total tests across ${#suites[@]} isolated suites"
 print "Logs: $native_output"
