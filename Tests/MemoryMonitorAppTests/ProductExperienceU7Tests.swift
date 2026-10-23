@@ -73,6 +73,32 @@ final class ProductExperienceU7Tests: XCTestCase {
         )
     }
 
+    func testTenMinuteProcessScanCountsFollowVisibleSurfaceTargets() {
+        let policy = AdaptiveSamplingPolicy()
+        func count(_ surfaces: Set<MonitorSamplingSurface>) -> Int {
+            var lastProcess: Date?
+            var scans = 0
+            for step in 0...200 {
+                let now = Date(timeIntervalSince1970: 1_700_000_000 + Double(step) * 3)
+                let mode = policy.samplingMode(
+                    surfaces: surfaces,
+                    pressureActive: false,
+                    now: now,
+                    lastProcessSampleAt: lastProcess
+                )
+                if mode.samplesProcesses {
+                    scans += 1
+                    lastProcess = now
+                }
+            }
+            return scans
+        }
+        XCTAssertEqual(count([.processes]), 201)
+        XCTAssertEqual(count([.overview]), 41)
+        XCTAssertEqual(count([.history]), 11)
+        XCTAssertEqual(count([.settings]), 11)
+    }
+
     @MainActor
     func testPageSwitchAndRestorePreserveActualSurface() async {
         let model = MonitorViewModel(
