@@ -58,6 +58,8 @@ struct MemoryTrend: View {
     @State private var data = HistoryTrendData(records: [], hours: 1, now: .distantPast)
     private enum Selection: Equatable { case sample(Date), gap }
     @State private var selection: Selection?
+    @State private var pinned: Date?
+    @FocusState private var chartFocused: Bool
 
     private var accent: Color { scheme == .dark ? .cyan : Color(red: 0.0, green: 0.46, blue: 0.59) }
     private var peakColor: Color { scheme == .dark ? .orange : Color(red: 0.70, green: 0.36, blue: 0.02) }
@@ -65,9 +67,20 @@ struct MemoryTrend: View {
         let divisions = compact ? 2 : 4
         return (0...divisions).map { now.addingTimeInterval(-Double(hours) * 3600 * Double(divisions - $0) / Double(divisions)) }
     }
-    private var inspected: MemoryHistoryRecord? {
+    private var hovered: MemoryHistoryRecord? {
         guard case .sample(let date) = selection else { return nil }
         return data.nearest(to: date)
+    }
+
+    private var inspected: MemoryHistoryRecord? {
+        if let pinned {
+            return data.exactRecord(at: pinned)
+        }
+        return hovered
+    }
+
+    private var pinnedExpired: Bool {
+        pinned != nil && inspected == nil
     }
 
     var body: some View {
@@ -75,10 +88,21 @@ struct MemoryTrend: View {
             if detailed { summary }
             plot.frame(maxWidth: .infinity, maxHeight: .infinity)
             if detailed { inspection }
+            if detailed {
+                Text(data.coverageText)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("history-coverage")
+            }
         }
         .onChange(of: records, initial: true) { rebuild() }
-        .onChange(of: hours) { selection = nil; rebuild() }
+        .onChange(of: hours) { selection = nil; pinned = nil; rebuild() }
         .onChange(of: now) { rebuild() }
+        .onExitCommand { pinned = nil; selection = nil }
+        .focusable(detailed)
+        .focused($chartFocused)
+        .onKeyPress(.leftArrow) { movePinned(-1); return .handled }
+        .onKeyPress(.rightArrow) { movePinned(1); return .handled }
     }
 
     private var summary: some View {
@@ -88,6 +112,12 @@ struct MemoryTrend: View {
             reading("时段平均", value: data.average, color: .primary)
             Divider()
             reading("时段最高", value: data.peak?.usedFraction, color: peakColor)
+            if data.peak != nil {
+                Button("定位最高记录", systemImage: "scope") { pinPeak() }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                    .accessibilityIdentifier("history-locate-peak")
+            }
         }.frame(height: 65)
     }
 
@@ -175,7 +205,16 @@ struct MemoryTrend: View {
                         case .ended: selection = nil
                         }
                     }
-                    .gesture(DragGesture(minimumDistance: 0).onChanged { select(at: $0.location, proxy: proxy, geometry: geometry) })
+                    .gesture(DragGesture(minimumDistance: 0)
+                        .onChanged { select(at: $0.location, proxy: proxy, geometry: geometry) }
+                        .onEnded { _ in
+                            if let hovered {
+                                pinned = hovered.timestamp
+                                chartFocused = true
+                            } else {
+                                pinned = nil
+                            }
+                        })
                     .allowsHitTesting(detailed && !data.records.isEmpty)
             }
         }
@@ -200,20 +239,105 @@ struct MemoryTrend: View {
     }
 
     private var inspection: some View {
-        HStack(spacing: 8) {
-            Circle().fill(selection == nil ? accent : .secondary).frame(width: 6, height: 6)
-            if let record = inspected ?? (selection == nil ? data.records.last : nil) {
-                Text(record.timestamp.formatted(.dateTime.month().day().hour().minute())).foregroundStyle(.secondary)
-                Spacer(minLength: 8)
-                Text(HistoryTrendData.percentage(record.usedFraction)).fontWeight(.semibold).foregroundStyle(accent)
+        VStack(alignment: .leading, spacing: 6) {
+            if pinnedExpired {
+                Label("固定的样本已移出当前范围，请重新定位最高记录。", systemImage: "clock.badge.exclamationmark")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            } else if let record = inspected {
+                let sample = data.presentation(for: record)
+                HStack(spacing: 8) {
+                    if pinned != nil {
+                        Image(systemName: "pin.fill").foregroundStyle(accent)
+                    }
+                    Text(record.timestamp.formatted(.dateTime.month().day().hour().minute()))
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 8)
+                    Text(HistoryTrendData.percentage(record.usedFraction))
+                        .fontWeight(.semibold)
+                        .foregroundStyle(accent)
+                }
+                if let source = record.sourceSampledAt {
+                    Text("源采样 " + source.formatted(.dateTime.hour().minute().second()))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                HStack(spacing: 14) {
+                    Text("压缩 " + SimpleMonitorPresentation.memory(record.compressedBytes))
+                    Text("交换 " + SimpleMonitorPresentation.memory(record.swapUsedBytes))
+                }
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+                if let interval = sample.comparisonInterval,
+                   let compressed = sample.compressedDelta,
+                   let swap = sample.swapDelta {
+                    Text("较 \(Int(interval)) 秒前：压缩 \(signedBytes(compressed))，交换 \(signedBytes(swap))（仅相邻有效记录，不是流量）")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Text("相邻有效记录超过 120 秒或不存在，未计算压缩/交换增量。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Text(sample.workloadQuality.title)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(sample.workloadQuality == .complete ? Color.secondary : Color.orange)
+                ForEach(sample.topWorkloads) { workload in
+                    HStack(spacing: 6) {
+                        Text(workload.title).lineLimit(1)
+                        Spacer(minLength: 8)
+                        Text(SimpleMonitorPresentation.memory(workload.attributedFootprintBytes))
+                            .monospacedDigit()
+                        if workload.containsEstimatedFootprint {
+                            Text("估算").font(.caption2).foregroundStyle(.orange)
+                        }
+                    }
+                    .font(.caption2)
+                }
+                if sample.additionalWorkloadCount > 0 {
+                    Text("另有 \(sample.additionalWorkloadCount) 个已保存工作组，展开历史详情查看。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             } else {
-                Text(selection == nil ? "等待记录" : "此处没有记录").foregroundStyle(.secondary)
-                Spacer()
-                Text("--").foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Circle().fill(accent).frame(width: 6, height: 6)
+                    Text(selection == nil ? "悬停预览，点击固定样本" : "此处没有记录")
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("--").foregroundStyle(.secondary)
+                }
+                .font(.caption)
             }
-        }.font(.caption).monospacedDigit().frame(minHeight: 30)
-            .padding(.horizontal, 12).background(.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 6))
-            .accessibilityElement(children: .combine).accessibilityIdentifier("history-inspection")
+        }
+        .frame(minHeight: 30, alignment: .leading)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 6))
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("history-inspection")
+    }
+
+    private func pinPeak() {
+        guard let peak = data.peak else { return }
+        pinned = peak.timestamp
+        selection = .sample(peak.timestamp)
+        chartFocused = true
+    }
+
+    private func movePinned(_ direction: Int) {
+        let current = inspected?.timestamp ?? data.records.last?.timestamp
+        guard let current,
+              let target = data.adjacentRecord(to: current, direction: direction) else { return }
+        pinned = target.timestamp
+        selection = .sample(target.timestamp)
+    }
+
+    private func signedBytes(_ value: Int64) -> String {
+        if value == 0 { return "无变化" }
+        let magnitude = SimpleMonitorPresentation.memory(UInt64(abs(value)))
+        return (value > 0 ? "+" : "−") + magnitude
     }
 
     private func select(at location: CGPoint, proxy: ChartProxy, geometry: GeometryProxy) {
@@ -265,7 +389,7 @@ struct DesktopHistory: View {
                         Text("每分钟记录").foregroundStyle(.tertiary)
                     }.font(.caption2).foregroundStyle(.secondary).frame(minHeight: 22)
                     if model.historyError != nil {
-                        Label("历史记录暂时无法保存", systemImage: "exclamationmark.triangle")
+                        Label("当前历史仅在内存中保留，尚未保存到磁盘", systemImage: "exclamationmark.triangle")
                             .font(.caption).foregroundStyle(.orange)
                     }
                 }.padding(.horizontal, 28).padding(.vertical, 20)
