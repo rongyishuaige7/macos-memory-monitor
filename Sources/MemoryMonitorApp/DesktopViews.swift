@@ -411,8 +411,11 @@ struct DesktopProcesses: View {
                     .scrollTargetLayout()
                 }
                 .scrollPosition(id: $navigation.processScrollAnchor, anchor: .center)
+                // The binding above tracks the actual visible row. Do not
+                // recenter every time the binding changes: that would fight
+                // the user's continuous scroll. Restore only when this page
+                // appears again (or an explicit action moves the anchor).
                 .onAppear { restoreScroll(proxy) }
-                .onChange(of: navigation.processScrollAnchor) { restoreScroll(proxy) }
             }
             .accessibilityIdentifier("desktop-process-list")
             Divider()

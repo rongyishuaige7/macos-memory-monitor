@@ -33,7 +33,7 @@ if [[ -n "${SWIFT_SCRATCH_PATH:-}" ]]; then scratch_args=(--scratch-path "$SWIFT
 test_flags=()
 if [[ -n "${SWIFT_TEST_FLAGS:-}" ]]; then test_flags=(${=SWIFT_TEST_FLAGS}); fi
 suites=(CleanupMotionTests DesktopMotionTests DesktopWindowTests SmartCleanupNativeTests)
-expected_counts=(2 1 3 1)
+expected_counts=(2 1 4 1)
 for index in {1..4}; do
 	suite="$suites[$index]"
 	log="$native_output/$suite.log"
