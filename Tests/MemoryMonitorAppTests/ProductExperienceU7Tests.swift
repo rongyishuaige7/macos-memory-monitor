@@ -74,6 +74,28 @@ final class ProductExperienceU7Tests: XCTestCase {
     }
 
     @MainActor
+    func testPageSwitchAndRestorePreserveActualSurface() async {
+        let model = MonitorViewModel(
+            historyStore: makeTemporaryHistoryStore("u7-switch-history"),
+            processActions: makeTemporaryProcessActions("u7-switch-actions"),
+            startRefreshTask: false
+        )
+        model.setDesktopPresented(true)
+        model.setDesktopSurface(.processes, detail: false)
+        XCTAssertEqual(model.activeSamplingSurfaces, [.processes])
+        let beforeSwitch = model.samplingDemandRevision
+        model.setDesktopSurface(.history, detail: false)
+        XCTAssertEqual(model.activeSamplingSurfaces, [.history])
+        XCTAssertGreaterThan(model.samplingDemandRevision, beforeSwitch)
+
+        model.setDesktopPresented(false)
+        XCTAssertTrue(model.activeSamplingSurfaces.isEmpty)
+        model.setDesktopPresented(true)
+        XCTAssertEqual(model.activeSamplingSurfaces, [.history])
+        await model.shutdown()
+    }
+
+    @MainActor
     func testClosingOneSurfaceKeepsAnotherConsumerRegistered() async {
         let model = MonitorViewModel(
             historyStore: makeTemporaryHistoryStore("u7-surface-history"),

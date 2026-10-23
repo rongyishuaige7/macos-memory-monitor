@@ -48,13 +48,21 @@ struct HistorySamplePresentation: Equatable, Sendable {
             comparisonInterval = nil
         }
 
-        if record.workloadsSampledAt == nil {
-            workloadQuality = .unknown
-        } else if record.workloadInventoryIsComplete == false {
-            workloadQuality = .partial
-        } else if record.workloadInventoryIsComplete == true {
-            workloadQuality = record.workloads.contains { $0.containsEstimatedFootprint }
-                ? .estimated : .complete
+        if let workloadSample = record.workloadsSampledAt {
+            let skew = workloadSample.timeIntervalSince(record.timestamp)
+            if !skew.isFinite
+                || abs(skew) > HistoryStore.maximumFreshnessMarkerRecordSkew {
+                // The attribution belongs to a different wall-clock era; it
+                // cannot be presented as the workload ranking at this point.
+                workloadQuality = .unknown
+            } else if record.workloadInventoryIsComplete == false {
+                workloadQuality = .partial
+            } else if record.workloadInventoryIsComplete == true {
+                workloadQuality = record.workloads.contains { $0.containsEstimatedFootprint }
+                    ? .estimated : .complete
+            } else {
+                workloadQuality = .unknown
+            }
         } else {
             workloadQuality = .unknown
         }

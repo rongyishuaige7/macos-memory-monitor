@@ -342,6 +342,7 @@ final class SmartCleanupController: ObservableObject {
     private var shuttingDown = false
     private var cooldownUntil: TimeInterval = 0
     private var pendingExitAudits: [ProcessIdentity: String] = [:]
+    private var activePreviewID: UUID?
 
     init(runtime: (any SmartCleanupRuntime)? = nil, defaults: UserDefaults = .standard,
          operationGate: MonitorOperationGate = MonitorOperationGate(),
@@ -403,11 +404,13 @@ final class SmartCleanupController: ObservableObject {
         if let metrics = inventory.metrics, !metrics.complete { return nil }
         let candidates = confirmationApplications
         guard !candidates.isEmpty else { return nil }
-        return CleanupPreview(
+        let preview = CleanupPreview(
             candidates: candidates,
             inventory: inventory,
             now: now ?? runtime.now
         )
+        activePreviewID = preview.id
+        return preview
     }
 
     /// The UI freezes this value after refreshing activity samples. Execution
@@ -524,6 +527,7 @@ final class SmartCleanupController: ObservableObject {
 
     func refreshApplications() {
         guard executionEnabled, !isBusy, !isRefreshing, !shuttingDown else { return }
+        activePreviewID = nil
         isRefreshing = true
         refreshTask = Task { [weak self] in
             guard let self else { return }
@@ -540,7 +544,28 @@ final class SmartCleanupController: ObservableObject {
 
     private func finishRefresh() { isRefreshing = false; refreshTask = nil }
 
+    func start(preview: CleanupPreview) {
+        guard activePreviewID == preview.id else {
+            notice = "本次预览已失效，请重新检查。"
+            return
+        }
+        guard preview.isValid(at: runtime.now) else {
+            activePreviewID = nil
+            notice = "预览已过期，请重新检查；旧名单不会执行。"
+            return
+        }
+        let selected = preview.selectedApplications
+        guard !selected.isEmpty else {
+            activePreviewID = nil
+            notice = "没有选择要退出的应用。"
+            return
+        }
+        activePreviewID = nil
+        start(confirmedApplications: selected)
+    }
+
     func start(confirmedApplications: [CleanupApplication]) {
+        activePreviewID = nil
         guard canStart else { notice = "请等待当前操作结束。"; return }
         guard runtime.now >= cooldownUntil else { notice = "刚刚完成清理，请稍后再试。"; return }
         guard operationGate.acquire(.cleanup) else { return }

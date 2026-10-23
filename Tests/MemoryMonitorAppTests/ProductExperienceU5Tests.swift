@@ -91,6 +91,28 @@ final class ProductExperienceU5Tests: XCTestCase {
         XCTAssertEqual(estimated.workloadQuality, .estimated)
     }
 
+    func testDistantWorkloadAttributionIsNotComplete() {
+        let workload = PersistedWorkloadRecord(
+            id: "w", title: "Workload", processCount: 1,
+            attributedFootprintBytes: 1024, attributedResidentBytes: 1024,
+            isSystem: false
+        )
+        for offset in [-1_000.0, 1_000.0] {
+            let record = MemoryHistoryRecord(
+                timestamp: Date(timeIntervalSince1970: 10_000),
+                availableFraction: 0.5,
+                compressedBytes: 1,
+                swapUsedBytes: 2,
+                workloads: [workload],
+                workloadsSampledAt: Date(timeIntervalSince1970: 10_000 + offset),
+                workloadInventoryIsComplete: true,
+                sourceSampledAt: Date(timeIntervalSince1970: 10_000)
+            )
+            let sample = HistorySamplePresentation(record: record, previous: nil)
+            XCTAssertEqual(sample.workloadQuality, .unknown, "offset \(offset)")
+        }
+    }
+
     func testCoverageAndGapCountDoNotFillMissingSamples() {
         let records = [
             record(0, used: 0.2),

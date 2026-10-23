@@ -349,6 +349,10 @@ final class MonitorViewModel: ObservableObject {
     private var isDesktopPresented = false
     private var visibleSurfaces: Set<MonitorSamplingSurface> = []
     private var desktopSurface: MonitorSamplingSurface?
+    private var lastSurfaceSignature = ""
+    private(set) var samplingDemandRevision: UInt64 = 0
+
+    var activeSamplingSurfaces: Set<MonitorSamplingSurface> { visibleSurfaces }
     @Published private(set) var pressureLevel: MemoryPressureLevel?
     @Published private(set) var samplingDiagnostics = SamplingDiagnostics(
         mode: .background,
@@ -527,18 +531,21 @@ final class MonitorViewModel: ObservableObject {
         if presented {
             if desktopSurface == nil {
                 desktopSurface = .overview
-                visibleSurfaces.insert(.overview)
+            }
+            if let desktopSurface {
+                visibleSurfaces.insert(desktopSurface)
             }
         } else if let desktopSurface {
             visibleSurfaces.remove(desktopSurface)
-            self.desktopSurface = nil
+            // Keep the actual page so restoring the window resumes the same
+            // demand instead of silently falling back to overview.
         }
         updatePresentationState()
     }
 
     func setDesktopSurface(_ surface: MonitorSamplingSurface, detail: Bool) {
         let next = detail ? MonitorSamplingSurface.detail : surface
-        if let desktopSurface {
+        if let desktopSurface, isDesktopPresented {
             visibleSurfaces.remove(desktopSurface)
         }
         desktopSurface = next
@@ -550,8 +557,13 @@ final class MonitorViewModel: ObservableObject {
 
     private func updatePresentationState() {
         let presented = !visibleSurfaces.isEmpty
-        guard isPanelPresented != presented else { return }
-        isPanelPresented = presented
+        let signature = visibleSurfaces.map(\.rawValue).sorted().joined(separator: "|")
+        if isPanelPresented != presented {
+            isPanelPresented = presented
+        }
+        guard signature != lastSurfaceSignature else { return }
+        lastSurfaceSignature = signature
+        samplingDemandRevision &+= 1
         Task { await refreshWakeup.signal() }
     }
 

@@ -75,6 +75,18 @@ enum DesktopPresentation {
         }
     }
 
+    /// Keep already visible groups in place while live readings update.
+    /// New groups append; removed groups disappear without filling their slot.
+    static func stableGroups(
+        _ fresh: [DesktopProcessGroup],
+        previous: [DesktopProcessGroup]
+    ) -> [DesktopProcessGroup] {
+        let freshByID = Dictionary(fresh.map { ($0.id, $0) }, uniquingKeysWith: { _, new in new })
+        let previousIDs = Set(previous.map(\.id))
+        return previous.compactMap { freshByID[$0.id] }
+            + fresh.filter { !previousIDs.contains($0.id) }
+    }
+
     static func initialHistoryHours(_ records: [MemoryHistoryRecord], now: Date) -> Int {
         guard let first = records.filter({ $0.timestamp <= now }).map(\.timestamp).min() else { return 1 }
         let span = now.timeIntervalSince(first)

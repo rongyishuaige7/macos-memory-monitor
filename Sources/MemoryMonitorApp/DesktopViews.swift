@@ -360,29 +360,37 @@ struct DesktopProcesses: View {
                 Text("操作").frame(width: 32)
             }.font(.caption).foregroundStyle(.secondary).padding(.horizontal, 10)
             Divider()
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(rows) { group in
-                        Button {
-                            if group.members.count == 1 {
-                                navigation.selectedProcess = group.members.first?.identity
-                            } else if navigation.expandedProcessGroups.contains(group.id) {
-                                navigation.expandedProcessGroups.remove(group.id)
-                            } else {
-                                navigation.expandedProcessGroups.insert(group.id)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(rows) { group in
+                            Button {
+                                navigation.processScrollAnchor = group.id
+                                if group.members.count == 1 {
+                                    navigation.selectedProcess = group.members.first?.identity
+                                } else if navigation.expandedProcessGroups.contains(group.id) {
+                                    navigation.expandedProcessGroups.remove(group.id)
+                                } else {
+                                    navigation.expandedProcessGroups.insert(group.id)
+                                }
+                            } label: {
+                                groupRow(group)
                             }
-                        } label: {
-                            groupRow(group)
-                        }.buttonStyle(.plain).monitorRowHover(selected: navigation.expandedProcessGroups.contains(group.id) || !navigation.processQuery.isEmpty)
-                        if navigation.expandedProcessGroups.contains(group.id) || !navigation.processQuery.isEmpty {
-                            ForEach(group.members) { process in
-                                Button { navigation.selectedProcess = process.identity } label: {
-                                    processRow(process).padding(.leading, 20)
-                                }.buttonStyle(.plain).monitorRowHover()
+                            .id(group.id)
+                            .buttonStyle(.plain)
+                            .monitorRowHover(selected: navigation.expandedProcessGroups.contains(group.id) || !navigation.processQuery.isEmpty)
+                            if navigation.expandedProcessGroups.contains(group.id) || !navigation.processQuery.isEmpty {
+                                ForEach(group.members) { process in
+                                    Button {
+                                        navigation.processScrollAnchor = group.id
+                                        navigation.selectedProcess = process.identity
+                                    } label: {
+                                        processRow(process).padding(.leading, 20)
+                                    }.buttonStyle(.plain).monitorRowHover()
+                                }
                             }
                         }
-                    }
-                    if rows.isEmpty {
+                        if rows.isEmpty {
                         VStack(spacing: 8) {
                             ContentUnavailableView(
                                 navigation.processQuery.isEmpty ? "没有可显示的进程" : "没有搜索结果",
@@ -397,8 +405,11 @@ struct DesktopProcesses: View {
                             }
                         }
                         .frame(maxWidth: .infinity, minHeight: 180)
+                        }
                     }
                 }
+                .onAppear { restoreScroll(proxy) }
+                .onChange(of: navigation.processScrollAnchor) { restoreScroll(proxy) }
             }
             .accessibilityIdentifier("desktop-process-list")
             Divider()
@@ -406,6 +417,7 @@ struct DesktopProcesses: View {
                 Text("\(rows.count) 组 · \(rows.reduce(0) { $0 + $1.members.count }) 个进程")
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
+                Toggle("固定排序", isOn: $navigation.processOrderStable).toggleStyle(.checkbox).font(.caption)
                 Toggle("显示系统进程", isOn: $navigation.processIncludesSystem).toggleStyle(.checkbox).font(.caption)
             }
         }
@@ -413,9 +425,10 @@ struct DesktopProcesses: View {
         .onChange(of: model.processes, initial: true) { rebuild() }
         .onChange(of: model.groups) { rebuild() }
         .onChange(of: model.processCPUPercent) { rebuild() }
-        .onChange(of: navigation.processQuery) { rebuild() }
-        .onChange(of: navigation.processSort) { rebuild() }
-        .onChange(of: navigation.processIncludesSystem) { rebuild() }
+        .onChange(of: navigation.processQuery) { rebuild(preserveOrder: false) }
+        .onChange(of: navigation.processSort) { rebuild(preserveOrder: false) }
+        .onChange(of: navigation.processIncludesSystem) { rebuild(preserveOrder: false) }
+        .onChange(of: navigation.processOrderStable) { rebuild(preserveOrder: false) }
         .onChange(of: navigation.searchFocusRequest) { searchFocused = true }
     }
 
@@ -468,8 +481,8 @@ struct DesktopProcesses: View {
         .padding(.horizontal, 10).frame(minHeight: 53).contentShape(Rectangle())
     }
 
-    private func rebuild() {
-        rows = DesktopPresentation.groupedProcesses(
+    private func rebuild(preserveOrder: Bool = true) {
+        let fresh = DesktopPresentation.groupedProcesses(
             model.groups,
             processes: model.processes,
             query: navigation.processQuery,
@@ -477,6 +490,14 @@ struct DesktopProcesses: View {
             sort: navigation.processSort,
             cpu: model.processCPUPercent
         )
+        rows = preserveOrder && navigation.processOrderStable
+            ? DesktopPresentation.stableGroups(fresh, previous: rows)
+            : fresh
+    }
+
+    private func restoreScroll(_ proxy: ScrollViewProxy) {
+        guard let anchor = navigation.processScrollAnchor else { return }
+        proxy.scrollTo(anchor, anchor: .center)
     }
 }
 

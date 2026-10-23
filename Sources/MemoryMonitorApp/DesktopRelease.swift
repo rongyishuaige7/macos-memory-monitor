@@ -110,7 +110,7 @@ struct DesktopRelease: View {
                 preview: frozen,
                 now: { cleanup.currentTime },
                 onConfirm: { selected in
-                    cleanup.start(confirmedApplications: selected.selectedApplications)
+                    cleanup.start(preview: selected)
                 },
                 onCancel: {},
                 onRecheck: { previewRequest = UUID() }

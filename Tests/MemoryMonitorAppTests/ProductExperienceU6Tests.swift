@@ -39,6 +39,25 @@ final class ProductExperienceU6Tests: XCTestCase {
         XCTAssertEqual(rows.first?.members.map(\.identity), [process.identity])
     }
 
+    func testStableGroupOrderAndScrollAnchorSurviveRefresh() {
+        let first = cleanupApp(1).process
+        let second = cleanupApp(2).process
+        let third = cleanupApp(3).process
+        let groupA = DesktopProcessGroup(id: "a", title: "A", members: [first])
+        let groupB = DesktopProcessGroup(id: "b", title: "B", members: [second])
+        let groupC = DesktopProcessGroup(id: "c", title: "C", members: [third])
+        let stable = DesktopPresentation.stableGroups(
+            [groupB, groupC, groupA], previous: [groupA, groupB]
+        )
+        XCTAssertEqual(stable.map { $0.id }, ["a", "b", "c"])
+
+        let navigation = DesktopNavigation()
+        navigation.processOrderStable = false
+        navigation.processScrollAnchor = "a"
+        XCTAssertFalse(navigation.processOrderStable)
+        XCTAssertEqual(navigation.processScrollAnchor, "a")
+    }
+
     func testAppearanceFollowsSystemAndFallsBackForInvalidValues() {
         XCTAssertNil(DesktopAppearancePreference.colorScheme("system"))
         XCTAssertNil(DesktopAppearancePreference.colorScheme("unexpected"))

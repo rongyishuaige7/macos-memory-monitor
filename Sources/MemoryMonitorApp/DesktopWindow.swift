@@ -67,7 +67,9 @@ final class DesktopNavigation: ObservableObject {
     @Published var processQuery = ""
     @Published var processSort: DesktopProcessSort = .memory
     @Published var processIncludesSystem = false
+    @Published var processOrderStable = true
     @Published var expandedProcessGroups: Set<String> = []
+    @Published var processScrollAnchor: String?
     @Published var historyHours = 1
     @Published var historyRangeInitialized = false
     @Published var searchFocusRequest = UUID()

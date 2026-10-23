@@ -97,7 +97,13 @@ struct CleanupPreviewSheet: View {
                 Button("重新检查", systemImage: "arrow.clockwise") { onRecheck(); dismiss() }
                 Spacer()
                 Button("请求正常退出 \(working.selectedApplications.count) 个应用", role: .destructive) {
-                    guard valid, !working.selectedApplications.isEmpty else { return }
+                    // Re-read the clock at the confirmation edge. `valid` is
+                    // only a rendering snapshot and can be one tick stale.
+                    let current = now()
+                    tick = current
+                    guard working.isValid(at: current), !working.selectedApplications.isEmpty else {
+                        return
+                    }
                     onConfirm(working)
                     dismiss()
                 }
