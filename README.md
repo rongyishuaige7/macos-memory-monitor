@@ -55,8 +55,15 @@ UI fixture 模式禁用智能清理执行，避免演示数据触发真实应用
 [stabilization-v1.4.0.md](docs/stabilization-v1.4.0.md)。以下章节保留
 早期设计与历次实现背景，当前界面以上述文档为准。
 
-1.4.2 之后的优先级、构建来源、历史恢复、审计中断状态和性能验收方案见
-[下一阶段可靠性实施计划](docs/next-stage-reliability-plan.md)；该文档为设计，尚未实施。
+1.4.2 之后的构建来源、历史恢复、审计中断状态与扫描预算见
+[下一阶段可靠性实施计划](docs/next-stage-reliability-plan.md)。S1–S7 已实施，
+验证证据、支持矩阵及剩余外部条件见
+[S1–S7 发布记录](docs/release-readiness-s1-s7.md)；尚未 bump 或部署。
+
+下一轮 [用户体验与产品优化方案](docs/product-experience-implementation-plan.md)
+覆盖状态反馈、清理预览、授权管理、历史追溯、原生操作与采样开销，
+**U1–U8 均待实施**。执行入口见
+[给 dsh 的任务说明](docs/dsh-product-experience-handoff.md)。
 
 ## 1. 产品定位
 
