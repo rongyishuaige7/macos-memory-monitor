@@ -348,7 +348,7 @@ struct MemoryMonitorFixtureTool {
         }
         let expectedNames = Set(expectedPaths.map {
             URL(fileURLWithPath: $0).lastPathComponent
-        }).union([segmentsURL.lastPathComponent])
+        }).union([segmentsURL.lastPathComponent, ".maintenance.lock"])
         let actualNames = Set(try fileManager.contentsOfDirectory(atPath: root.path))
         guard actualNames == expectedNames else {
             throw FixtureToolError.verificationFailed(
