@@ -112,8 +112,11 @@ struct DesktopRelease: View {
                 onConfirm: { selected in
                     cleanup.start(preview: selected)
                 },
-                onCancel: {},
-                onRecheck: { previewRequest = UUID() }
+                onCancel: { cleanup.invalidatePreview() },
+                onRecheck: {
+                    cleanup.invalidatePreview()
+                    previewRequest = UUID()
+                }
             )
         }
         .onChange(of: cleanup.phase) { if cleanup.phase == .scanning { showsResults = false } }

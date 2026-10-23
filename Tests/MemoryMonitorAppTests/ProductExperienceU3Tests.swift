@@ -91,6 +91,29 @@ final class ProductExperienceU3Tests: XCTestCase {
         XCTAssertTrue(controller.notice?.contains("过期") == true)
     }
 
+    func testCancelInvalidatesPreviewBeforeConfirmation() async {
+        let runtime = FakeCleanupRuntime()
+        let app = cleanupApp(1)
+        runtime.observations = [observation(app)]
+        runtime.inventoryReportValue = CleanupInventory(
+            observations: [observation(app)],
+            metrics: completeMetrics()
+        )
+        let suite = "u3-preview-cancel-" + UUID().uuidString
+        let defaults = try! XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let controller = SmartCleanupController(runtime: runtime, defaults: defaults)
+        controller.setAuthorized(app, true)
+        controller.refreshApplications()
+        await controller.waitUntilRefreshed()
+        let preview = try! XCTUnwrap(controller.makePreview(now: 100))
+        controller.cancel()
+        controller.start(preview: preview)
+        XCTAssertFalse(controller.isBusy)
+        XCTAssertTrue(runtime.requests.isEmpty)
+        XCTAssertTrue(controller.notice?.contains("失效") == true)
+    }
+
     private func completeMetrics() -> CleanupInventoryMetrics {
         CleanupInventoryMetrics(
             generation: 1, scanCount: 1, memberCount: 1, complete: true,

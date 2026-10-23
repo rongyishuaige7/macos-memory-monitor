@@ -595,13 +595,22 @@ final class SmartCleanupController: ObservableObject {
         }
     }
 
-    func cancel() { task?.cancel() }
+    func invalidatePreview() {
+        activePreviewID = nil
+    }
+
+    func cancel() {
+        // A cancelled/closed preview must not remain confirmable.
+        activePreviewID = nil
+        task?.cancel()
+    }
     func skipCurrent() { if phase == .waiting { wantsSkip = true } }
     func waitUntilFinished() async { await task?.value }
     func waitUntilRefreshed() async { await refreshTask?.value }
 
     func shutdown() async {
         shuttingDown = true
+        activePreviewID = nil
         refreshTask?.cancel()
         task?.cancel()
         await refreshTask?.value

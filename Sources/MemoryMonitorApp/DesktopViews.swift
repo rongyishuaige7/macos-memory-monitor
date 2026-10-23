@@ -67,6 +67,7 @@ struct DesktopShell: View {
             )
         }
         .onChange(of: navigation.page) {
+            model.smartCleanup.invalidatePreview()
             model.setDesktopSurface(
                 navigation.page.samplingSurface,
                 detail: navigation.selectedProcess != nil
@@ -407,7 +408,9 @@ struct DesktopProcesses: View {
                         .frame(maxWidth: .infinity, minHeight: 180)
                         }
                     }
+                    .scrollTargetLayout()
                 }
+                .scrollPosition(id: $navigation.processScrollAnchor, anchor: .center)
                 .onAppear { restoreScroll(proxy) }
                 .onChange(of: navigation.processScrollAnchor) { restoreScroll(proxy) }
             }

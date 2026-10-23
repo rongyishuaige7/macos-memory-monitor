@@ -117,6 +117,11 @@ struct CleanupPreviewSheet: View {
             onCancel()
             dismiss()
         }
+        .onDisappear {
+            // Covers an outside-click dismissal as well as the explicit
+            // cancel/close buttons.
+            onCancel()
+        }
         .task {
             while !Task.isCancelled {
                 tick = now()
