@@ -1,7 +1,7 @@
 # S1–S7 组合验收与发布记录
 
 日期：2026-10-23
-源码 HEAD：`89779c5`
+源码 HEAD：`82e03c9`
 产品版本：1.4.2 (142)，**未 bump、未部署**
 
 ## 结论
@@ -15,14 +15,15 @@ S1–S7 的代码、数据恢复工具、审计/扫描边界和组合证据已�
 
 | 证据 | 路径/结果 |
 | --- | --- |
-| 完整门禁（当前 HEAD） | `/private/tmp/mm-s7-gate-full-89779c5`，`status=passed`，`exitCode=0` |
-| 非 GUI 测试 | 386 项通过；`non_gui_test_scope` 通过 |
+| 完整门禁（当前 HEAD） | `/private/tmp/mm-s7-gate-full-82e03c9`，`status=passed`，`exitCode=0` |
+| 非 GUI 测试 | 388 项通过；`non_gui_test_scope` 通过 |
 | 原生隔离套件 | `CleanupMotionTests` 2、`DesktopMotionTests` 1、`DesktopWindowTests` 3、`SmartCleanupNativeTests` 1，全部通过（7/7） |
-| 原生日志 | `/private/tmp/mm-s7-gate-full-89779c5/native-tests` |
-| 门禁摘要 | source `89779c5`，checkout clean，verification digest before==after |
+| 原生日志 | `/private/tmp/mm-s7-gate-full-82e03c9/native-tests` |
+| 门禁摘要 | source `82e03c9`，checkout clean，verification digest before==after |
 | 产物 | `dist/MemoryMonitor.app`，签名、provenance、probe、桌面报告均通过 |
-| CI | [run 39914746514](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/39914746514)，macOS 15 arm64 成功 |
+| CI | [run 39923010777](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/39923010777)，macOS 15 arm64 成功 |
 | 历史失败证据 | `/private/tmp/mm-s7-gate-full`（`fcf2d91`，DesktopMotion inactive）保留，未删除 |
+| 旧事务标记 | 缺少 `currentFiles` 的旧版 `prepared` 标记被拒绝自动回滚，保留数据/标记，转人工恢复 |
 | 数据升级/回滚 | v2 fixture → backup → 恢复 v1 backup → 恢复 v2 backup，最终 `healthy/segmentedV2`，无 v1/v2 混合 |
 
 ### 升级/回滚演练细节
@@ -65,7 +66,7 @@ S1–S7 的代码、数据恢复工具、审计/扫描边界和组合证据已�
 # 完整门禁（当前 HEAD 全绿）
 SWIFT_BUILD_FLAGS=--disable-sandbox \
 SWIFT_TEST_FLAGS=--disable-sandbox \
-./scripts/verify-release.sh /private/tmp/mm-s7-gate-full-89779c5
+./scripts/verify-release.sh /private/tmp/mm-s7-gate-full-82e03c9
 
 # 数据演练
 memory-monitor-fixture --storage-root /private/tmp/mm-s7-fixture-root

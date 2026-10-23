@@ -6,7 +6,7 @@
 （`14a908a`），S2/S3 审查修复已推送（`4f421b3`、`c8d0a42`），S4 已实施
 并推送（`f0b2a22`），S5 已实施并推送（`efe799b`、`39c939f`），S6 已实施
 并推送（`f869f4d`），S1–S6 复审修复已推送（`13979b6`），S7 已实施并通过
-完整门禁（`89779c5`）。
+完整门禁（`82e03c9`）。
 
 建议下一阶段以“可核对来源、可解释中断、可恢复数据”为目标。先完善发布
 证据，再补存储检查和审计中断状态，之后实施备份恢复与扫描预算。登录项
@@ -461,17 +461,17 @@ release gate 的非 GUI/独立 GUI 入口继续使用；单进程 swift test 的
 
 ## S7 最终记录（2026-10-23）
 
-状态：已完成并推送；源码 `89779c5`。完整门禁全绿，发布记录见
+状态：已完成并推送；源码 `82e03c9`。完整门禁全绿，发布记录见
 [release-readiness-s1-s7.md](release-readiness-s1-s7.md)。
 
 - 修复 fixture 对 `.maintenance.lock` 的兼容；fixture 可生成 v2 数据
   （240 历史、239 journal、12 审计、1 分段）。
 - 完成 v2 → v1 → v2 临时数据升级/回滚演练，最终 `healthy/segmentedV2`，
   无 v1/v2 混合；未对真实数据执行 restore。
-- 完整 `verify-release.sh` 于 `89779c5` 通过：非 GUI **386 项**、四套原生
+- 完整 `verify-release.sh` 于 `82e03c9` 通过：非 GUI **388 项**、四套原生
   **7/7**、构建、签名、provenance、probe、桌面报告和输入稳定性全部通过。
-- 最终门禁证据：`/private/tmp/mm-s7-gate-full-89779c5`；CI
-  [run 39914746514](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/39914746514)
+- 最终门禁证据：`/private/tmp/mm-s7-gate-full-82e03c9`；CI
+  [run 39923010777](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/39923010777)
   的 macOS 15 arm64 任务成功。
 - 历史失败证据 `/private/tmp/mm-s7-gate-full`（`fcf2d91`，DesktopMotion
   inactive）保留，未删除，也未改成 skipped。
@@ -487,5 +487,7 @@ release gate 的非 GUI/独立 GUI 入口继续使用；单进程 swift test 的
   （32 MiB）和 `maximumLineBytes`（1 MiB）；超限备份 `restorable=false`。
 - P2 扫描 worker：worker 句柄绑定 token，只有等待的旧句柄仍属当前 token 时
   才清空；四请求阻塞 fixture 最大并发 worker 为 1。
-- 验证：非 GUI **386 项**通过；最终完整门禁全绿；真实备份/临时恢复 hash
+- 旧版 `prepared` 标记缺少完整性清单时返回 `manualRecoveryRequired`，保留
+  数据、副本和标记，不再自动删除；新版带 hash 路径继续自动恢复。
+- 验证：非 GUI **388 项**通过；最终完整门禁全绿；真实备份/临时恢复 hash
   一致。
