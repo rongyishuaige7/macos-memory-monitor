@@ -34,6 +34,7 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
     private var cpuActivity = CleanupCPUActivityTracker()
     private var handles: [ProcessIdentity: NSRunningApplication] = [:]
     private var worker: Task<ActivityInventory, Never>?
+    private var workerToken: UUID?
     private var scanGeneration: UInt64 = 0
     private let scanBudgetMilliseconds = 1_500
     private let maximumScanMembers = 20_000
@@ -257,9 +258,15 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
         scanGeneration &+= 1
         let requestGeneration = scanGeneration
         if let worker {
+            let token = workerToken
             worker.cancel()
             _ = await worker.value
-            self.worker = nil
+            // A newer request may already have installed its own worker while
+            // this caller was waiting. Only clear the handle we waited on.
+            if workerToken == token {
+                self.worker = nil
+                self.workerToken = nil
+            }
         }
         // Several callers can wait on the same old worker. Only the caller
         // that still owns the newest generation may create the next worker.
@@ -365,7 +372,9 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
                 )
             }
         }
+        let token = UUID()
         self.worker = task
+        self.workerToken = token
 
         let result = await withTaskCancellationHandler(operation: {
             await task.value
@@ -373,8 +382,9 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
             task.cancel()
             cancellation.record(ContinuousClock.now)
         })
-        if scanGeneration == requestGeneration {
+        if workerToken == token {
             self.worker = nil
+            self.workerToken = nil
         }
         let completed = ContinuousClock.now
         let cancellationLatency = cancellation.instant.map {

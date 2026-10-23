@@ -368,7 +368,7 @@ public enum StorageBackup {
         }
         guard (info.st_mode & S_IFMT) == S_IFREG,
               info.st_size >= 0,
-              info.st_size <= 64 * 1024 * 1024 else {
+              info.st_size <= ProcessActionAuditStore.maximumFileBytes else {
             return false
         }
         guard let data = try? Data(contentsOf: url) else { return false }
@@ -397,7 +397,7 @@ public enum StorageBackup {
                 guard index == lines.count - 1 else { return false }
                 continue
             }
-            guard line.count <= 1024 * 1024 else { return false }
+            guard line.count <= ProcessActionAuditStore.maximumLineBytes else { return false }
             guard (try? decoder.decode(ProcessActionAuditEvent.self, from: Data(line))) != nil else {
                 return false
             }

@@ -45,6 +45,12 @@ public enum StorageRestore {
     private static let segmentsDirectory = "history.json.segments"
     private static let markerSchemaVersion = 1
 
+    private struct CurrentFile: Codable, Equatable {
+        let relativePath: String
+        let byteCount: Int
+        let sha256: String
+    }
+
     private struct Marker: Codable {
         let schemaVersion: Int
         let id: String
@@ -52,6 +58,7 @@ public enum StorageRestore {
         let phase: String
         let currentBackup: String
         let stage: String
+        let currentFiles: [CurrentFile]?
     }
 
     private struct FileInfo {
@@ -137,25 +144,27 @@ public enum StorageRestore {
             ".memory-monitor-restore-stage-" + identifier,
             isDirectory: true
         )
-        let marker = Marker(
-            schemaVersion: markerSchemaVersion,
-            id: identifier,
-            createdAt: now,
-            phase: "prepared",
-            currentBackup: currentBackup.path,
-            stage: stage.path
-        )
-
+        var marker: Marker?
         var transactionStarted = false
         do {
             try copyCurrentData(from: dataRoot, to: currentBackup)
+            let prepared = Marker(
+                schemaVersion: markerSchemaVersion,
+                id: identifier,
+                createdAt: now,
+                phase: "prepared",
+                currentBackup: currentBackup.path,
+                stage: stage.path,
+                currentFiles: try snapshotCurrentFiles(at: currentBackup)
+            )
+            marker = prepared
             try copyBackupData(manifest: manifest, from: backupData, to: stage)
-            try writeMarker(marker, root: dataRoot, replacing: false)
+            try writeMarker(prepared, root: dataRoot, replacing: false)
             transactionStarted = true
             try removeCurrentData(from: dataRoot)
             try installStagedData(from: stage, to: dataRoot)
         } catch {
-            guard transactionStarted else {
+            guard transactionStarted, let marker else {
                 // The target was not modified yet; keep the current set intact.
                 try? removeIfExists(MaintenanceTransaction.url(root: dataRoot))
                 if let restoreError = error as? StorageRestoreError {
@@ -177,14 +186,17 @@ public enum StorageRestore {
             throw StorageRestoreError.writeFailed
         }
 
-        var committed = marker
-        committed = Marker(
-            schemaVersion: committed.schemaVersion,
-            id: committed.id,
-            createdAt: committed.createdAt,
+        guard let marker else {
+            throw StorageRestoreError.writeFailed
+        }
+        let committed = Marker(
+            schemaVersion: marker.schemaVersion,
+            id: marker.id,
+            createdAt: marker.createdAt,
             phase: "committed",
-            currentBackup: committed.currentBackup,
-            stage: committed.stage
+            currentBackup: marker.currentBackup,
+            stage: marker.stage,
+            currentFiles: marker.currentFiles
         )
         try writeMarker(committed, root: dataRoot, replacing: true)
         try removeIfExists(MaintenanceTransaction.url(root: dataRoot))
@@ -259,12 +271,33 @@ public enum StorageRestore {
             try removeIfExists(markerURL)
             return StorageRestoreResult(restoredFiles: 0, previousDataRetained: false)
         }
+        if marker.phase == "rolledBack" {
+            // The data was already restored; only cleanup was interrupted.
+            // Never roll back a second time based on a partially deleted copy.
+            try removeIfExists(stageURL)
+            try removeIfExists(currentBackupURL)
+            try removeIfExists(markerURL)
+            return StorageRestoreResult(restoredFiles: 0, previousDataRetained: true)
+        }
         guard let currentInfo = try? fileInfo(currentBackupURL.path),
               currentInfo.isDirectory,
               !currentInfo.isSymlink else {
             throw StorageRestoreError.invalidBackup("恢复事务副本缺失")
         }
+        try validateCurrentBackup(marker: marker, at: currentBackupURL)
         try rollback(marker: marker, root: dataRoot)
+        let rolledBack = Marker(
+            schemaVersion: marker.schemaVersion,
+            id: marker.id,
+            createdAt: marker.createdAt,
+            phase: "rolledBack",
+            currentBackup: marker.currentBackup,
+            stage: marker.stage,
+            currentFiles: marker.currentFiles
+        )
+        // Persist completion before deleting the copies. A crash during cleanup
+        // then retries as a no-op instead of deleting restored data again.
+        try writeMarker(rolledBack, root: dataRoot, replacing: true)
         try removeIfExists(stageURL)
         try removeIfExists(currentBackupURL)
         try removeIfExists(markerURL)
@@ -319,6 +352,56 @@ public enum StorageRestore {
             guard !remainder.contains("/"), !remainder.isEmpty else {
                 throw StorageRestoreError.invalidBackup("备份分段路径无效")
             }
+        }
+    }
+
+    private static func snapshotCurrentFiles(at root: URL) throws -> [CurrentFile] {
+        var result: [CurrentFile] = []
+        for path in knownFiles {
+            let url = root.appendingPathComponent(path)
+            guard let info = try? fileInfo(url.path) else { continue }
+            guard info.isRegular, !info.isSymlink else {
+                throw StorageRestoreError.invalidBackup("恢复副本包含非普通文件")
+            }
+            let hash = try hashFile(url)
+            result.append(CurrentFile(
+                relativePath: path,
+                byteCount: hash.byteCount,
+                sha256: hash.sha256
+            ))
+        }
+        let segments = root.appendingPathComponent(segmentsDirectory, isDirectory: true)
+        if let info = try? fileInfo(segments.path) {
+            guard info.isDirectory, !info.isSymlink else {
+                throw StorageRestoreError.invalidBackup("恢复副本分段目录无效")
+            }
+            for file in try listRegularFiles(in: segments) {
+                let relative = segmentsDirectory + "/" + file.lastPathComponent
+                let hash = try hashFile(file)
+                result.append(CurrentFile(
+                    relativePath: relative,
+                    byteCount: hash.byteCount,
+                    sha256: hash.sha256
+                ))
+            }
+        }
+        return result.sorted { $0.relativePath < $1.relativePath }
+    }
+
+    private static func validateCurrentBackup(marker: Marker, at url: URL) throws {
+        guard let info = try? fileInfo(url.path),
+              info.isDirectory,
+              !info.isSymlink else {
+            throw StorageRestoreError.invalidBackup("恢复事务副本缺失")
+        }
+        guard let expected = marker.currentFiles else {
+            // Markers written before the manifest field was introduced cannot
+            // prove completeness; retain the directory check only.
+            return
+        }
+        let actual = try snapshotCurrentFiles(at: url)
+        guard actual == expected else {
+            throw StorageRestoreError.invalidBackup("恢复事务副本不完整")
         }
     }
 
@@ -412,6 +495,7 @@ public enum StorageRestore {
               !currentInfo.isSymlink else {
             throw StorageRestoreError.invalidBackup("恢复事务副本缺失")
         }
+        try validateCurrentBackup(marker: marker, at: currentBackup)
         try removeCurrentData(from: root)
         try copyCurrentData(from: currentBackup, to: root)
     }
@@ -557,10 +641,17 @@ public enum StorageRestore {
     }
 
     private static func canonicalURL(_ url: URL) -> URL {
-        URL(
-            fileURLWithPath: canonicalPath(url.path) ?? url.path,
-            isDirectory: true
-        )
+        if let resolved = canonicalPath(url.path) {
+            return URL(fileURLWithPath: resolved, isDirectory: true)
+        }
+        // A missing transaction copy still needs a canonical parent for the
+        // containment check; resolve the parent and retain the last component.
+        let parent = url.deletingLastPathComponent()
+        if let resolvedParent = canonicalPath(parent.path) {
+            return URL(fileURLWithPath: resolvedParent, isDirectory: true)
+                .appendingPathComponent(url.lastPathComponent)
+        }
+        return URL(fileURLWithPath: url.path, isDirectory: true)
     }
 
     private static func canonicalPath(_ path: String) -> String? {

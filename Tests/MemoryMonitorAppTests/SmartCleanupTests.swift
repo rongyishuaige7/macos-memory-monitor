@@ -468,7 +468,8 @@ final class SmartCleanupTests: XCTestCase {
         async let first = runtime.inventoryReport()
         async let second = runtime.inventoryReport()
         async let third = runtime.inventoryReport()
-        _ = await (first, second, third)
+        async let fourth = runtime.inventoryReport()
+        _ = await (first, second, third, fourth)
         XCTAssertEqual(scanner.maximumActive, 1)
     }
 }

@@ -101,6 +101,17 @@ final class StorageBackupTests: XCTestCase {
         XCTAssertTrue(manifest.files.contains { $0.role == "audit" && !$0.present })
     }
 
+    func testOversizedAuditIsNotRestorable() throws {
+        try writeV1()
+        let auditURL = root.appendingPathComponent("actions.jsonl")
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: auditURL.path)
+        try Data(repeating: 0x0A, count: ProcessActionAuditStore.maximumFileBytes + 1)
+            .write(to: auditURL)
+        let manifest = try StorageBackup.create(root: root, output: output)
+        XCTAssertFalse(manifest.restorable)
+        XCTAssertTrue(manifest.files.contains { $0.role == "audit" && $0.present })
+    }
+
     func testSymlinkedSegmentIsRejected() throws {
         try writeV1()
         let segments = root.appendingPathComponent("history.json.segments", isDirectory: true)
