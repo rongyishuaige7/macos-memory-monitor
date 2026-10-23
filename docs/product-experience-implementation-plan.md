@@ -594,9 +594,9 @@ Developer ID、公证、真实登录/注销与登录项路径迁移仍按 S7 记
 | U3 | 已完成 | `aab8a4b` | 4 项预览测试、402 项非 GUI、清理回归 |
 | U4 | 已完成 | `c78bf61` | 5 项授权测试、407 项非 GUI |
 | U5 | 已完成 | `cfe9562` | 4 项历史测试、411 项非 GUI |
-| U6 | 已完成 | `edf17d4` / `c687ded` | 会话/稳定排序/滚动锚点；422 项非 GUI |
-| U7 | 已实现，性能待验收 | `b7d15b7` / `c687ded` | 需求唤醒/页面恢复修复；5 项调度测试；性能对照未执行 |
-| U8 | 候选交付 | `c687ded` | 非原生 artifact gate 通过；完整门禁仍受 DesktopMotion inactive 偶发失败；CI 39955036496 |
+| U6 | 已完成 | `edf17d4` / `e6d9d9d` | 会话/稳定排序/实际滚动锚点；423 项非 GUI |
+| U7 | 已实现，性能待验收 | `b7d15b7` / `e6d9d9d` | 需求唤醒/页面恢复修复；5 项调度测试；性能对照未执行 |
+| U8 | 候选交付 | `e6d9d9d` | 非原生 artifact gate 通过；当前源码独立原生 6/7；完整门禁未重跑；CI 39957566763 |
 
 ### U1 实施记录
 
@@ -647,6 +647,18 @@ Developer ID、公证、真实登录/注销与登录项路径迁移仍按 S7 记
   会话失败（证据 `/private/tmp/mm-ux-u8-gate-c687ded`），非原生 artifact gate
   通过（`/private/tmp/mm-ux-u8-gate-c687ded-noskip`）；CI `39955036496`。
 - 未完成：U7 连续性能对照、完整人工桌面矩阵、稳定原生门禁、外部发布条件。
+
+### U3/U6 复审补修（2026-10-23）
+
+- `e6d9d9d`：`cancel()`、窗口关闭、切页、预览关闭统一清除
+  `activePreviewID`；`start(preview:)` 校验 preview ID/有效期/选中集合。
+- U6 列表用 `scrollPosition(id:)` 跟踪实际可见锚点，不再只记录点击行；
+  读数刷新保留已有组顺序，新增组追加。
+- 验证：非 GUI **423 项**通过；非原生 artifact gate
+  `/private/tmp/mm-ux-u8-gate-e6d9d9d-noskip` 通过；当前源码独立原生
+  6/7（DesktopMotion inactive，日志 `/private/tmp/mm-ux-native-e6d9d9d`）；
+  CI `39957566763`。完整门禁未在当前源码重跑，不能写成 7/7。
+- 未完成：U7 性能对照、完整人工桌面矩阵、稳定原生门禁、外部发布条件。
 
 ### 12.3 回退与后续需求
 
