@@ -60,6 +60,24 @@ struct DesktopShell: View {
                      navigation.selectedProcess == nil && !navigation.showsAudit)
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in appActive = true }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in appActive = false }
+        .onAppear {
+            model.setDesktopSurface(
+                navigation.page.samplingSurface,
+                detail: navigation.selectedProcess != nil
+            )
+        }
+        .onChange(of: navigation.page) {
+            model.setDesktopSurface(
+                navigation.page.samplingSurface,
+                detail: navigation.selectedProcess != nil
+            )
+        }
+        .onChange(of: navigation.selectedProcess) {
+            model.setDesktopSurface(
+                navigation.page.samplingSurface,
+                detail: navigation.selectedProcess != nil
+            )
+        }
     }
 
     private var sidebar: some View {

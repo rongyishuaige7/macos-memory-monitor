@@ -637,7 +637,8 @@ final class AppIntegrationTests: XCTestCase {
             processActions: makeTemporaryProcessActions(),
             startRefreshTask: false
         )
-        model.setPanelPresented(true)
+        model.setDesktopPresented(true)
+        model.setDesktopSurface(.processes, detail: false)
 
         await model.refreshOnce(at: timestamp)
         XCTAssertEqual(model.processes, [firstProcess])

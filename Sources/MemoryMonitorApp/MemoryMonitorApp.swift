@@ -347,6 +347,8 @@ final class MonitorViewModel: ObservableObject {
     private(set) var isPanelPresented = false
     private var isPopoverPresented = false
     private var isDesktopPresented = false
+    private var visibleSurfaces: Set<MonitorSamplingSurface> = []
+    private var desktopSurface: MonitorSamplingSurface?
     @Published private(set) var pressureLevel: MemoryPressureLevel?
     @Published private(set) var samplingDiagnostics = SamplingDiagnostics(
         mode: .background,
@@ -512,16 +514,42 @@ final class MonitorViewModel: ObservableObject {
 
     func setPanelPresented(_ presented: Bool) {
         isPopoverPresented = presented
+        if presented {
+            visibleSurfaces.insert(.menu)
+        } else {
+            visibleSurfaces.remove(.menu)
+        }
         updatePresentationState()
     }
 
     func setDesktopPresented(_ presented: Bool) {
         isDesktopPresented = presented
+        if presented {
+            if desktopSurface == nil {
+                desktopSurface = .overview
+                visibleSurfaces.insert(.overview)
+            }
+        } else if let desktopSurface {
+            visibleSurfaces.remove(desktopSurface)
+            self.desktopSurface = nil
+        }
+        updatePresentationState()
+    }
+
+    func setDesktopSurface(_ surface: MonitorSamplingSurface, detail: Bool) {
+        let next = detail ? MonitorSamplingSurface.detail : surface
+        if let desktopSurface {
+            visibleSurfaces.remove(desktopSurface)
+        }
+        desktopSurface = next
+        if isDesktopPresented {
+            visibleSurfaces.insert(next)
+        }
         updatePresentationState()
     }
 
     private func updatePresentationState() {
-        let presented = isPopoverPresented || isDesktopPresented
+        let presented = !visibleSurfaces.isEmpty
         guard isPanelPresented != presented else { return }
         isPanelPresented = presented
         Task { await refreshWakeup.signal() }
@@ -554,7 +582,7 @@ final class MonitorViewModel: ObservableObject {
         await refreshOnce()
         return RefreshWaitConfiguration(
             interval: samplingPolicy.intervalSeconds(
-                panelPresented: isPanelPresented,
+                surfaces: visibleSurfaces,
                 pressureActive: pressureEvaluator.pressureActiveForSampling
             ),
             wakeup: refreshWakeup
@@ -717,7 +745,7 @@ final class MonitorViewModel: ObservableObject {
         let samplingTimestamp = usesLiveClock ? dateProvider() : timestamp
         guard samplingTimestamp.timeIntervalSince1970.isFinite else { return }
         let mode = samplingPolicy.samplingMode(
-            panelPresented: isPanelPresented,
+            surfaces: visibleSurfaces,
             pressureActive: pressureEvaluator.pressureActiveForSampling,
             now: samplingTimestamp,
             lastProcessSampleAt: lastUsableProcessSampleAt

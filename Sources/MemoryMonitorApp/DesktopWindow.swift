@@ -27,6 +27,19 @@ enum DesktopPage: String, CaseIterable, Identifiable {
     }
 }
 
+extension DesktopPage {
+    var samplingSurface: MonitorSamplingSurface {
+        switch self {
+        case .overview: return .overview
+        case .processes: return .processes
+        case .cleanup: return .cleanup
+        case .history: return .history
+        case .stress: return .stress
+        case .settings: return .settings
+        }
+    }
+}
+
 enum DesktopAppearancePreference {
     static func colorScheme(_ value: String) -> ColorScheme? {
         switch value {

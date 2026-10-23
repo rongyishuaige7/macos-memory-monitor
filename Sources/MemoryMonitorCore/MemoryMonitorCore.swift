@@ -3732,6 +3732,37 @@ public struct SamplingDiagnostics: Codable, Sendable, Equatable {
 /// The values are deliberately conservative for a menu-bar process monitor: the
 /// full process scan is the expensive part, so normal background observation is
 /// much less frequent than an open panel or an elevated-pressure state.
+public enum MonitorSamplingSurface: String, CaseIterable, Sendable, Equatable {
+    case menu
+    case overview
+    case processes
+    case detail
+    case cleanup
+    case history
+    case settings
+    case stress
+
+    public var systemIntervalSeconds: TimeInterval {
+        switch self {
+        case .processes, .detail, .menu, .overview, .cleanup:
+            return 3
+        case .history, .settings, .stress:
+            return 20
+        }
+    }
+
+    public var processIntervalSeconds: TimeInterval {
+        switch self {
+        case .processes, .detail:
+            return 3
+        case .menu, .overview, .cleanup:
+            return 15
+        case .history, .settings, .stress:
+            return 60
+        }
+    }
+}
+
 public struct AdaptiveSamplingPolicy: Sendable, Equatable {
     public let backgroundIntervalSeconds: TimeInterval
     public let panelIntervalSeconds: TimeInterval
@@ -3788,6 +3819,47 @@ public struct AdaptiveSamplingPolicy: Sendable, Equatable {
             lastProcessSampleAt: lastProcessSampleAt,
             interval: backgroundProcessIntervalSeconds
         ) ? .backgroundProcess : .background
+    }
+
+    /// Merges every visible consumer; a faster consumer always wins. Pressure
+    /// adds its own 5s/10s ceiling but never removes a faster visible demand.
+    public func intervalSeconds(
+        surfaces: Set<MonitorSamplingSurface>,
+        pressureActive: Bool
+    ) -> TimeInterval {
+        let visible = surfaces.map(\.systemIntervalSeconds).min() ?? backgroundIntervalSeconds
+        return pressureActive ? min(visible, pressureIntervalSeconds) : visible
+    }
+
+    public func samplingMode(
+        surfaces: Set<MonitorSamplingSurface>,
+        pressureActive: Bool,
+        now: Date = Date(),
+        lastProcessSampleAt: Date?
+    ) -> SamplingMode {
+        let processInterval = surfaces.map(\.processIntervalSeconds).min()
+            ?? backgroundProcessIntervalSeconds
+        let effectiveProcessInterval = pressureActive
+            ? min(processInterval, pressureProcessIntervalSeconds)
+            : processInterval
+        if effectiveProcessInterval <= panelIntervalSeconds {
+            return .panel
+        }
+        if processRefreshIsDue(now: now, lastProcessSampleAt: lastProcessSampleAt, interval: effectiveProcessInterval) {
+            return pressureActive ? .pressure : .backgroundProcess
+        }
+        return .background
+    }
+
+    public func cadenceDescription(
+        surfaces: Set<MonitorSamplingSurface>,
+        pressureActive: Bool
+    ) -> String {
+        let system = intervalSeconds(surfaces: surfaces, pressureActive: pressureActive)
+        let process = surfaces.map(\.processIntervalSeconds).min()
+            ?? backgroundProcessIntervalSeconds
+        let effectiveProcess = pressureActive ? min(process, pressureProcessIntervalSeconds) : process
+        return "系统约 \(formattedSeconds(system)) 秒 · 进程约 \(formattedSeconds(effectiveProcess)) 秒"
     }
 
     public func cadenceDescription(panelPresented: Bool, pressureActive: Bool) -> String {
