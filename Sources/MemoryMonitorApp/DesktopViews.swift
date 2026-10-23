@@ -6,7 +6,7 @@ struct DesktopShell: View {
     @ObservedObject var model: MonitorViewModel
     @ObservedObject var navigation: DesktopNavigation
     @ObservedObject var memoryTest: MemoryTestController
-    @AppStorage("desktopAppearance") private var appearance = "dark"
+    @AppStorage("desktopAppearance") private var appearance = "system"
     @AppStorage("desktopMotionEnabled") private var motionEnabled = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var appActive = NSRunningApplication.current.isActive
@@ -39,9 +39,12 @@ struct DesktopShell: View {
                     case .overview: DesktopOverview(model: model, navigation: navigation)
                     case .processes: DesktopProcesses(model: model, navigation: navigation)
                     case .cleanup: DesktopRelease(model: model, cleanup: model.smartCleanup, navigation: navigation)
-                    case .history: DesktopHistory(model: model)
+                    case .history: DesktopHistory(model: model, navigation: navigation)
                     case .stress: DesktopTestInstrument(model: model, test: memoryTest)
-                    case .settings: DesktopPreferences(model: model, login: model.loginLaunch, navigation: navigation)
+                    case .settings: DesktopPreferences(
+                        model: model, login: model.loginLaunch,
+                        navigation: navigation, memoryTest: memoryTest
+                    )
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -52,7 +55,6 @@ struct DesktopShell: View {
         }
         .tint(.blue)
         .background(Color(nsColor: .windowBackgroundColor))
-        .environment(\.colorScheme, appearance == "light" ? .light : .dark)
         .environment(\.monitorMotionAllowed, motionEnabled && !reduceMotion && appActive &&
                      model.systemDataIsUsable && model.pressureLevel == .normal &&
                      navigation.selectedProcess == nil && !navigation.showsAudit)
@@ -70,7 +72,7 @@ struct DesktopShell: View {
                 }
             }
             .padding(.horizontal, 10).padding(.top, 24).padding(.bottom, 22)
-            ForEach(DesktopPage.allCases) { page in
+            ForEach(DesktopPage.allCases.filter { $0 != .stress }) { page in
                 Button {
                     navigation.page = page
                 } label: {
@@ -312,21 +314,19 @@ struct ProcessAppIcon: View {
 struct DesktopProcesses: View {
     @ObservedObject var model: MonitorViewModel
     @ObservedObject var navigation: DesktopNavigation
-    @State private var query = ""
-    @State private var includesSystem = false
-    @State private var sort: DesktopProcessSort = .memory
     @State private var rows: [DesktopProcessGroup] = []
-    @State private var expanded = Set<String>()
+    @FocusState private var searchFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 16) {
-                Picker("排序", selection: $sort) {
+                Picker("排序", selection: $navigation.processSort) {
                     ForEach(DesktopProcessSort.allCases) { Text($0.rawValue).tag($0) }
                 }.pickerStyle(.segmented).labelsHidden().frame(maxWidth: 300)
                 Spacer(minLength: 0)
-                TextField("搜索应用或进程…", text: $query)
+                TextField("搜索应用或进程…", text: $navigation.processQuery)
                     .textFieldStyle(.roundedBorder).frame(width: 180)
+                    .focused($searchFocused)
                     .accessibilityIdentifier("desktop-process-search")
             }
             if let notice = SimpleMonitorPresentation.listNotice(status: model.detailDataStatus(
@@ -346,13 +346,17 @@ struct DesktopProcesses: View {
                 LazyVStack(spacing: 0) {
                     ForEach(rows) { group in
                         Button {
-                            if group.members.count == 1 { navigation.selectedProcess = group.members.first?.identity }
-                            else if expanded.contains(group.id) { expanded.remove(group.id) }
-                            else { expanded.insert(group.id) }
+                            if group.members.count == 1 {
+                                navigation.selectedProcess = group.members.first?.identity
+                            } else if navigation.expandedProcessGroups.contains(group.id) {
+                                navigation.expandedProcessGroups.remove(group.id)
+                            } else {
+                                navigation.expandedProcessGroups.insert(group.id)
+                            }
                         } label: {
                             groupRow(group)
-                        }.buttonStyle(.plain).monitorRowHover(selected: expanded.contains(group.id))
-                        if expanded.contains(group.id) {
+                        }.buttonStyle(.plain).monitorRowHover(selected: navigation.expandedProcessGroups.contains(group.id) || !navigation.processQuery.isEmpty)
+                        if navigation.expandedProcessGroups.contains(group.id) || !navigation.processQuery.isEmpty {
                             ForEach(group.members) { process in
                                 Button { navigation.selectedProcess = process.identity } label: {
                                     processRow(process).padding(.leading, 20)
@@ -361,9 +365,20 @@ struct DesktopProcesses: View {
                         }
                     }
                     if rows.isEmpty {
-                        ContentUnavailableView(query.isEmpty ? "没有可显示的进程" : "没有搜索结果",
-                                               systemImage: "magnifyingglass")
-                            .frame(maxWidth: .infinity, minHeight: 180)
+                        VStack(spacing: 8) {
+                            ContentUnavailableView(
+                                navigation.processQuery.isEmpty ? "没有可显示的进程" : "没有搜索结果",
+                                systemImage: "magnifyingglass",
+                                description: Text(navigation.processQuery.isEmpty
+                                    ? "可切换“显示系统进程”查看被隐藏的对象。"
+                                    : "查询：\(navigation.processQuery)")
+                            )
+                            if !navigation.processQuery.isEmpty {
+                                Button("清除搜索") { navigation.processQuery = "" }
+                                    .buttonStyle(.borderless)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 180)
                     }
                 }
             }
@@ -373,16 +388,17 @@ struct DesktopProcesses: View {
                 Text("\(rows.count) 组 · \(rows.reduce(0) { $0 + $1.members.count }) 个进程")
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Toggle("显示系统进程", isOn: $includesSystem).toggleStyle(.checkbox).font(.caption)
+                Toggle("显示系统进程", isOn: $navigation.processIncludesSystem).toggleStyle(.checkbox).font(.caption)
             }
         }
         .padding(28)
         .onChange(of: model.processes, initial: true) { rebuild() }
         .onChange(of: model.groups) { rebuild() }
         .onChange(of: model.processCPUPercent) { rebuild() }
-        .onChange(of: query) { rebuild() }
-        .onChange(of: sort) { rebuild() }
-        .onChange(of: includesSystem) { rebuild() }
+        .onChange(of: navigation.processQuery) { rebuild() }
+        .onChange(of: navigation.processSort) { rebuild() }
+        .onChange(of: navigation.processIncludesSystem) { rebuild() }
+        .onChange(of: navigation.searchFocusRequest) { searchFocused = true }
     }
 
     private func groupRow(_ group: DesktopProcessGroup) -> some View {
@@ -390,8 +406,18 @@ struct DesktopProcesses: View {
             if let process = group.members.first { ProcessAppIcon(process: process) }
             VStack(alignment: .leading, spacing: 4) {
                 Text(group.title).font(.subheadline.weight(.medium)).lineLimit(1)
-                Text(group.members.count > 1 ? "\(group.members.count) 个进程" : "PID \(group.members.first?.identity.pid ?? 0)")
-                    .font(.caption2).foregroundStyle(.secondary)
+                if !navigation.processQuery.isEmpty, group.members.count > 1 {
+                    let hits = group.members.filter {
+                        ($0.applicationName ?? $0.name).localizedCaseInsensitiveContains(navigation.processQuery)
+                            || $0.name.localizedCaseInsensitiveContains(navigation.processQuery)
+                            || String($0.identity.pid).contains(navigation.processQuery)
+                    }.count
+                    Text("命中 \(hits) / 共 \(group.members.count) 个进程 · 组占用为全组")
+                        .font(.caption2).foregroundStyle(.secondary)
+                } else {
+                    Text(group.members.count > 1 ? "\(group.members.count) 个进程" : "PID \(group.members.first?.identity.pid ?? 0)")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
             }.frame(maxWidth: .infinity, alignment: .leading)
             Text((group.estimated ? "≈ " : "") + SimpleMonitorPresentation.memory(group.bytes))
                 .frame(width: 86, alignment: .trailing).lineLimit(1).minimumScaleFactor(0.8)
@@ -399,7 +425,7 @@ struct DesktopProcesses: View {
             Text(group.cpu(model.processCPUPercent).map { String(format: "%.1f%%", $0) } ?? "--")
                 .foregroundStyle(.secondary).frame(width: 64, alignment: .trailing)
                 .lineLimit(1).minimumScaleFactor(0.8)
-            Image(systemName: group.members.count == 1 ? "ellipsis.circle" : expanded.contains(group.id) ? "chevron.down" : "chevron.right")
+            Image(systemName: group.members.count == 1 ? "ellipsis.circle" : (navigation.expandedProcessGroups.contains(group.id) || !navigation.processQuery.isEmpty) ? "chevron.down" : "chevron.right")
                 .foregroundStyle(.secondary).frame(width: 32)
         }.font(.callout).monospacedDigit().padding(.horizontal, 10)
             .frame(minHeight: 62).contentShape(Rectangle())
@@ -425,8 +451,14 @@ struct DesktopProcesses: View {
     }
 
     private func rebuild() {
-        rows = DesktopPresentation.groupedProcesses(model.groups, processes: model.processes, query: query,
-            includeSystem: includesSystem, sort: sort, cpu: model.processCPUPercent)
+        rows = DesktopPresentation.groupedProcesses(
+            model.groups,
+            processes: model.processes,
+            query: navigation.processQuery,
+            includeSystem: navigation.processIncludesSystem,
+            sort: navigation.processSort,
+            cpu: model.processCPUPercent
+        )
     }
 }
 
@@ -506,7 +538,8 @@ struct DesktopPreferences: View {
     @ObservedObject var model: MonitorViewModel
     @ObservedObject var login: LoginLaunchCoordinator
     @ObservedObject var navigation: DesktopNavigation
-    @AppStorage("desktopAppearance") private var appearance = "dark"
+    @ObservedObject var memoryTest: MemoryTestController
+    @AppStorage("desktopAppearance") private var appearance = "system"
     @AppStorage("menuBarShowsPercentage") private var showsPercentage = true
     @AppStorage("desktopMotionEnabled") private var motionEnabled = true
     @State private var showsDiagnostics = false
@@ -544,6 +577,7 @@ struct DesktopPreferences: View {
                     Text("外观")
                     Spacer()
                     HStack(spacing: 12) {
+                        appearancePreview("system", title: "跟随系统")
                         appearancePreview("dark", title: "深色")
                         appearancePreview("light", title: "浅色")
                     }
@@ -557,6 +591,25 @@ struct DesktopPreferences: View {
                     Text("操作记录")
                     Spacer()
                     Button("查看记录", systemImage: "clock.arrow.circlepath") { navigation.showsAudit = true }
+                }
+                HStack {
+                    Text("高级工具")
+                    Spacer()
+                    Button("内存压力测试", systemImage: "cpu") {
+                        navigation.page = .stress
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityIdentifier("desktop-settings-stress-test")
+                }
+                if memoryTest.isRunning {
+                    HStack {
+                        Text("内存压力测试正在运行；可从主窗口返回并停止。")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                        Spacer()
+                        Button("停止测试") { memoryTest.stop() }
+                            .buttonStyle(.borderless)
+                    }
                 }
                 HStack {
                     Text("本地数据与隐私")

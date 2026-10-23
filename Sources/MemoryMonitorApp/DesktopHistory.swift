@@ -357,8 +357,7 @@ struct MemoryTrend: View {
 
 struct DesktopHistory: View {
     @ObservedObject var model: MonitorViewModel
-    @State private var hours = 1
-    @State private var initializedRange = false
+    @ObservedObject var navigation: DesktopNavigation
 
     var body: some View {
         GeometryReader { geometry in
@@ -367,14 +366,14 @@ struct DesktopHistory: View {
                     HStack {
                         Label("内存使用率", systemImage: "waveform.path").font(.subheadline.weight(.medium))
                         Spacer(minLength: 16)
-                        Picker("时间范围", selection: $hours) {
+                        Picker("时间范围", selection: $navigation.historyHours) {
                             Text("1 小时").tag(1)
                             Text("6 小时").tag(6)
                             Text("24 小时").tag(24)
                         }.pickerStyle(.segmented).labelsHidden().frame(width: 222)
                             .accessibilityIdentifier("history-range")
                     }.frame(height: 28)
-                    MemoryTrend(records: model.history, hours: hours, now: model.updatedAt ?? Date(), detailed: true)
+                    MemoryTrend(records: model.history, hours: navigation.historyHours, now: model.updatedAt ?? Date(), detailed: true)
                         .frame(height: max(300, min(420, geometry.size.height - 136)))
                     HStack(spacing: 18) {
                         HStack(spacing: 6) {
@@ -396,9 +395,11 @@ struct DesktopHistory: View {
             }
         }
         .onChange(of: model.history, initial: true) {
-            guard !initializedRange, !model.history.isEmpty else { return }
-            hours = DesktopPresentation.initialHistoryHours(model.history, now: model.updatedAt ?? Date())
-            initializedRange = true
+            guard !navigation.historyRangeInitialized, !model.history.isEmpty else { return }
+            navigation.historyHours = DesktopPresentation.initialHistoryHours(
+                model.history, now: model.updatedAt ?? Date()
+            )
+            navigation.historyRangeInitialized = true
         }
     }
 }

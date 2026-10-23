@@ -64,6 +64,22 @@ struct MemoryMonitorApp: App {
             )
         }
         .menuBarExtraStyle(.window)
+        .commands {
+            CommandGroup(replacing: .appSettings) {
+                Button("设置…") {
+                    applicationDelegate.desktop.show(.settings)
+                }
+                .keyboardShortcut(",", modifiers: .command)
+            }
+            CommandGroup(after: .textEditing) {
+                Button("搜索当前页面") {
+                    let navigation = applicationDelegate.desktop.navigation
+                    guard navigation.page == .processes else { return }
+                    navigation.searchFocusRequest = UUID()
+                }
+                .keyboardShortcut("f", modifiers: .command)
+            }
+        }
     }
 }
 

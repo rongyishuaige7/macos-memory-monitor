@@ -107,6 +107,10 @@ struct CleanupPreviewSheet: View {
         }
         .padding(20)
         .frame(minWidth: 480, idealWidth: 520, minHeight: 360, idealHeight: 480)
+        .onExitCommand {
+            onCancel()
+            dismiss()
+        }
         .task {
             while !Task.isCancelled {
                 tick = now()

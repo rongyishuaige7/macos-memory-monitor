@@ -10,7 +10,7 @@ enum DesktopPage: String, CaseIterable, Identifiable {
         case .overview: "内存"
         case .processes: "进程"
         case .cleanup: "释放内存"
-        case .history: "统计"
+        case .history: "历史"
         case .stress: "压力测试"
         case .settings: "设置"
         }
@@ -27,12 +27,37 @@ enum DesktopPage: String, CaseIterable, Identifiable {
     }
 }
 
+enum DesktopAppearancePreference {
+    static func colorScheme(_ value: String) -> ColorScheme? {
+        switch value {
+        case "dark": return .dark
+        case "light": return .light
+        default: return nil
+        }
+    }
+
+    static func isDark(_ value: String) -> Bool? {
+        switch value {
+        case "dark": return true
+        case "light": return false
+        default: return nil
+        }
+    }
+}
+
 @MainActor
 final class DesktopNavigation: ObservableObject {
     @Published var page: DesktopPage = .overview
     @Published var selectedProcess: ProcessIdentity?
     @Published var showsAudit = false
     @Published var showsLocalData = false
+    @Published var processQuery = ""
+    @Published var processSort: DesktopProcessSort = .memory
+    @Published var processIncludesSystem = false
+    @Published var expandedProcessGroups: Set<String> = []
+    @Published var historyHours = 1
+    @Published var historyRangeInitialized = false
+    @Published var searchFocusRequest = UUID()
 }
 
 /// Pure policy for whether the desktop window should request panel-level
@@ -197,7 +222,7 @@ struct DesktopWindowRoot: View {
     @ObservedObject var model: MonitorViewModel
     @ObservedObject var navigation: DesktopNavigation
     @ObservedObject var memoryTest: MemoryTestController
-    @AppStorage("desktopAppearance") private var appearance = "dark"
+    @AppStorage("desktopAppearance") private var appearance = "system"
 
     var body: some View {
         DesktopShell(model: model, navigation: navigation, memoryTest: memoryTest)
@@ -215,13 +240,13 @@ struct DesktopWindowRoot: View {
         .sheet(isPresented: $navigation.showsLocalData) {
             LocalDataPanel()
         }
-        .background(DesktopWindowAppearance(dark: appearance != "light"))
-        .preferredColorScheme(appearance == "light" ? .light : .dark)
+        .background(DesktopWindowAppearance(dark: DesktopAppearancePreference.isDark(appearance)))
+        .preferredColorScheme(DesktopAppearancePreference.colorScheme(appearance))
     }
 }
 
 private struct DesktopWindowAppearance: NSViewRepresentable {
-    let dark: Bool
+    let dark: Bool?
 
     func makeNSView(context: Context) -> AppearanceView { AppearanceView() }
     func updateNSView(_ view: AppearanceView, context: Context) {
@@ -230,8 +255,14 @@ private struct DesktopWindowAppearance: NSViewRepresentable {
     }
 
     final class AppearanceView: NSView {
-        var dark = true
+        var dark: Bool?
         override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); apply() }
-        func apply() { window?.appearance = NSAppearance(named: dark ? .darkAqua : .aqua) }
+        func apply() {
+            guard let dark else {
+                window?.appearance = nil
+                return
+            }
+            window?.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+        }
     }
 }

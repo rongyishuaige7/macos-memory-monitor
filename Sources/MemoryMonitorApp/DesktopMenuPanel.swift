@@ -6,7 +6,7 @@ struct DesktopMenuPanel: View {
     let openDesktop: (DesktopPage) -> Void
     let openAudit: () -> Void
     let terminationAction: ApplicationTerminationAction
-    @AppStorage("desktopAppearance") private var appearance = "dark"
+    @AppStorage("desktopAppearance") private var appearance = "system"
 
     init(
         model: MonitorViewModel,
@@ -77,7 +77,7 @@ struct DesktopMenuPanel: View {
                     Divider()
                     route("打开主窗口", symbol: "macwindow", page: .overview)
                     route("查看进程", symbol: "list.bullet.rectangle", page: .processes)
-                    route("统计", symbol: "chart.xyaxis.line", page: .history)
+                    route("历史", symbol: "chart.xyaxis.line", page: .history)
                     route("内存压力测试", symbol: "cpu", page: .stress)
                     route("设置", symbol: "gearshape", page: .settings)
                     if model.processActions.auditError != nil {
@@ -109,7 +109,7 @@ struct DesktopMenuPanel: View {
         .font(.callout)
         .frame(width: 290)
         .background(.regularMaterial)
-        .environment(\.colorScheme, appearance == "light" ? .light : .dark)
+        .preferredColorScheme(DesktopAppearancePreference.colorScheme(appearance))
     }
 
     private func open(_ destination: MonitorPrimaryDestination) {
