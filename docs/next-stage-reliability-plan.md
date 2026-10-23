@@ -5,7 +5,8 @@
 （`0dd8acd`、`1c0ccfd`、`cc7b52a`、`18ec7f5`），S3 已实施并推送
 （`14a908a`），S2/S3 审查修复已推送（`4f421b3`、`c8d0a42`），S4 已实施
 并推送（`f0b2a22`），S5 已实施并推送（`efe799b`、`39c939f`），S6 已实施
-并推送（`f869f4d`），S1–S6 复审修复已推送（`13979b6`），S7 仍待实施。
+并推送（`f869f4d`），S1–S6 复审修复已推送（`13979b6`），S7 证据与发布
+记录已推送（`fcf2d91`）；完整原生门禁仍受当前 GUI 会话限制。
 
 建议下一阶段以“可核对来源、可解释中断、可恢复数据”为目标。先完善发布
 证据，再补存储检查和审计中断状态，之后实施备份恢复与扫描预算。登录项
@@ -457,3 +458,22 @@ release gate 的非 GUI/独立 GUI 入口继续使用；单进程 swift test 的
   严格并发构建通过；真实备份/临时恢复 hash 一致；CI job `39900320424`
   的 macOS 15 任务成功。
 - 未完成：完整 GUI/原生门禁未重跑；S7 升级/回滚和部署仍待实施。
+
+## S7 证据记录（2026-10-23）
+
+状态：S7 证据切片已完成并推送；源码 `fcf2d91`。完整原生门禁未全绿，
+发布记录见 [release-readiness-s1-s7.md](release-readiness-s1-s7.md)。
+
+- 修复 fixture 对新增 `.maintenance.lock` 的兼容校验；fixture 可重新生成
+  v2 数据（240 历史、239 journal、12 审计、1 分段）。
+- 完成 v2 → v1 → v2 临时数据升级/回滚演练：最终 `healthy/segmentedV2`，
+  无 v1/v2 混合；未对真实数据执行 restore。
+- 当前 HEAD 完整 `verify-release.sh`：非 GUI 383 项通过；原生
+  `CleanupMotionTests` 2、`DesktopWindowTests` 3、`SmartCleanupNativeTests`
+  1 通过；`DesktopMotionTests` 因当前会话无法激活窗口失败。失败证据保留在
+  `/private/tmp/mm-s7-gate-full`。
+- 显式跳过原生的完整 artifact 门禁通过：`/private/tmp/mm-s7-gate-skip`，
+  `native_tests=skipped`；未把它当作完整原生通过。
+- CI [run 39911542300](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/39911542300)
+  的 macOS 15 arm64 任务成功。
+- 支持矩阵、人工项和停止条件已写入发布记录；未 bump 版本、未部署。
