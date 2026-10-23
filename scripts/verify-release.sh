@@ -116,7 +116,7 @@ step_bundle_replacement() {
 
 step_non_gui_tests() {
 	swift test "${test_flags[@]}" --package-path "$project_root" \
-		--skip 'CleanupMotionTests|DesktopMotionTests|SmartCleanupNativeTests|DesktopWindowTests' || return 1
+		--skip 'CleanupMotionTests|DesktopMotionTests|SmartCleanupNativeTests|DesktopWindowTests|DesktopScrollTests' || return 1
 }
 
 step_non_gui_scope() {
