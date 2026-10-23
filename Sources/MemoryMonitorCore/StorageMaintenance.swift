@@ -264,10 +264,12 @@ public enum StorageBackup {
             ))
         }
 
-        let hasAudit = files.contains { $0.role == "audit" && $0.present }
+        let auditValid = isValidAuditFile(
+            at: sourceRoot.appendingPathComponent("actions.jsonl")
+        )
         let manifest = StorageBackupManifest(
             createdAt: now,
-            restorable: historyRestorable && hasAudit,
+            restorable: historyRestorable && auditValid,
             historyStatus: inspection.status,
             format: inspection.format,
             files: files.sorted { $0.relativePath < $1.relativePath },
@@ -357,6 +359,50 @@ public enum StorageBackup {
         guard let resolved = realpath(path, nil) else { return nil }
         defer { free(resolved) }
         return String(cString: resolved)
+    }
+
+    static func isValidAuditFile(at url: URL) -> Bool {
+        var info = stat()
+        if lstat(url.path, &info) != 0 {
+            return errno == ENOENT
+        }
+        guard (info.st_mode & S_IFMT) == S_IFREG,
+              info.st_size >= 0,
+              info.st_size <= 64 * 1024 * 1024 else {
+            return false
+        }
+        guard let data = try? Data(contentsOf: url) else { return false }
+        return isValidAuditData(data)
+    }
+
+    static func isValidAuditData(_ data: Data) -> Bool {
+        guard !data.isEmpty else { return true }
+        guard data.last == 0x0A else { return false }
+        let lines = data.split(separator: 0x0A, omittingEmptySubsequences: false)
+        let decoder = JSONDecoder()
+        let fractional = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+        let legacy = Date.ISO8601FormatStyle(includingFractionalSeconds: false)
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let container = try decoder.singleValueContainer()
+            let value = try container.decode(String.self)
+            if let date = try? fractional.parse(value) { return date }
+            if let date = try? legacy.parse(value) { return date }
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "Invalid audit timestamp"
+            )
+        }
+        for (index, line) in lines.enumerated() {
+            if line.isEmpty {
+                guard index == lines.count - 1 else { return false }
+                continue
+            }
+            guard line.count <= 1024 * 1024 else { return false }
+            guard (try? decoder.decode(ProcessActionAuditEvent.self, from: Data(line))) != nil else {
+                return false
+            }
+        }
+        return true
     }
 
     private static func listRegularFiles(in directory: URL) throws -> [URL] {

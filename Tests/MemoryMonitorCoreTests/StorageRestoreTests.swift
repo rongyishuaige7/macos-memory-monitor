@@ -40,7 +40,7 @@ final class StorageRestoreTests: XCTestCase {
         try Data(value.utf8).write(to: url)
     }
 
-    private func makeBackup() throws {
+    private func makeBackup(includeAudit: Bool = true) throws {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         let record = MemoryHistoryRecord(
@@ -55,8 +55,10 @@ final class StorageRestoreTests: XCTestCase {
         try Data().write(to: root.appendingPathComponent("history.json.journal"))
         try Data("{\"observedAt\":\"2026-10-22T00:00:00Z\"}".utf8)
             .write(to: root.appendingPathComponent("history.json.clock"))
-        try Data("audit".utf8).write(to: root.appendingPathComponent("actions.jsonl"))
-        try Data("audit-clock".utf8).write(to: root.appendingPathComponent("actions.jsonl.clock"))
+        if includeAudit {
+            try Data().write(to: root.appendingPathComponent("actions.jsonl"))
+            try Data("audit-clock".utf8).write(to: root.appendingPathComponent("actions.jsonl.clock"))
+        }
         _ = try StorageBackup.create(root: root, output: backup)
     }
 
@@ -82,7 +84,7 @@ final class StorageRestoreTests: XCTestCase {
         )
         XCTAssertEqual(
             try Data(contentsOf: root.appendingPathComponent("actions.jsonl")),
-            Data("audit".utf8)
+            Data()
         )
         XCTAssertFalse(
             FileManager.default.fileExists(atPath: root.appendingPathComponent("history.json.segments").path)
@@ -126,7 +128,7 @@ final class StorageRestoreTests: XCTestCase {
             segments: [Reference(bucket: bucket, digest: digest)]
         )
         try encoder.encode(index).write(to: root.appendingPathComponent("history.json"))
-        try Data("audit".utf8).write(to: root.appendingPathComponent("actions.jsonl"))
+        try Data().write(to: root.appendingPathComponent("actions.jsonl"))
         _ = try StorageBackup.create(root: root, output: backup)
         let indexBefore = try Data(contentsOf: backup.appendingPathComponent("data/history.json"))
 
@@ -144,6 +146,74 @@ final class StorageRestoreTests: XCTestCase {
                 atPath: root.appendingPathComponent("history.json.segments/" + segmentName).path
             )
         )
+    }
+
+    func testRestoreAcceptsMissingAuditAndRemovesCurrentAudit() throws {
+        try makeBackup(includeAudit: false)
+        try write("current-audit", to: "actions.jsonl")
+        let result = try StorageRestore.restore(backupDirectory: backup, root: root)
+        XCTAssertGreaterThanOrEqual(result.restoredFiles, 3)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: root.appendingPathComponent("actions.jsonl").path)
+        )
+    }
+
+    func testSecondRecoverIsANoOpAndPreservesData() throws {
+        try write("current", to: "history.json")
+        let currentBackup = root.appendingPathComponent(".restore-current", isDirectory: true)
+        let stage = root.appendingPathComponent(".restore-stage", isDirectory: true)
+        try FileManager.default.createDirectory(at: currentBackup, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: stage, withIntermediateDirectories: true)
+        try Data("previous".utf8).write(to: currentBackup.appendingPathComponent("history.json"))
+        try writeMarker(currentBackup: currentBackup, stage: stage)
+
+        _ = try StorageRestore.recover(root: root)
+        let second = try StorageRestore.recover(root: root)
+        XCTAssertTrue(second.previousDataRetained)
+        XCTAssertEqual(
+            try String(contentsOf: root.appendingPathComponent("history.json"), encoding: .utf8),
+            "previous"
+        )
+    }
+
+    func testRecoverRefusesMissingCurrentBackupWithoutDeletingData() throws {
+        try write("current", to: "history.json")
+        let missing = root.appendingPathComponent(".missing-current", isDirectory: true)
+        let stage = root.appendingPathComponent(".restore-stage", isDirectory: true)
+        try FileManager.default.createDirectory(at: stage, withIntermediateDirectories: true)
+        try writeMarker(currentBackup: missing, stage: stage)
+
+        XCTAssertThrowsError(try StorageRestore.recover(root: root)) { error in
+            guard case StorageRestoreError.invalidBackup = error else {
+                return XCTFail("expected invalidBackup, got \(error)")
+            }
+        }
+        XCTAssertEqual(
+            try String(contentsOf: root.appendingPathComponent("history.json"), encoding: .utf8),
+            "current"
+        )
+    }
+
+    private func writeMarker(currentBackup: URL, stage: URL) throws {
+        struct Marker: Codable {
+            let schemaVersion: Int
+            let id: String
+            let createdAt: Date
+            let phase: String
+            let currentBackup: String
+            let stage: String
+        }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let marker = Marker(
+            schemaVersion: 1,
+            id: "test",
+            createdAt: Date(timeIntervalSince1970: 1),
+            phase: "prepared",
+            currentBackup: currentBackup.path,
+            stage: stage.path
+        )
+        try encoder.encode(marker).write(to: MaintenanceTransaction.url(root: root))
     }
 
     func testRestoreRejectsTamperedBackupWithoutChangingRoot() throws {

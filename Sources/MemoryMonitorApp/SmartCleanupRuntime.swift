@@ -2,6 +2,19 @@ import AppKit
 import Darwin
 import MemoryMonitorCore
 
+protocol CleanupProcessScanning: Sendable {
+    func sampleDetailed(
+        at timestamp: Date,
+        budget: ProcessScanBudget?
+    ) throws -> ProcessSamplingResult
+    func descendantProcessIDs(
+        of rootPID: Int32,
+        budget: ProcessScanBudget?
+    ) throws -> Set<Int32>
+}
+
+extension ProcessSampler: CleanupProcessScanning {}
+
 @MainActor
 final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
     private struct ActivityInventory: Sendable {
@@ -14,7 +27,7 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
     private let clock = ContinuousClock()
     private let origin = ContinuousClock.now
     private let timeProvider: (@MainActor () -> TimeInterval)?
-    private let sampler = ProcessSampler()
+    private let sampler: any CleanupProcessScanning
     private let policy = ProcessActionPolicy(currentUserID: UInt32(getuid()), monitorPID: Int32(getpid()))
     private var activity: [Int32: TimeInterval] = [:]
     private var cpuSamples: [ProcessIdentity: (time: TimeInterval, percent: Double?)] = [:]
@@ -31,8 +44,12 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
         return Double(value.seconds) + Double(value.attoseconds) / 1e18
     }
 
-    init(timeProvider: (@MainActor () -> TimeInterval)? = nil) {
+    init(
+        timeProvider: (@MainActor () -> TimeInterval)? = nil,
+        sampler: any CleanupProcessScanning = ProcessSampler()
+    ) {
         self.timeProvider = timeProvider
+        self.sampler = sampler
         super.init()
         for app in NSWorkspace.shared.runningApplications { activity[app.processIdentifier] = now }
         for name in [NSWorkspace.didActivateApplicationNotification, NSWorkspace.didDeactivateApplicationNotification,
@@ -244,6 +261,11 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
             _ = await worker.value
             self.worker = nil
         }
+        // Several callers can wait on the same old worker. Only the caller
+        // that still owns the newest generation may create the next worker.
+        guard scanGeneration == requestGeneration else {
+            return supersededInventory(generation: requestGeneration, sampledAt: now)
+        }
 
         let started = ContinuousClock.now
         let deadline = started.advanced(by: .milliseconds(scanBudgetMilliseconds))
@@ -371,6 +393,24 @@ final class LiveSmartCleanupRuntime: NSObject, SmartCleanupRuntime {
                 durationMilliseconds: result.metrics.durationMilliseconds,
                 cancellationLatencyMilliseconds: cancellationLatency,
                 budgetExhausted: result.metrics.budgetExhausted
+            )
+        )
+    }
+
+    private func supersededInventory(generation: UInt64, sampledAt: TimeInterval) -> ActivityInventory {
+        ActivityInventory(
+            scan: nil,
+            families: [:],
+            sampledAt: sampledAt,
+            generation: generation,
+            metrics: CleanupInventoryMetrics(
+                generation: generation,
+                scanCount: 0,
+                memberCount: 0,
+                complete: false,
+                durationMilliseconds: 0,
+                cancellationLatencyMilliseconds: nil,
+                budgetExhausted: false
             )
         )
     }

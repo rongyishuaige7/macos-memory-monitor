@@ -69,13 +69,24 @@ final class AuditOperationProjectionTests: XCTestCase {
 
     func testTerminalOnlyLegacyRecordIsNotIncomplete() {
         let projection = AuditOperationProjector.project(
-            events: [event("t", operationID: "legacy", phase: .terminal, outcome: .completed, timestamp: 3)],
+            events: [event("t", operationID: "t", phase: .terminal, outcome: .completed, timestamp: 3)],
             activeOperationIDs: []
         ).first
 
         XCTAssertEqual(projection?.state, .completed)
         XCTAssertTrue(projection?.isLegacyTerminalOnly == true)
         XCTAssertFalse(projection?.isIncomplete == true)
+    }
+
+    func testTerminalOnlyNewOperationIsIncompleteNotLegacy() {
+        let projection = AuditOperationProjector.project(
+            events: [event("terminal-new", operationID: "op-new", phase: .terminal, outcome: .completed, timestamp: 3)],
+            activeOperationIDs: []
+        ).first
+
+        XCTAssertEqual(projection?.state, .completed)
+        XCTAssertFalse(projection?.isLegacyTerminalOnly == true)
+        XCTAssertTrue(projection?.isIncomplete == true)
     }
 
     func testTerminalWithTrimmedIntentIsIncompleteButDecisive() {

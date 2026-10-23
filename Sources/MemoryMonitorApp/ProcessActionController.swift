@@ -403,6 +403,12 @@ final class ProcessActionController: ObservableObject {
     /// treat a `false` result as a hard stop before sending any termination
     /// request.
     func recordExternalAudit(_ event: ProcessActionAuditEvent) async -> Bool {
+        // New smart-cleanup intents obey the same admission limit as manual
+        // actions. Sent/terminal facts are still preserved for existing work.
+        if event.phase == .intent, auditQueueIsFull {
+            auditError = "审计待写队列已满，已暂停新的进程操作。"
+            return false
+        }
         // A failed intent must stop execution. Once a request has been sent,
         // preserve its facts for idempotent retry just like manual actions.
         if event.phase == .terminal {

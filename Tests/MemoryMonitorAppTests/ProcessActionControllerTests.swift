@@ -819,6 +819,19 @@ final class ProcessActionControllerTests: XCTestCase {
         XCTAssertEqual(identity, second.identity)
         XCTAssertTrue(message.contains("审计待写队列已满"))
         XCTAssertEqual(controller.pendingAuditCount, 1)
+
+        let externalIntent = ProcessActionAuditEvent(
+            id: "external-queue-intent",
+            operationID: "external-queue-op",
+            action: .gracefulExit,
+            phase: .intent,
+            outcome: .completed,
+            processLabel: "worker",
+            detail: "intent"
+        )
+        let externalRecorded = await controller.recordExternalAudit(externalIntent)
+        XCTAssertFalse(externalRecorded)
+        XCTAssertEqual(controller.pendingAuditCount, 1)
         await controller.shutdown()
     }
 

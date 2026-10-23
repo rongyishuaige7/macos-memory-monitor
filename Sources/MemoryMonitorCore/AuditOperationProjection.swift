@@ -101,8 +101,13 @@ public enum AuditOperationProjector {
             let terminal = terminalEvents.last
             let terminalOutcome = terminal?.outcome
             let hasTerminal = terminal != nil
-            let isIncomplete = !hasIntent && hasSignalSent
+            // Old terminal-only records defaulted operationID to the event id.
+            // A terminal-only operation whose operationID differs has lost its
+            // preceding records through retention and must be marked incomplete.
             let isLegacyTerminalOnly = !hasIntent && !hasSignalSent && hasTerminal
+                && ordered.allSatisfy { $0.operationID == $0.id }
+            let isIncomplete = (!hasIntent && hasSignalSent)
+                || (!hasIntent && !hasSignalSent && hasTerminal && !isLegacyTerminalOnly)
 
             let state: AuditOperationState
             if let terminalOutcome {

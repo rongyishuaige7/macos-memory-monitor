@@ -205,27 +205,6 @@ public enum StorageRestore {
             throw StorageRestoreError.invalidBackup("数据根必须是真实目录")
         }
         let markerURL = MaintenanceTransaction.url(root: dataRoot)
-        guard FileManager.default.fileExists(atPath: markerURL.path) else {
-            throw StorageRestoreError.nothingToRecover
-        }
-        let marker: Marker
-        do {
-            let data = try Data(contentsOf: markerURL)
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .iso8601
-            marker = try decoder.decode(Marker.self, from: data)
-        } catch {
-            throw StorageRestoreError.invalidBackup("恢复事务标记无效")
-        }
-        guard marker.schemaVersion == markerSchemaVersion else {
-            throw StorageRestoreError.invalidBackup("恢复事务版本不受支持")
-        }
-        let currentBackupURL = canonicalURL(URL(fileURLWithPath: marker.currentBackup))
-        let stageURL = canonicalURL(URL(fileURLWithPath: marker.stage))
-        guard isInside(currentBackupURL.path, root: dataRoot.path),
-              isInside(stageURL.path, root: dataRoot.path) else {
-            throw StorageRestoreError.invalidBackup("恢复事务路径越界")
-        }
 
         let maintenance: Int32
         do {
@@ -249,11 +228,41 @@ public enum StorageRestore {
         )
         defer { StoreFileLock.release(auditLock) }
 
+        // Re-read the marker under the exclusive lock. A concurrent recover
+        // may have completed while this caller was waiting; in that case this
+        // call is an idempotent no-op, never a second destructive rollback.
+        guard FileManager.default.fileExists(atPath: markerURL.path) else {
+            return StorageRestoreResult(restoredFiles: 0, previousDataRetained: true)
+        }
+        let marker: Marker
+        do {
+            let data = try Data(contentsOf: markerURL)
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            marker = try decoder.decode(Marker.self, from: data)
+        } catch {
+            throw StorageRestoreError.invalidBackup("恢复事务标记无效")
+        }
+        guard marker.schemaVersion == markerSchemaVersion else {
+            throw StorageRestoreError.invalidBackup("恢复事务版本不受支持")
+        }
+        let currentBackupURL = canonicalURL(URL(fileURLWithPath: marker.currentBackup))
+        let stageURL = canonicalURL(URL(fileURLWithPath: marker.stage))
+        guard isInside(currentBackupURL.path, root: dataRoot.path),
+              isInside(stageURL.path, root: dataRoot.path) else {
+            throw StorageRestoreError.invalidBackup("恢复事务路径越界")
+        }
+
         if marker.phase == "committed" {
             try removeIfExists(stageURL)
             try removeIfExists(currentBackupURL)
             try removeIfExists(markerURL)
             return StorageRestoreResult(restoredFiles: 0, previousDataRetained: false)
+        }
+        guard let currentInfo = try? fileInfo(currentBackupURL.path),
+              currentInfo.isDirectory,
+              !currentInfo.isSymlink else {
+            throw StorageRestoreError.invalidBackup("恢复事务副本缺失")
         }
         try rollback(marker: marker, root: dataRoot)
         try removeIfExists(stageURL)
@@ -299,8 +308,11 @@ public enum StorageRestore {
                 throw StorageRestoreError.invalidBackup("备份缺少历史索引")
             }
         }
-        guard presentPaths.contains("actions.jsonl") else {
-            throw StorageRestoreError.invalidBackup("备份缺少审计文件")
+        if presentPaths.contains("actions.jsonl") {
+            let auditURL = backupData.appendingPathComponent("actions.jsonl")
+            guard StorageBackup.isValidAuditFile(at: auditURL) else {
+                throw StorageRestoreError.invalidBackup("备份审计文件内容无效")
+            }
         }
         for path in presentPaths where path.hasPrefix(segmentsDirectory + "/") {
             let remainder = String(path.dropFirst(segmentsDirectory.count + 1))
@@ -394,6 +406,11 @@ public enum StorageRestore {
         let currentBackup = canonicalURL(URL(fileURLWithPath: marker.currentBackup))
         guard isInside(currentBackup.path, root: root.path) else {
             throw StorageRestoreError.invalidBackup("恢复事务备份路径越界")
+        }
+        guard let currentInfo = try? fileInfo(currentBackup.path),
+              currentInfo.isDirectory,
+              !currentInfo.isSymlink else {
+            throw StorageRestoreError.invalidBackup("恢复事务副本缺失")
         }
         try removeCurrentData(from: root)
         try copyCurrentData(from: currentBackup, to: root)

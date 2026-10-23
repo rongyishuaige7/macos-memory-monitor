@@ -461,6 +461,56 @@ final class SmartCleanupTests: XCTestCase {
         disabled.setAuthorized(cleanupApp(1), true)
         XCTAssertTrue(disabled.authorizations.isEmpty)
     }
+
+    func testConcurrentInventoryRequestsUseOneScanWorker() async {
+        let scanner = SlowCleanupScanner()
+        let runtime = LiveSmartCleanupRuntime(sampler: scanner)
+        async let first = runtime.inventoryReport()
+        async let second = runtime.inventoryReport()
+        async let third = runtime.inventoryReport()
+        _ = await (first, second, third)
+        XCTAssertEqual(scanner.maximumActive, 1)
+    }
+}
+
+private final class SlowCleanupScanner: CleanupProcessScanning, @unchecked Sendable {
+    private let lock = NSLock()
+    private var active = 0
+    private var maximum = 0
+
+    var maximumActive: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return maximum
+    }
+
+    func sampleDetailed(
+        at timestamp: Date,
+        budget: ProcessScanBudget?
+    ) throws -> ProcessSamplingResult {
+        lock.lock()
+        active += 1
+        maximum = max(maximum, active)
+        lock.unlock()
+        Thread.sleep(forTimeInterval: 0.12)
+        lock.lock()
+        active -= 1
+        lock.unlock()
+        return ProcessSamplingResult(
+            processes: [],
+            listedProcessCount: 0,
+            sampledProcessCount: 0,
+            skippedProcessCount: 0,
+            status: .unavailable(message: "test")
+        )
+    }
+
+    func descendantProcessIDs(
+        of rootPID: Int32,
+        budget: ProcessScanBudget?
+    ) throws -> Set<Int32> {
+        []
+    }
 }
 
 @MainActor

@@ -40,7 +40,7 @@ final class StorageBackupTests: XCTestCase {
         try Data().write(to: root.appendingPathComponent("history.json.journal"))
         try Data("{\"observedAt\":\"2026-10-22T00:00:00Z\"}".utf8)
             .write(to: root.appendingPathComponent("history.json.clock"))
-        try Data("audit\n".utf8).write(to: root.appendingPathComponent("actions.jsonl"))
+        try Data().write(to: root.appendingPathComponent("actions.jsonl"))
         try Data("audit-clock".utf8).write(to: root.appendingPathComponent("actions.jsonl.clock"))
     }
 
@@ -83,6 +83,22 @@ final class StorageBackupTests: XCTestCase {
         XCTAssertFalse(manifest.restorable)
         XCTAssertEqual(manifest.historyStatus, .invalidData)
         XCTAssertTrue(FileManager.default.fileExists(atPath: output.appendingPathComponent("data/history.json").path))
+    }
+
+    func testCorruptAuditIsBackedUpButNotRestorable() throws {
+        try writeV1()
+        try Data("not-json\n".utf8).write(to: root.appendingPathComponent("actions.jsonl"))
+        let manifest = try StorageBackup.create(root: root, output: output)
+        XCTAssertFalse(manifest.restorable)
+        XCTAssertTrue(manifest.files.contains { $0.role == "audit" && $0.present })
+    }
+
+    func testMissingAuditIsStillRestorable() throws {
+        try writeV1()
+        try FileManager.default.removeItem(at: root.appendingPathComponent("actions.jsonl"))
+        let manifest = try StorageBackup.create(root: root, output: output)
+        XCTAssertTrue(manifest.restorable)
+        XCTAssertTrue(manifest.files.contains { $0.role == "audit" && !$0.present })
     }
 
     func testSymlinkedSegmentIsRejected() throws {
