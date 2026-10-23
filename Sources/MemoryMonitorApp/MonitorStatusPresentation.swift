@@ -28,6 +28,21 @@ struct ActionAvailability: Equatable, Sendable {
     }
 }
 
+enum MonitorPrimaryDestination: String, Equatable, Sendable {
+    case processes
+    case cleanup
+    case retry
+}
+
+struct MonitorOverviewDecision: Equatable, Sendable {
+    let status: MonitorStatusPresentation
+    let primaryTitle: String
+    let primaryDestination: MonitorPrimaryDestination
+    let secondaryTitle: String?
+    let secondaryDestination: MonitorPrimaryDestination?
+    let sampleTime: String
+}
+
 enum MonitorHealthRoute: String, Equatable, Sendable {
     case audit
     case localData
@@ -72,6 +87,51 @@ enum MonitorStatusProjection {
                 nextStep: "查看主要占用"
             )
         }
+    }
+
+    static func overview(
+        usable: Bool,
+        level: MemoryPressureLevel?,
+        sampleAt: Date?
+    ) -> MonitorOverviewDecision {
+        let status = pressure(usable: usable, level: level)
+        let time = sampleTimeText(sampleAt)
+        switch status.tone {
+        case .loading, .unavailable:
+            return MonitorOverviewDecision(
+                status: status,
+                primaryTitle: "重新读取",
+                primaryDestination: .retry,
+                secondaryTitle: nil,
+                secondaryDestination: nil,
+                sampleTime: time
+            )
+        case .normal:
+            return MonitorOverviewDecision(
+                status: status,
+                primaryTitle: "查看主要占用",
+                primaryDestination: .processes,
+                secondaryTitle: "检查可退出应用",
+                secondaryDestination: .cleanup,
+                sampleTime: time
+            )
+        case .attention, .critical, .partial:
+            return MonitorOverviewDecision(
+                status: status,
+                primaryTitle: "查看主要占用",
+                primaryDestination: .processes,
+                secondaryTitle: "检查可退出应用",
+                secondaryDestination: .cleanup,
+                sampleTime: time
+            )
+        }
+    }
+
+    static func sampleTimeText(_ date: Date?) -> String {
+        guard let date, date.timeIntervalSince1970.isFinite else {
+            return "尚未获得有效样本"
+        }
+        return "有效时间 " + date.formatted(date: .omitted, time: .standard)
     }
 
     static func detail(_ status: MonitorDetailDataStatus) -> MonitorStatusPresentation {

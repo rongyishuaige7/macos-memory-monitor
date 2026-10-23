@@ -131,8 +131,43 @@ struct DesktopOverview: View {
     @ObservedObject var navigation: DesktopNavigation
 
     var body: some View {
+        let decision = MonitorStatusProjection.overview(
+            usable: model.systemDataIsUsable,
+            level: model.pressureLevel,
+            sampleAt: model.updatedAt
+        )
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Image(systemName: decision.status.tone == .normal ? "checkmark.circle.fill" : "info.circle.fill")
+                            .foregroundStyle(monitorStatusColor(decision.status.tone))
+                        Text(decision.status.title)
+                            .font(.headline)
+                        Spacer(minLength: 8)
+                        Text(decision.sampleTime)
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(decision.status.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 10) {
+                        Button(decision.primaryTitle) {
+                            navigate(decision.primaryDestination)
+                        }
+                        .buttonStyle(MonitorPrimaryButtonStyle())
+                        if let title = decision.secondaryTitle,
+                           let destination = decision.secondaryDestination {
+                            Button(title) { navigate(destination) }
+                                .buttonStyle(.bordered)
+                        }
+                    }
+                }
+                .padding(16)
+                .glassSurface(accent: monitorStatusColor(decision.status.tone))
+                .accessibilityElement(children: .contain)
                 HStack(spacing: 30) {
                     MemoryUsageRing(system: model.systemDataIsUsable ? model.system : nil)
                         .frame(width: 216, height: 216)
@@ -150,23 +185,10 @@ struct DesktopOverview: View {
                     .frame(maxWidth: .infinity)
                 }
                 MemoryMetrics(system: model.systemDataIsUsable ? model.system : nil)
-                HStack(spacing: 12) {
-                    Button {
-                        navigation.page = .cleanup
-                    } label: {
-                        Label("释放内存", systemImage: "sparkles")
-                            .frame(minWidth: 160)
-                    }.buttonStyle(MonitorPrimaryButtonStyle())
-                    Button("查看进程", systemImage: "list.bullet.rectangle") { navigation.page = .processes }
-                        .buttonStyle(.bordered).controlSize(.large)
-                    Spacer()
-                }
                 HStack {
                     Label("\(model.processes.count) 个进程", systemImage: "square.stack.3d.up")
                     Spacer()
-                    if let updated = model.updatedAt {
-                        Text("更新于 " + updated.formatted(date: .omitted, time: .standard))
-                    }
+                    Text("内存压力与读数来自同一系统样本")
                 }.font(.caption).foregroundStyle(.secondary)
                 if let notice = SimpleMonitorPresentation.listNotice(status: model.detailDataStatus(
                     retainedItemCount: model.processes.count, targetPresent: !model.processes.isEmpty
@@ -176,6 +198,28 @@ struct DesktopOverview: View {
             }
             .padding(28)
         }
+    }
+
+    private func navigate(_ destination: MonitorPrimaryDestination) {
+        switch destination {
+        case .processes:
+            navigation.page = .processes
+        case .cleanup:
+            navigation.page = .cleanup
+        case .retry:
+            model.refreshHealth()
+        }
+    }
+}
+
+func monitorStatusColor(_ tone: MonitorStatusTone) -> Color {
+    switch tone {
+    case .normal: return .green
+    case .loading: return .secondary
+    case .partial: return .orange
+    case .attention: return .orange
+    case .critical: return .red
+    case .unavailable: return .secondary
     }
 }
 

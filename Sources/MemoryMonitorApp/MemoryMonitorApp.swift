@@ -1380,8 +1380,10 @@ private struct MenuBarStatus: View {
         .accessibilityLabel("Memory Monitor 状态")
         .accessibilityValue(
             model.systemDataIsUsable
-                ? (model.system.map { "内存使用率 \(Int($0.usedFraction * 100))%" } ?? "内存数据不可用")
-                : "内存数据不可用"
+                ? (model.system.map {
+                    "内存使用率 \(Int($0.usedFraction * 100))%，\(model.pressure.title)，数据可用"
+                } ?? "内存数据不可用")
+                : "内存数据不可用，\(model.pressure.title)"
         )
     }
 }

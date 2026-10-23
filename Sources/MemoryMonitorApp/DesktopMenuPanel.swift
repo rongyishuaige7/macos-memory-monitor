@@ -21,9 +21,38 @@ struct DesktopMenuPanel: View {
     }
 
     var body: some View {
+        let decision = MonitorStatusProjection.overview(
+            usable: model.systemDataIsUsable,
+            level: model.pressureLevel,
+            sampleAt: model.updatedAt
+        )
         VStack(alignment: .leading, spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
+                    HStack(alignment: .firstTextBaseline, spacing: 7) {
+                        Image(systemName: decision.status.tone == .normal ? "checkmark.circle.fill" : "info.circle.fill")
+                            .foregroundStyle(monitorStatusColor(decision.status.tone))
+                        Text(decision.status.title)
+                            .font(.callout.weight(.semibold))
+                        Spacer(minLength: 4)
+                        Text(decision.sampleTime)
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(decision.status.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 8) {
+                        Button(decision.primaryTitle) { open(decision.primaryDestination) }
+                            .buttonStyle(MonitorPrimaryButtonStyle())
+                        if let title = decision.secondaryTitle,
+                           let destination = decision.secondaryDestination {
+                            Button(title) { open(destination) }
+                                .buttonStyle(.bordered)
+                        }
+                    }
+                    Divider()
                     HStack {
                         Text("内存使用率").foregroundStyle(.secondary)
                         Spacer()
@@ -45,9 +74,6 @@ struct DesktopMenuPanel: View {
                         metric("已压缩", bytes: model.system?.compressedBytes, color: .orange)
                         metric("可用", bytes: model.system?.availableEstimateBytes, color: .green)
                     }
-                    Button { openDesktop(.cleanup) } label: {
-                        Label("释放内存", systemImage: "sparkles").frame(maxWidth: .infinity).padding(.vertical, 4)
-                    }.buttonStyle(MonitorPrimaryButtonStyle())
                     Divider()
                     route("打开主窗口", symbol: "macwindow", page: .overview)
                     route("查看进程", symbol: "list.bullet.rectangle", page: .processes)
@@ -84,6 +110,17 @@ struct DesktopMenuPanel: View {
         .frame(width: 290)
         .background(.regularMaterial)
         .environment(\.colorScheme, appearance == "light" ? .light : .dark)
+    }
+
+    private func open(_ destination: MonitorPrimaryDestination) {
+        switch destination {
+        case .processes:
+            openDesktop(.processes)
+        case .cleanup:
+            openDesktop(.cleanup)
+        case .retry:
+            model.refreshHealth()
+        }
     }
 
     private func metric(_ title: String, bytes: UInt64?, color: Color) -> some View {
