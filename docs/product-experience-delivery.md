@@ -1,7 +1,7 @@
 # 产品体验 U1–U8 候选交付记录
 
 日期：2026-10-23  
-实现源码：`377ac0b`（当前复审修复源码）
+实现源码：`03bdf24`（当前完整门禁源码）
 产品版本：1.4.2 (142)，**未 bump、未部署**
 
 ## 交付范围
@@ -15,19 +15,19 @@
 | U5 | `cfe9562` | 原始峰值/取点、压缩/交换增量、工作组质量、覆盖与断档 |
 | U6 | `edf17d4` | 会话搜索/排序/展开/历史范围、跟随系统、快捷键、高级工具入口 |
 | U7 | `b7d15b7` | 可见面需求合并、系统/进程间隔分层、生命周期注销 |
-| U8 | `377ac0b` | 预览失效、实际滚动锚点、滚轮回归测试、CI 桌面守卫 |
+| U8 | `03bdf24` | 预览失效、实际滚动锚点、滚轮回归、U7 计数、最终门禁 |
 
 ## 验证证据
 
 | 项目 | 结果 |
 | --- | --- |
-| 完整 `verify-release.sh` | `/private/tmp/mm-ux-u8-gate-377ac0b`，`status=passed`，`exitCode=0` |
-| 源码/构建 | source `377ac0b`，checkout clean，build inputs digest `e4eb2478dc4586f01f8e41c486b0796294122426aadd3f35541241e2e12246c3` |
+| 完整 `verify-release.sh` | `/private/tmp/mm-ux-u8-gate-03bdf24-final`，`status=passed`，`exitCode=0` |
+| 源码/构建 | source `03bdf24`，checkout clean，build inputs digest `e4eb2478dc4586f01f8e41c486b0796294122426aadd3f35541241e2e12246c3` |
 | 非 GUI | 424 项通过；`non_gui_test_scope` 通过 |
-| 原生（当前源码，5 套隔离） | **8/8**：CleanupMotion 2、DesktopMotion 1、DesktopWindow 3、SmartCleanupNative 1、DesktopScroll 1；日志 `/private/tmp/mm-ux-u8-gate-377ac0b/native-tests` |
+| 原生（当前源码，5 套隔离） | **8/8**：CleanupMotion 2、DesktopMotion 1、DesktopWindow 3、SmartCleanupNative 1、DesktopScroll 1；日志 `/private/tmp/mm-ux-u8-gate-03bdf24-final/native-tests` |
 | 产物 | 签名、BuildProvenance、probe、兼容性报告、桌面报告、输入稳定性均通过 |
-| CI | [run 39964483745](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/39964483745)，macOS 15 arm64 成功 |
-| UI fixture | `/private/tmp/mm-ux-ui-check-377ac0b`，Launch Services 启动、240 历史/239 journal/12 审计；本次 PID 已停止 |
+| CI | [run 39967122323](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/39967122323)，macOS 15 arm64 成功 |
+| UI fixture | `/private/tmp/mm-ux-ui-check-377ac0b`（产品代码同源），Launch Services 启动、240 历史/239 journal/12 审计；本次 PID 已停止 |
 | 性能 | 10 分钟策略计数已记录（进程页 201、概览 41、历史/设置 11）；CPU/RSS 连续对照**未执行**，见 [product-experience-performance-u7.md](product-experience-performance-u7.md) |
 
 ## A01–A18 覆盖
