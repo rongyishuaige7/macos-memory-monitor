@@ -646,7 +646,8 @@ Developer ID、公证、真实登录/注销与登录项路径迁移仍按 S7 记
 - 验证：非 GUI **422 项**通过；完整门禁在 `DesktopMotionTests` 因 inactive
   会话失败（证据 `/private/tmp/mm-ux-u8-gate-c687ded`），非原生 artifact gate
   通过（`/private/tmp/mm-ux-u8-gate-c687ded-noskip`）；CI `39955036496`。
-- 未完成：U7 连续性能对照、完整人工桌面矩阵、稳定原生门禁、外部发布条件。
+- 未完成：U7 完整 10 分钟三组性能对照（仅完成 2 分钟冒烟与策略计数）、
+  完整人工桌面矩阵、外部发布条件。
 
 ### U3/U6 复审补修（2026-10-23）
 

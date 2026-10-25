@@ -28,7 +28,7 @@
 | 产物 | 签名、BuildProvenance、probe、兼容性报告、桌面报告、输入稳定性均通过 |
 | CI | [run 39967122323](https://github.com/rongyishuaige7/macos-memory-monitor/actions/runs/39967122323)，macOS 15 arm64 成功 |
 | UI fixture | `/private/tmp/mm-ux-ui-check-377ac0b`（产品代码同源），Launch Services 启动、240 历史/239 journal/12 审计；本次 PID 已停止 |
-| 性能 | 10 分钟策略计数已记录（进程页 201、概览 41、历史/设置 11）；CPU/RSS 连续对照**未执行**，见 [product-experience-performance-u7.md](product-experience-performance-u7.md) |
+| 性能 | 10 分钟策略计数已记录（进程页 201、概览 41、历史/设置 11）；2 分钟冒烟 CPU/RSS 已记录；完整 10 分钟三组对照**未执行**，见 [product-experience-performance-u7.md](product-experience-performance-u7.md) |
 
 ## A01–A18 覆盖
 
